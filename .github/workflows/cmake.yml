@@ -1,0 +1,72 @@
+name: CMake
+
+on:
+  push:
+  pull_request:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: CMake Build
+    runs-on: ubuntu-24.04
+
+    env:
+      RELEASE_FILE: ${{github.event.repository.name}}-${{github.sha}}
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        path: code
+
+    # The PicoSystem SDK is vendored in-tree (picosystem/); only pico-sdk is
+    # external.
+    - name: Checkout Pico SDK
+      uses: actions/checkout@v4
+      with:
+        repository: raspberrypi/pico-sdk
+        path: pico-sdk
+        submodules: true
+
+    - name: Cache
+      uses: actions/cache@v4
+      with:
+        path: /home/runner/.ccache
+        key: ccache-picosystem-${{github.ref}}-${{github.sha}}
+        restore-keys: |
+          ccache-picosystem-${{github.ref}}
+          ccache-picosystem-
+
+    - name: Install deps
+      run: |
+        sudo apt update && sudo apt install ccache gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib python3-setuptools
+
+    # No ROMs ship with the repo, so CI builds against a generated minimal
+    # ROM -- same path a user exercises after dropping files in assets/.
+    - name: Generate placeholder ROM
+      run: python3 code/tools/gen_rom_data.py --make-dummy code/assets/ci_placeholder.gbc
+
+    - name: Configure CMake
+      shell: bash
+      working-directory: ${{runner.workspace}}
+      run: |
+        cmake -E make_directory build
+        cmake -S $GITHUB_WORKSPACE/code -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+          -DPICO_SDK_PATH=$GITHUB_WORKSPACE/pico-sdk -DPICO_BOARD=pimoroni_picosystem \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      shell: bash
+      run: |
+        ccache --zero-stats || true
+        cmake --build . --config $BUILD_TYPE -j 2
+        ccache --show-stats || true
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{env.RELEASE_FILE}}
+        path: ${{runner.workspace}}/build/PicoCrystal.uf2

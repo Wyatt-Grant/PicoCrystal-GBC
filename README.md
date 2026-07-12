@@ -1,0 +1,95 @@
+# PicoCrystal
+
+A Game Boy Color emulator for the [Pimoroni PicoSystem](https://shop.pimoroni.com/products/picosystem)
+(RP2040 handheld), built around a heavily optimized fork of
+[Walnut-GB/CGB](host_test/LICENSE-walnut-cgb). Drop your ROMs in `assets/`,
+run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
+
+- Full-speed CGB emulation on the RP2040's two Cortex-M0+ cores
+  (overclocked to 250MHz), with optional tear-free vsync
+- Boot menu for multiple ROMs; per-game flash save regions
+- Automatic battery-backed-save persistence: autosaves to flash a few
+  seconds after the game writes cart RAM, double-buffered so a mid-save
+  power-off can never destroy the last good save
+- MBC3 real-time clock, persisted across power cycles (freeze-while-off,
+  adjustable in the settings menu)
+- Settings menu (Y+X): brightness, volume, vsync, FPS/battery overlays, clock
+
+**No ROMs are included** and none can be distributed with this repository.
+Use your own cartridge dumps or freely licensed homebrew.
+
+## Building
+
+Requirements: `cmake` (≥ 3.12), `gcc-arm-none-eabi` (+ newlib), `python3`,
+and `make`. The [pico-sdk](https://github.com/raspberrypi/pico-sdk) is fetched
+from git automatically on the first configure; to use an existing checkout,
+set `PICO_SDK_PATH` in your environment.
+
+```sh
+cp path/to/your/roms/*.gbc assets/
+make
+```
+
+Every `.gb`/`.gbc` file in `assets/` is validated (header checksum, supported
+mapper, cart-RAM size) and embedded into the firmware; the build fails with a
+readable message if a file isn't a usable ROM or the set won't fit in the
+16MB flash (roughly 14MB is available for ROMs, at most 14 games).
+
+Supported cartridge types: ROM-only, MBC1, MBC2, MBC3 (incl. RTC), MBC5,
+with up to 32KB of cart RAM.
+
+## Flashing
+
+Hold **X** while switching the PicoSystem on — it mounts as a USB drive named
+`RPI-RP2`. Copy `build/PicoCrystal.uf2` onto it; the device reboots into the
+boot menu.
+
+## The boot menu
+
+- **UP/DOWN** to pick a game (long lists scroll), **A** to boot it
+- **Y+X** (or the SETTINGS row) opens settings, both here and in-game
+- To switch games, power-cycle the console
+
+## Customizing names, order, and save slots (`assets/roms.json`)
+
+By default games appear in alphabetical filename order, named after the file
+(`super_mario_bros_deluxe.gbc` → `SUPER MARIO BROS DELUXE`). To override,
+create `assets/roms.json` (it is gitignored, like the ROMs):
+
+```json
+{
+  "roms": [
+    { "file": "polishedcrystal.gbc",  "name": "POKEMON CRYSTAL", "slot": 0 },
+    { "file": "chromatic_tetris.gbc", "name": "CHROMATIC TETRIS" },
+    { "file": "some_other_game.gb" }
+  ]
+}
+```
+
+`name` and `slot` are optional (omit or set to `null`). The array sets the
+menu order; unlisted files are appended alphabetically. Names may use `A-Z`,
+`0-9`, and spaces (the menu font has nothing else). Entries for files no
+longer in `assets/` are skipped with a warning, and their pinned slots stay
+reserved — so you can remove a game without touching the manifest, and
+re-adding the file later reattaches its old save.
+
+**Save slots** matter once you have saves you care about: each game's save
+lives in the flash region chosen by its slot number (0–13), which defaults to
+its position in the list. Adding, removing, or renaming ROM files can
+therefore re-shuffle slots and detach games from their existing saves (the
+save data itself is untouched — saves live outside the firmware and survive
+reflashing). If you change the ROM list on a device with saves you want to
+keep, pin each existing game's slot in `roms.json` first — the build log
+prints every game's current slot.
+
+## Repo layout
+
+- `main.cpp` — emulator frontend: dual-core render/audio offload, menus,
+  per-game boot
+- `core/walnut_cgb.h` — the CPU/PPU emulator core (heavily modified fork)
+- `save_storage.*` — incremental, torn-write-safe flash save + settings + RTC
+  persistence
+- `picosystem/` — vendored, narrowed PicoSystem SDK fork (this project owns
+  `main()` and the framebuffer)
+- `tools/gen_rom_data.py` — build-time ROM catalog generator (run by CMake)
+- `tools/`, `host_test/` — host-side UI render harness and emulator tests

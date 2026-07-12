@@ -1,0 +1,24 @@
+build/
+
+# ROMs are never committed -- drop your own .gb/.gbc files in assets/
+# (see README). roms.json is a per-user manifest for them.
+assets/*.gb
+assets/*.gbc
+assets/*.GB
+assets/*.GBC
+assets/roms.json
+
+# Build artifact (embeds the ROMs, so it can't be committed either)
+*.uf2
+
+# Windows zone-marker droppings
+*:Zone.Identifier
+
+# Editor / assistant local files
+CLAUDE.md
+.claude/
+
+# Host-side test binaries and generated outputs
+host_test/headless_test
+host_test/rtc_test
+host_test/out/

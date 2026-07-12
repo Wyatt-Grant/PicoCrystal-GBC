@@ -1,0 +1,242 @@
+#include "audio_output.hpp"
+
+#include <cstdint>
+#include "hardware/pwm.h"
+#include "hardware/gpio.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
+#include "pico/platform.h" // __not_in_flash_func()
+
+namespace {
+
+// GPIO 11 -- the PicoSystem's piezo speaker PWM pin. Not exposed via
+// picosystem.hpp (it's a private enum inside hardware.cpp); confirmed by
+// reading picosystem/hardware.cpp's `enum pin { ... AUDIO = 11 ... }`.
+constexpr uint AUDIO_PIN = 11;
+
+// 12-bit duty-cycle resolution, carrier ~61kHz at the 250MHz overclock
+// (250e6 / 4096) -- comfortably above both audible range and the piezo's own
+// bandwidth, so it reads as a clean crude DAC rather than an audible whine.
+constexpr uint16_t PWM_WRAP = 4095;
+
+// The screen driver (picosystem/hardware.cpp) hardcodes DMA channel 0
+// without claiming it, so dma_claim_unused_channel() could hand that same
+// channel back to us. Claim a fixed channel 1 instead (panics on conflict,
+// which is what we want if another user ever appears).
+constexpr uint AUDIO_DMA_CH = 1;
+
+// GPIO 11 is PWM slice 5, channel B: duty lives in bits 31:16 of the slice's
+// CC register. Each playback word is (duty << 16); the low half writes
+// channel A's compare, which drives nothing (GPIO 10 is unconnected on the
+// PicoSystem and never set to GPIO_FUNC_PWM).
+uint32_t duty_buf[2][AUDIO_SAMPLES];
+
+// Double-buffer state, all core1-only after init (render_frame in thread
+// context vs the DMA IRQ handler -- same core, so a brief IRQ-disable is a
+// sufficient critical section).
+volatile uint8_t play_buf_idx = 0; // buffer the DMA is (or was last) playing
+volatile bool dma_idle = true;     // no transfer in flight; PWM holds its last duty
+volatile bool buf_pending = false; // a filled buffer is published but not yet started
+
+// Synthesis staging buffer (interleaved stereo from minigb_apu). Lived in
+// main()'s frame loop when synthesis ran on core0; now owned here since only
+// core1 touches it.
+audio_sample_t stage_buf[AUDIO_SAMPLES_TOTAL];
+
+// One-pole high-pass state (core1 only). See render_frame for why.
+int32_t hpf_x1 = 0, hpf_y1 = 0;
+
+// minigb_apu deliberately keeps each of its (up to 4) channels quiet
+// internally -- VOL_INIT_MAX in minigb_apu.h is AUDIO_SAMPLE_MAX/8 -- so that
+// summing several at once doesn't overflow. In practice most frames don't
+// have all 4 channels active at once, so even 100% ("unity", no additional
+// gain) plays back well under full scale. VOLUME_MAX_PERCENT allows real
+// amplification above that, not just attenuation; the soft-knee limiter in
+// render_frame keeps boosted peaks from wrapping or hard-clipping harshly.
+// 800% drives typical loud passages deep into the limiter's knee -- i.e.
+// deliberate compression: peaks are pinned near full scale while everything
+// quieter comes up toward them, which is the only way to raise *average*
+// loudness once peaks already span the full 3.3V swing.
+constexpr uint16_t VOLUME_MAX_PERCENT = 800;
+volatile uint16_t volume_percent = 0; // muted by default -- hold Y + Up to raise it
+
+// DMA completion handler, on core1 (audio_output_core1_init installs it
+// there). RAM-resident: a flash-resident handler would stall on XIP misses
+// and steal QSPI bandwidth from core0's ROM fetches.
+//
+// If the next frame's buffer is already published, chain straight into it --
+// back-to-back samples, no gap. If it isn't (the pacing DREQ deliberately
+// runs a hair fast -- see core1_init), go idle: the PWM simply holds the
+// last duty level (no writes arrive), which stretches one sample by a few
+// microseconds instead of clicking, and render_frame restarts us.
+void __not_in_flash_func(audio_dma_irq_handler)() {
+	dma_irqn_acknowledge_channel(1, AUDIO_DMA_CH);
+	if (buf_pending) {
+		buf_pending = false;
+		play_buf_idx ^= 1;
+		dma_channel_set_read_addr(AUDIO_DMA_CH, duty_buf[play_buf_idx], false);
+		dma_channel_set_trans_count(AUDIO_DMA_CH, AUDIO_SAMPLES, true);
+	} else {
+		dma_idle = true;
+	}
+}
+
+} // namespace
+
+void audio_output_init() {
+	gpio_set_function(AUDIO_PIN, GPIO_FUNC_PWM);
+
+	// Max out the pad drive. The piezo is a capacitive load being switched
+	// at the 61kHz carrier; the default 4mA drive (and slew limiting) can't
+	// fully charge it each period, which droops the effective swing and
+	// with it the acoustic output. 12mA + fast slew delivers the fullest
+	// rail-to-rail swing the pad can manage. (If the board buffers the
+	// piezo behind a transistor this is simply a no-op -- the schematic
+	// isn't public, so set it either way; it costs nothing.)
+	gpio_set_drive_strength(AUDIO_PIN, GPIO_DRIVE_STRENGTH_12MA);
+	gpio_set_slew_rate(AUDIO_PIN, GPIO_SLEW_RATE_FAST);
+
+	uint slice = pwm_gpio_to_slice_num(AUDIO_PIN);
+	pwm_config cfg = pwm_get_default_config();
+	pwm_config_set_clkdiv(&cfg, 1.0f);
+	pwm_config_set_wrap(&cfg, PWM_WRAP);
+	pwm_init(slice, &cfg, true);
+	pwm_set_gpio_level(AUDIO_PIN, PWM_WRAP / 2); // centered = silence
+}
+
+void audio_output_core1_init() {
+	// Hardware-paced playback: a DMA channel, paced by a DMA DREQ timer at
+	// the sample rate, writes duty words straight into the PWM slice's CC
+	// register. This replaces the old 30us repeating alarm on core1, which
+	// had two audible defects: (a) 30us != the true 30.52us sample period,
+	// so playback ran ~1.7% fast and drained each frame's buffer ~300us
+	// early -- the PWM then flat-lined until the next frame, a guaranteed
+	// ~60Hz buzz -- and (b) every sample was delivered by a software timer
+	// IRQ that core1's scanline rendering could delay, adding jitter (FM
+	// grit) on top. DMA pacing is sample-exact and jitter-free, and also
+	// removes ~549 IRQs/frame of core1 overhead.
+	//
+	// Rate choice: production is AUDIO_SAMPLES per paced frame -- 548
+	// samples / 16742us = ~32732Hz -- not the nominal 32768Hz (minigb_apu's
+	// integer truncation of samples-per-vsync). Pace consumption a touch
+	// *above* production (250MHz / 7635 = ~32745Hz, +0.04%): drift then
+	// always lands on the graceful side -- a few-microsecond hold at a
+	// buffer boundary -- rather than the bad side, where an unconsumed
+	// buffer eventually gets overwritten and a whole frame of audio skips.
+	int timer = dma_claim_unused_timer(true);
+	dma_timer_set_fraction(timer, 1, 7635);
+
+	dma_channel_claim(AUDIO_DMA_CH);
+	dma_channel_config cfg = dma_channel_get_default_config(AUDIO_DMA_CH);
+	channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
+	channel_config_set_read_increment(&cfg, true);
+	channel_config_set_write_increment(&cfg, false);
+	channel_config_set_dreq(&cfg, dma_get_timer_dreq(timer));
+	dma_channel_configure(AUDIO_DMA_CH, &cfg,
+			      &pwm_hw->slice[pwm_gpio_to_slice_num(AUDIO_PIN)].cc,
+			      nullptr, AUDIO_SAMPLES, false);
+
+	// The completion IRQ must be taken on core1 (render_frame relies on
+	// IRQ-disable as its critical section against the handler, which only
+	// works same-core), hence DMA_IRQ_1 -- the screen driver already owns
+	// DMA_IRQ_0 on core0. irq_set_exclusive_handler binds to the calling
+	// core's vector table, which is why this whole function must run on
+	// core1.
+	dma_channel_set_irq1_enabled(AUDIO_DMA_CH, true);
+	irq_set_exclusive_handler(DMA_IRQ_1, audio_dma_irq_handler);
+	irq_set_enabled(DMA_IRQ_1, true);
+}
+
+void __not_in_flash_func(audio_output_render_frame)(struct minigb_apu_ctx *ctx) {
+	minigb_apu_audio_callback(ctx, stage_buf);
+
+	// Claim the fill slot atomically. If a previous frame is still pending
+	// (production ran ahead -- e.g. core0 catching up after a stall), we are
+	// about to overwrite that same slot, so revoke it first: otherwise the
+	// completion IRQ could chain into the buffer mid-write and play a torn
+	// frame. Revoked means the DMA goes idle at completion instead and our
+	// publish below restarts it -- the older frame is dropped, which is the
+	// right call when production runs ahead.
+	uint32_t save = save_and_disable_interrupts();
+	buf_pending = false;
+	uint8_t fill_idx = play_buf_idx ^ 1;
+	restore_interrupts(save);
+
+	uint32_t *out = duty_buf[fill_idx];
+	uint16_t vol = volume_percent;
+	int32_t x1 = hpf_x1, y1 = hpf_y1;
+
+	for (unsigned i = 0; i < AUDIO_SAMPLES; i++) {
+		// Mono downmix.
+		int32_t x = ((int32_t)stage_buf[i * 2] + stage_buf[i * 2 + 1]) / 2;
+
+		// One-pole high-pass, ~200Hz (a = 246/256 at ~32.7kHz). The piezo
+		// radiates essentially nothing below a few hundred Hz, but GB bass
+		// lines and channel-gating DC steps still swing the signal hard --
+		// wasting headroom the audible mids then lose to the limiter.
+		// Filtering the dead band out first lets the same volume setting
+		// play noticeably louder and cleaner.
+		int32_t y = ((y1 + x - x1) * 246) >> 8;
+		x1 = x;
+		y1 = y;
+
+		int32_t s = y * vol / 100;
+
+		// Soft-knee limiter: progressively halve the overshoot in stages
+		// instead of slamming into a hard clip. Above ~100% volume loud
+		// frames legitimately exceed int16 range; the knee turns what would
+		// be harsh flat-topping into ordinary-sounding compression, so the
+		// volume can be pushed much further before it turns nasty. The
+		// cascaded stages give slopes of 1/2, 1/4, 1/8, then 1/32 for
+		// successive overshoot bands -- at 800% even worst-case all-channel
+		// peaks (~229k in) compress to ~37k, so the waveform rounds off
+		// toward full scale and only its topmost sliver hits the final
+		// clamp.
+		int32_t mag = s < 0 ? -s : s;
+		if (mag > 20000) mag = 20000 + ((mag - 20000) >> 1);
+		if (mag > 26000) mag = 26000 + ((mag - 26000) >> 1);
+		if (mag > 30000) mag = 30000 + ((mag - 30000) >> 1);
+		if (mag > 32000) mag = 32000 + ((mag - 32000) >> 2);
+		if (mag > 32767) mag = 32767;
+		s = s < 0 ? -mag : mag;
+
+		// -32768..32767 -> 0..4095 duty, pre-shifted into the CC register's
+		// channel-B half so the DMA can copy words verbatim.
+		out[i] = (((uint32_t)(s + 32768)) >> 4) << 16;
+	}
+	hpf_x1 = x1;
+	hpf_y1 = y1;
+
+	// Publish. Same-core race with the DMA IRQ handler: without the guard,
+	// the handler could fire between our dma_idle check and the kick and
+	// double-start the channel.
+	save = save_and_disable_interrupts();
+	if (dma_idle) {
+		dma_idle = false;
+		play_buf_idx = fill_idx;
+		dma_channel_set_read_addr(AUDIO_DMA_CH, out, false);
+		dma_channel_set_trans_count(AUDIO_DMA_CH, AUDIO_SAMPLES, true);
+	} else {
+		// Still draining the previous buffer -- the handler will chain into
+		// this one at completion.
+		buf_pending = true;
+	}
+	restore_interrupts(save);
+}
+
+void audio_output_set_volume(uint16_t percent) {
+	volume_percent = percent > VOLUME_MAX_PERCENT ? VOLUME_MAX_PERCENT : percent;
+}
+
+uint16_t audio_output_get_volume() {
+	return volume_percent;
+}
+
+void audio_output_mute() {
+	// Called every frame while muted (render_frame isn't). Any in-flight DMA
+	// drains within a frame and goes idle -- no new buffers get published --
+	// after which this write sticks and the speaker sits at a clean center
+	// level instead of whatever it last played.
+	pwm_set_gpio_level(AUDIO_PIN, PWM_WRAP / 2);
+}
