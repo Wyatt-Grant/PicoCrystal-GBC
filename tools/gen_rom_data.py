@@ -171,6 +171,9 @@ def parse_cfg(cfg_path, roms_by_file, warnings):
         if name is not None:
             if not isinstance(name, str):
                 fail("%s: \"name\" must be a string" % where)
+            # Lowercase is accepted for convenience and folded to upper, since
+            # the boot menu font only has uppercase glyphs.
+            name = name.upper()
             bad = re.sub(r"[A-Z0-9 ]", "", name)
             if bad:
                 fail("%s: name '%s' contains '%s' -- the boot menu font only "
