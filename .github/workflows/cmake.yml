@@ -43,10 +43,8 @@ jobs:
       run: |
         sudo apt update && sudo apt install ccache gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib python3-setuptools
 
-    # No ROMs ship with the repo, so CI builds against a generated minimal
-    # ROM -- same path a user exercises after dropping files in assets/.
-    - name: Generate placeholder ROM
-      run: python3 code/tools/gen_rom_data.py --make-dummy code/assets/ci_placeholder.gbc
+    # CI builds against assets/colorbar.gbc, a free test-pattern ROM committed
+    # to the repo -- same path a user exercises after dropping files in assets/.
 
     - name: Configure CMake
       shell: bash

@@ -7,6 +7,9 @@ assets/*.gbc
 assets/*.GB
 assets/*.GBC
 assets/roms.json
+# ...except colorbar.gbc: a free test-pattern ROM committed so CI has
+# something valid to build against (see .github/workflows/cmake.yml).
+!assets/colorbar.gbc
 
 # Build artifact (embeds the ROMs, so it can't be committed either)
 *.uf2
