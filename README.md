@@ -5,6 +5,12 @@ A Game Boy Color emulator for the [Pimoroni PicoSystem](https://shop.pimoroni.co
 [Walnut-GB/CGB](host_test/LICENSE-walnut-cgb). Drop your ROMs in `assets/`,
 run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
 
+<p align="center">
+  <img src="screenshots/boot-menu.png" alt="Boot menu" width="30%">
+  <img src="screenshots/in-game.png"  alt="A game running" width="30%">
+  <img src="screenshots/settings.png" alt="Settings menu" width="30%">
+</p>
+
 - Full-speed CGB emulation on the RP2040's two Cortex-M0+ cores
   (overclocked to 250MHz), with optional tear-free vsync
 - Boot menu for multiple ROMs; per-game flash save regions
@@ -29,6 +35,12 @@ set `PICO_SDK_PATH` in your environment.
 cp path/to/your/roms/*.gbc assets/
 make
 ```
+
+> **Setting names, order, and save slots:** before building, optionally create
+> `assets/roms.json` to rename games, fix their menu order, and pin save slots.
+> This matters especially if you have saves you want to keep — see
+> [Customizing names, order, and save slots](#customizing-names-order-and-save-slots-assetsromsjson)
+> below.
 
 Every `.gb`/`.gbc` file in `assets/` is validated (header checksum, supported
 mapper, cart-RAM size) and embedded into the firmware; the build fails with a
