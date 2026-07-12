@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Example roms.json -- copy to 'roms.json' (same folder) and edit.",
+    "This file pins the boot-menu name, order, and save slot of the .gb/.gbc",
+    "ROMs you drop in assets/. It is optional: without it, games appear in",
+    "alphabetical filename order, named after the file, with slots assigned",
+    "top-down. The real roms.json is gitignored (like the ROMs); this .example",
+    "is the tracked template. Underscore-prefixed keys like this one are",
+    "ignored by the generator, so you can leave notes in your own file too.",
+    "",
+    "Each entry needs a \"file\" (must match a real file in assets/). Both",
+    "\"name\" and \"slot\" are optional -- omit them or set them to null.",
+    "  name: boot-menu label, A-Z / 0-9 / space only (lowercase is folded to",
+    "        upper), max 24 chars. Defaults to the filename.",
+    "  slot: flash save region 0..13. Defaults to list position. Pin it to",
+    "        keep a game attached to its existing on-device save when you add,",
+    "        remove, or rename ROMs. Slots must be unique.",
+    "The array sets menu order; any assets/ files not listed here are appended",
+    "alphabetically. Entries whose file is missing are skipped with a warning",
+    "but keep their slot reserved (so removing/re-adding a game keeps its save)."
+  ],
+  "roms": [
+    { "file": "polishedcrystal.gbc",  "name": "POKEMON CRYSTAL",   "slot": 0 },
+    { "file": "chromatic_tetris.gbc", "name": "CHROMATIC TETRIS" },
+    { "file": "some_other_game.gb" }
+  ]
+}
