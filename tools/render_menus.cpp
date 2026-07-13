@@ -119,5 +119,13 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/settings_nopct.ppm", dir);
 	write_ppm(path);
 
+	// A non-default theme with the THEME row selected -- every
+	// accent-tinted element should recolor.
+	g_show_battery = true;
+	apply_theme(1); // GRAPE
+	draw_settings_menu(SET_ROW_THEME, 82);
+	snprintf(path, sizeof path, "%s/settings_grape.ppm", dir);
+	write_ppm(path);
+
 	return 0;
 }

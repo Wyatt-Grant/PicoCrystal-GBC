@@ -725,7 +725,7 @@ static void menu_text(int32_t x, int32_t y, const char *s, color_t col,
 
 // 7x7 1-bit icons for the menu rows, drawn at 2x (14x14) by draw_icon().
 // MSB is the leftmost pixel.
-enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY };
+enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY, ICON_SWATCHES };
 
 static const uint8_t _icons7[][7] = {
 	{ 0b1111110,  // ICON_CART -- GB cartridge, notched top-right corner
@@ -784,6 +784,13 @@ static const uint8_t _icons7[][7] = {
 	  0b1000001,
 	  0b1000001,
 	  0b0111110 },
+	{ 0b1110111,  // ICON_SWATCHES -- 2x2 grid of color swatches (THEME row)
+	  0b1110111,
+	  0b1110111,
+	  0b0000000,
+	  0b1110111,
+	  0b1110111,
+	  0b1110111 },
 };
 
 static void draw_icon(int32_t x, int32_t y, icon_t icon, color_t col) {
@@ -801,11 +808,45 @@ constexpr color_t status_rgb(uint32_t r4, uint32_t g4, uint32_t b4) {
 	return (color_t)(r4 | 0xF0 | (b4 << 8) | (g4 << 12));
 }
 
-// UI palette: dark full-screen panels with a single mint-green accent.
-constexpr color_t UI_ACCENT  = status_rgb(4, 13, 8); // mint green
+// UI palette: dark full-screen panels with a single accent color, picked from
+// the themes below (settings THEME row). Everything accent-tinted -- icons,
+// meter fills, header rule, selection pill, battery fill -- follows it.
+struct ui_theme_t {
+	const char *name;
+	color_t accent;
+};
+
+constexpr ui_theme_t UI_THEMES[] = {
+	{ "MINT",      status_rgb( 4, 13,  8) }, // the classic green
+	{ "GRAPE",     status_rgb( 9,  5, 15) },
+	{ "BERRY",     status_rgb(15,  4,  7) },
+	{ "PEACH",     status_rgb(15,  9,  4) },
+	{ "LEMON",     status_rgb(14, 13,  3) },
+	{ "SKY",       status_rgb( 4, 10, 15) },
+	{ "BUBBLEGUM", status_rgb(15,  7, 11) },
+	{ "VANILLA",   status_rgb(14, 13, 10) },
+};
+constexpr uint32_t THEME_COUNT = sizeof(UI_THEMES) / sizeof(UI_THEMES[0]);
+
+// Selected-row pill: the accent knocked down to a dark tint (each channel /4
+// -- MINT's (4,13,8) gives the (1,3,2) pill the UI always had).
+constexpr color_t theme_pill(color_t a) {
+	return status_rgb((a & 0xF) >> 2, ((a >> 12) & 0xF) >> 2,
+			  ((a >> 8) & 0xF) >> 2);
+}
+
+static uint8_t g_theme = 0; // UI_THEMES index, persisted in device settings
+static color_t UI_ACCENT  = UI_THEMES[0].accent;
+static color_t UI_ROW_SEL = theme_pill(UI_THEMES[0].accent);
+
+static void apply_theme(uint32_t idx) {
+	g_theme = (uint8_t)(idx < THEME_COUNT ? idx : 0);
+	UI_ACCENT = UI_THEMES[g_theme].accent;
+	UI_ROW_SEL = theme_pill(UI_ACCENT);
+}
+
 constexpr color_t UI_CARD    = status_rgb(1, 1, 1);  // panel body
 constexpr color_t UI_HEADER  = status_rgb(2, 2, 2);  // header band
-constexpr color_t UI_ROW_SEL = status_rgb(1, 3, 2);  // selected-row pill (green-tinted)
 constexpr color_t UI_TRACK   = status_rgb(3, 3, 3);  // meter tracks, header rule
 constexpr color_t UI_VALUE   = status_rgb(6, 6, 6);   // unselected values/meter fills
 constexpr color_t UI_BRIGHT  = status_rgb(11, 11, 11); // clock digits (unselected)
@@ -1024,6 +1065,7 @@ enum settings_row_t : uint32_t {
 	SET_ROW_VSYNC,
 	SET_ROW_FPS,
 	SET_ROW_BATTERY,
+	SET_ROW_THEME,
 	SET_ROW_DOW, // the clock rows render as the big segmented clock below
 	SET_ROW_HOUR,
 	SET_ROW_MIN,
@@ -1038,31 +1080,40 @@ static const char *const RTC_DOW_NAMES[7] = {
 constexpr int32_t CLK_SCALE = 4;
 constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 
-// Meter rows (BRIGHT, VOLUME) draw a bar underneath and need the full 36px;
-// toggle rows (VSYNC, FPS, BATTERY) are a single text line and fit in less --
-// giving them a smaller slot keeps the RTC clock section below clear of
-// draw_menu_hints()'s fixed y=226 as more toggle rows are added.
-constexpr int32_t METER_ROW_H = 36;
-constexpr int32_t TOGGLE_ROW_H = 24;
+// Meter rows (BRIGHT, VOLUME) draw a bar underneath and need the tallest slot;
+// value rows (VSYNC, FPS, BATTERY, THEME) are a single text line and fit in
+// less -- giving them a smaller slot keeps the RTC clock section below clear
+// of draw_menu_hints()'s fixed y=226 as more rows are added (at 34/20 the
+// clock digits end at y=216, same clearance the pre-THEME 36/24 layout had).
+constexpr int32_t METER_ROW_H = 34;
+constexpr int32_t TOGGLE_ROW_H = 20;
 constexpr uint32_t METER_ROW_COUNT = SET_ROW_VSYNC; // rows before VSYNC are meters
 
 static int32_t settings_row_y(uint32_t row) {
 	if (row < METER_ROW_COUNT)
-		return OFFSET_Y + 14 + (int32_t)row * METER_ROW_H;
-	return OFFSET_Y + 14 + (int32_t)METER_ROW_COUNT * METER_ROW_H +
+		return OFFSET_Y + 10 + (int32_t)row * METER_ROW_H;
+	return OFFSET_Y + 10 + (int32_t)METER_ROW_COUNT * METER_ROW_H +
 	       (int32_t)(row - METER_ROW_COUNT) * TOGGLE_ROW_H;
 }
 
-// Toggle row: icon + label, an ON/OFF value where the meter rows have a bar.
-// Shared by VSYNC, FPS, and BATTERY -- identical layout, just icon/label/value.
-static void draw_toggle_row(uint32_t row, uint32_t sel, icon_t icon,
-			     const char *label, bool value) {
+// Value row: icon + label, a right-aligned text value where the meter rows
+// have a bar. Shared by the toggles (ON/OFF) and the THEME row (theme name).
+static void draw_value_row(uint32_t row, uint32_t sel, icon_t icon,
+			    const char *label, const char *value) {
 	int32_t y = settings_row_y(row);
 	bool is_sel = (row == sel);
+	int32_t n = 0;
+	while (value[n])
+		n++;
 	draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
 	status_text(UI_MARGIN + 22, y + 2, label, is_sel ? STATUS_WHITE : STATUS_GREY);
-	status_text(UI_RIGHT - text_w(value ? 2 : 3), y + 2, value ? "ON" : "OFF",
+	status_text(UI_RIGHT - text_w(n), y + 2, value,
 		    is_sel ? UI_ACCENT : STATUS_GREY);
+}
+
+static void draw_toggle_row(uint32_t row, uint32_t sel, icon_t icon,
+			     const char *label, bool value) {
+	draw_value_row(row, sel, icon, label, value ? "ON" : "OFF");
 }
 
 static void draw_settings_menu(uint32_t sel, uint32_t batt) {
@@ -1109,6 +1160,10 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	draw_toggle_row(SET_ROW_FPS, sel, ICON_BOLT, "FPS", g_show_fps);
 	draw_toggle_row(SET_ROW_BATTERY, sel, ICON_BATTERY, "BATTERY PERCENTAGE",
 			g_show_battery);
+	// THEME: the value is the theme's name; every accent-tinted element on
+	// screen (including this value) recolors live as < > cycles it.
+	draw_value_row(SET_ROW_THEME, sel, ICON_SWATCHES, "THEME",
+		       UI_THEMES[g_theme].name);
 
 	// RTC clock section: DOW : HH : MM as a big segmented clock with a small
 	// caption over each group and the clock icon in the left margin beside
@@ -1252,6 +1307,9 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	case SET_ROW_VSYNC: g_vsync = !g_vsync; return; // either direction toggles
 	case SET_ROW_FPS: g_show_fps = !g_show_fps; return; // either direction toggles
 	case SET_ROW_BATTERY: g_show_battery = !g_show_battery; return; // either direction toggles
+	case SET_ROW_THEME:
+		apply_theme((g_theme + THEME_COUNT + (uint32_t)dir) % THEME_COUNT);
+		return;
 	// RTC fields wrap so either direction reaches any value quickly.
 	case SET_ROW_DOW:  g_rtc_dow  = (uint8_t)((g_rtc_dow + 7 + dir) % 7);    break;
 	case SET_ROW_HOUR: g_rtc_hour = (uint8_t)((g_rtc_hour + 24 + dir) % 24); break;
@@ -1364,7 +1422,7 @@ static void settings_menu(bool in_game) {
 			(uint8_t)(g_vsync ? 1 : 0),
 			(uint8_t)(g_show_fps ? 1 : 0),
 			(uint8_t)(g_show_battery ? 1 : 0),
-			0,
+			g_theme,
 		};
 		save_storage_settings_store(ds);
 	}
@@ -1482,6 +1540,7 @@ int main() {
 			g_vsync = ds.vsync != 0;
 			g_show_fps = ds.show_fps != 0;
 			g_show_battery = ds.show_battery != 0;
+			apply_theme(ds.theme); // out-of-range falls back to MINT
 #if ENABLE_SOUND
 			audio_output_set_volume(ds.volume); // clamps internally
 #endif
