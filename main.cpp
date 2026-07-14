@@ -310,6 +310,20 @@ static volatile bool g_vsync = false;
 static bool g_show_fps = true;
 static bool g_show_battery = true;
 
+// The LED reports battery charge: a green->red gradient (green ~= full,
+// red ~= nearly empty) at ~30% brightness so it glows rather than glares.
+// The usable ~5..100 span maps to the gradient, blended through yellow.
+// Shared by the in-game run loop and the menus (boot ROM picker, settings).
+static void led_show_battery(int level) {
+	if (level < 5)   level = 5;
+	if (level > 100) level = 100;
+	constexpr int BRIGHTNESS = 30;      // ~30% max brightness
+	int fill = (level - 5) * 100 / 95;  // 0 (empty) .. 100 (full)
+	led((100 - fill) * BRIGHTNESS / 100, // red rises as it drains
+	    fill * BRIGHTNESS / 100,         // green rises as it fills
+	    0);
+}
+
 // Poll PicoSystem's 8 buttons and pack them into the GBC joypad byte (active
 // low, per JOYPAD_* in walnut_cgb.h). PicoSystem has no Start/Select of its
 // own, so per the plan: X->Start, Y->Select. Holding Y and X together opens
@@ -971,7 +985,8 @@ static void draw_menu_hints(const char *s) {
 // BATTERY_UPDATE_FRAMES in main()) -- the level changes slowly, so reading
 // the ADC every menu frame would be waste. The counter starts at the
 // threshold so the very first frame paints a real level instead of leaving
-// the icon blank for ~0.5s.
+// the icon blank for ~0.5s. Each fresh reading also drives the battery LED,
+// so the gradient shows from the boot ROM picker onward, not just in-game.
 struct menu_battery_poll {
 	static constexpr int INTERVAL_FRAMES = 30;
 	int count = INTERVAL_FRAMES;
@@ -983,6 +998,7 @@ struct menu_battery_poll {
 			if (b < 0)   b = 0;
 			if (b > 100) b = 100;
 			level = (uint32_t)b;
+			led_show_battery(b);
 		}
 		return level;
 	}
@@ -1760,10 +1776,6 @@ int main() {
 
 		if (++battery_count >= BATTERY_UPDATE_FRAMES) {
 			battery_count = 0;
-			// battery() is 0..100. Map the usable ~5..100 span to a green->red
-			// gradient: full -> green, ~5% -> red, blended through yellow in
-			// between. Scaled to ~30% of the LED's 0..100 range so it glows
-			// rather than glares.
 			int level = battery();
 			if (level < 0)   level = 0;
 			if (level > 100) level = 100;
@@ -1779,12 +1791,7 @@ int main() {
 				status_dirty = true;
 			}
 #endif
-			if (level < 5)   level = 5;
-			constexpr int BRIGHTNESS = 30;      // ~30% max brightness
-			int fill = (level - 5) * 100 / 95;  // 0 (empty) .. 100 (full)
-			led((100 - fill) * BRIGHTNESS / 100, // red rises as it drains
-			    fill * BRIGHTNESS / 100,         // green rises as it fills
-			    0);
+			led_show_battery(level);
 		}
 
 #if ENABLE_LCD
