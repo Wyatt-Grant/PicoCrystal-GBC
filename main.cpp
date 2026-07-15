@@ -991,7 +991,9 @@ static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
 	color_t fill = batt >= 66 ? BATT_GREEN            // healthy
 		     : batt >= 11 ? status_rgb(13, 10, 2) // 11..65%
 				  : status_rgb(13, 3, 2);    // <= 10%
-	int32_t fw = (int32_t)(batt * 14 + 50) / 100; // rounded, 0..14
+	int32_t fw = (int32_t)(batt * 13 + 50) / 100; // rounded, 0..13 -- leaves a
+							// 1px gap on both sides of
+							// the interior at full charge
 	for (int32_t ry = 2; ry <= 10; ry++) {
 		color_t *d = SCREEN->p(x + 2, y + ry);
 		for (int32_t rx = 0; rx < fw; rx++)
@@ -1003,10 +1005,17 @@ static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
 // Shared by the in-game status bar and the menu card headers. show_pct=false
 // drops the "<n>%" text and keeps the icon (the in-game BATTERY PERCENTAGE
 // toggle -- the icon's fill still shows the level at a glance).
+//
+// The icon (17x13, see draw_battery_icon) is 3px taller than the "<n>%"
+// text (6x10 glyphs at status_text's 2x scale), so drawing both at the same
+// `top` leaves their vertical centers off by 1.5px -- the icon reads as
+// sitting low against the text. BATT_ICON_Y_ADJ shifts the icon up to
+// re-center it against the text's midline.
+constexpr int32_t BATT_ICON_Y_ADJ = 2;
 static void draw_battery_block(int32_t right, int32_t top, uint32_t batt,
 				bool show_pct = true) {
 	char buf[12];
-	draw_battery_icon(right - BATT_ICON_W, top, batt);
+	draw_battery_icon(right - BATT_ICON_W, top - BATT_ICON_Y_ADJ, batt);
 	if (!show_pct)
 		return;
 	int32_t n = status_fmt_uint(buf, batt);
