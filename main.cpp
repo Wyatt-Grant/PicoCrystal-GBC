@@ -251,7 +251,7 @@ static void gb_error(struct gb_s *, const enum gb_error_e, const uint16_t) {
 // Volume step used by the settings menu's VOLUME row (settings_step()
 // below). audio_output's native range is 0..800, a "percent of unity" that
 // goes up to 8x -- see audio_output.hpp.
-constexpr uint16_t VOLUME_STEP = 50; // 0..800 in 16 steps
+constexpr uint16_t VOLUME_STEP = 40; // 0..800 in 20 steps -- 5% of unity per step
 constexpr uint16_t VOLUME_MAX = 800;
 
 static inline void adjust_volume(int32_t dir) { // dir > 0: up, dir < 0: down
@@ -268,7 +268,7 @@ static inline void adjust_volume(int32_t dir) { // dir > 0: up, dir < 0: down
 // Floored above 0 (never fully black): there's no other way to see the
 // picker or a running game well enough to bring brightness back up again.
 static uint8_t g_brightness = 75;
-constexpr uint8_t BRIGHTNESS_STEP = 10; // 0..100 in 10 steps
+constexpr uint8_t BRIGHTNESS_STEP = 5; // 0..100 in 20 steps -- 5% per step
 constexpr uint8_t BRIGHTNESS_MIN = 10;
 
 static inline void adjust_brightness(int32_t dir) { // dir > 0: up, dir < 0: down
@@ -862,6 +862,10 @@ constexpr ui_theme_t UI_THEMES[] = {
 	{ "VANILLA",   status_rgb(14, 13, 10) },
 };
 constexpr uint32_t THEME_COUNT = sizeof(UI_THEMES) / sizeof(UI_THEMES[0]);
+// Pseudo-theme past the last fixed entry: cycles UI_ACCENT through the hue
+// wheel instead of a static color, so it can't live in UI_THEMES[] above.
+constexpr uint32_t THEME_RGB = THEME_COUNT;
+constexpr uint32_t THEME_OPTION_COUNT = THEME_COUNT + 1;
 
 // Selected-row pill (boot menu highlight). Dark mode: the accent knocked down
 // to a dark tint (each channel /4 -- MINT's (4,13,8) gives the (1,3,2) pill the
@@ -883,9 +887,36 @@ static color_t UI_ACCENT  = UI_THEMES[0].accent;
 static color_t UI_ROW_SEL = theme_pill(UI_THEMES[0].accent);
 
 static void apply_theme(uint32_t idx) {
-	g_theme = (uint8_t)(idx < THEME_COUNT ? idx : 0);
-	UI_ACCENT = UI_THEMES[g_theme].accent;
+	g_theme = (uint8_t)(idx < THEME_OPTION_COUNT ? idx : 0);
+	// RGB pseudo-theme: seed a starting hue here; update_rgb_theme() takes
+	// over recomputing UI_ACCENT every LED-update tick while it's selected.
+	UI_ACCENT = g_theme < THEME_COUNT ? UI_THEMES[g_theme].accent
+					   : hsv(0.0f, 1.0f, 1.0f);
 	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
+}
+
+// RGB pseudo-theme: cycles UI_ACCENT (and, via led_show_rgb(), the power LED)
+// through the hue wheel over time. Called from the same throttled ~0.75s
+// cadence as the battery-LED update (menu_battery_poll::poll(), the run
+// loop's BATTERY_UPDATE_FRAMES block) rather than every frame -- a step per
+// tick still reads as a smooth cycle without adding a per-frame cost.
+static void update_rgb_theme() {
+	if (g_theme != THEME_RGB)
+		return;
+	static uint32_t step = 0;
+	step = (step + 1) % 32; // 32 hue steps per revolution
+	UI_ACCENT = hsv((float)step / 32.0f, 1.0f, 1.0f);
+	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
+}
+
+// Drives the power LED from the current (just-updated) UI_ACCENT, mirroring
+// the RGB pseudo-theme on screen. Same brightness cap as led_show_battery()
+// so it glows rather than glares.
+static void led_show_rgb() {
+	constexpr int BRIGHTNESS = 30;
+	led((uint8_t)((UI_ACCENT & 0xF) * BRIGHTNESS / 15),
+	    (uint8_t)(((UI_ACCENT >> 12) & 0xF) * BRIGHTNESS / 15),
+	    (uint8_t)(((UI_ACCENT >> 8) & 0xF) * BRIGHTNESS / 15));
 }
 
 // Neutral background/text ramp, swapped as a set by apply_mode() (see below).
@@ -936,29 +967,32 @@ static void apply_mode(uint32_t dark) {
 	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
 }
 
-// Battery icon: a 14x10 rounded body outline plus a 2x4 terminal nub (16px
-// total), its interior filled proportionally to the charge level -- accent
-// green while healthy, amber under 25%, red under 10%.
-constexpr int32_t BATT_ICON_W = 16;
+// Battery icon: a 17x13 rounded body outline plus a 3x5 terminal nub (20px
+// total), its interior filled proportionally to the charge level -- a fixed
+// green/yellow/red gradient, independent of the UI accent theme (including
+// the RGB pseudo-theme) so the charge state always reads the same way.
+constexpr int32_t BATT_ICON_W = 20;
+constexpr color_t BATT_GREEN = status_rgb(4, 13, 8); // >= 66%
 
 static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
-	for (int32_t i = 1; i < 13; i++) {
-		*SCREEN->p(x + i, y)     = STATUS_GREY;
-		*SCREEN->p(x + i, y + 9) = STATUS_GREY;
+	for (int32_t i = 1; i < 16; i++) {
+		*SCREEN->p(x + i, y)      = STATUS_GREY;
+		*SCREEN->p(x + i, y + 12) = STATUS_GREY;
 	}
-	for (int32_t i = 1; i < 9; i++) {
+	for (int32_t i = 1; i < 12; i++) {
 		*SCREEN->p(x, y + i)      = STATUS_GREY;
-		*SCREEN->p(x + 13, y + i) = STATUS_GREY;
+		*SCREEN->p(x + 16, y + i) = STATUS_GREY;
 	}
-	for (int32_t i = 3; i <= 6; i++) {
-		*SCREEN->p(x + 14, y + i) = STATUS_GREY;
-		*SCREEN->p(x + 15, y + i) = STATUS_GREY;
+	for (int32_t i = 4; i <= 8; i++) {
+		*SCREEN->p(x + 17, y + i) = STATUS_GREY;
+		*SCREEN->p(x + 18, y + i) = STATUS_GREY;
+		*SCREEN->p(x + 19, y + i) = STATUS_GREY;
 	}
-	color_t fill = batt > 25 ? UI_ACCENT
-		     : batt > 10 ? status_rgb(13, 10, 2)
-				 : status_rgb(13, 3, 2);
-	int32_t fw = (int32_t)(batt * 11 + 50) / 100; // rounded, 0..11
-	for (int32_t ry = 2; ry <= 7; ry++) {
+	color_t fill = batt >= 66 ? BATT_GREEN            // healthy
+		     : batt >= 11 ? status_rgb(13, 10, 2) // 11..65%
+				  : status_rgb(13, 3, 2);    // <= 10%
+	int32_t fw = (int32_t)(batt * 14 + 50) / 100; // rounded, 0..14
+	for (int32_t ry = 2; ry <= 10; ry++) {
 		color_t *d = SCREEN->p(x + 2, y + ry);
 		for (int32_t rx = 0; rx < fw; rx++)
 			d[rx] = fill;
@@ -990,6 +1024,13 @@ constexpr int32_t HDR_TOP = 7;    // (24 - 10px glyph height) / 2
 constexpr int32_t UI_MARGIN = 12; // screen-edge margin for all UI content
 constexpr int32_t UI_RIGHT = 240 - UI_MARGIN;
 
+// In-game header rule: always dark, regardless of light/dark mode. This
+// hairline sits directly above the scaled GBC frame, not other UI chrome, so
+// it shouldn't lighten with UI_TRACK's light-mode ramp -- in light mode
+// UI_TRACK is near-white there and reads as a stray bright line against the
+// game content below it.
+constexpr color_t STATUS_RULE = status_rgb(3, 3, 3);
+
 // bottom_gap reserves that many rows at the band's bottom edge (painted in the
 // band color, below the rule) so the hairline rule doesn't sit flush against
 // whatever follows. Used in-game to keep the rule off the top of the scaled
@@ -1017,11 +1058,11 @@ static void draw_status_bar(uint32_t fps, uint32_t batt, bool saving) {
 	// 8px advance, not the header's letterspaced 12px: at 16 glyphs the
 	// letterspaced version would run into the battery block.
 	if (saving) {
-		draw_header_band("", batt, UI_TRACK, g_show_battery, 1);
+		draw_header_band("", batt, STATUS_RULE, g_show_battery, 1);
 		status_text(UI_MARGIN, HDR_TOP, "WRITING TO FLASH", UI_ACCENT);
 		return;
 	}
-	draw_header_band(g_show_fps ? "FPS" : "", batt, UI_TRACK, g_show_battery, 1);
+	draw_header_band(g_show_fps ? "FPS" : "", batt, STATUS_RULE, g_show_battery, 1);
 	if (g_show_fps) {
 		char buf[12];
 		int32_t n = status_fmt_uint(buf, fps);
@@ -1075,7 +1116,12 @@ struct menu_battery_poll {
 			if (b < 0)   b = 0;
 			if (b > 100) b = 100;
 			level = (uint32_t)b;
-			led_show_battery(b);
+			if (g_theme == THEME_RGB) {
+				update_rgb_theme();
+				led_show_rgb();
+			} else {
+				led_show_battery(b);
+			}
 		}
 		return level;
 	}
@@ -1185,6 +1231,16 @@ static int32_t settings_row_y(uint32_t row) {
 	return OFFSET_Y + 10 + (int32_t)row * ROW_H;
 }
 
+// Selected-row highlight pill -- same two-rect shape as the boot menu's row
+// highlight (draw_boot_menu), offset for settings rows' icon/text baseline:
+// boot's `y` is the row top with its icon drawn at y+4, while settings rows
+// draw their icon directly at `y`, so this shifts by that same 4px to keep
+// the pill centered on the row content.
+static void draw_row_highlight(int32_t y) {
+	fill_rect(UI_MARGIN - 6, y - 3, UI_RIGHT - UI_MARGIN + 12, 18, UI_ROW_SEL);
+	fill_rect(UI_MARGIN - 5, y - 4, UI_RIGHT - UI_MARGIN + 10, 20, UI_ROW_SEL);
+}
+
 // Value row: icon + label, a right-aligned text value where the meter rows
 // have a bar. Shared by the toggles (ON/OFF) and the THEME row (theme name).
 static void draw_value_row(uint32_t row, uint32_t sel, icon_t icon,
@@ -1194,6 +1250,8 @@ static void draw_value_row(uint32_t row, uint32_t sel, icon_t icon,
 	int32_t n = 0;
 	while (value[n])
 		n++;
+	if (is_sel)
+		draw_row_highlight(y);
 	draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
 	status_text(UI_MARGIN + 22, y + 2, label, is_sel ? UI_ACCENT : STATUS_GREY);
 	status_text(UI_RIGHT - text_w(n), y + 2, value,
@@ -1216,7 +1274,7 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// changes with the digit count (9%..100%), so the bar is anchored to a
 	// fixed slot sized for the widest value ("100%") and holds still as the
 	// number ticks rather than shifting with it.
-	constexpr int32_t MINI_BAR_W = 44, MINI_BAR_H = 8;
+	constexpr int32_t MINI_BAR_W = 64, MINI_BAR_H = 8;
 	constexpr int32_t bar_x = UI_RIGHT - text_w(4) - 8 - MINI_BAR_W;
 	for (uint32_t row = 0; row < SET_ROW_VSYNC; row++) {
 		int32_t y = settings_row_y(row);
@@ -1234,6 +1292,8 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 			value = ((uint32_t)audio_output_get_volume() * 100 + VOLUME_MAX / 2) / VOLUME_MAX;
 		}
 #endif
+		if (is_sel)
+			draw_row_highlight(y);
 		draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
 		status_text(UI_MARGIN + 22, y + 2, label,
 			    is_sel ? UI_ACCENT : STATUS_GREY);
@@ -1256,10 +1316,11 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	draw_toggle_row(SET_ROW_FPS, sel, ICON_BOLT, "FPS", g_show_fps);
 	draw_toggle_row(SET_ROW_BATTERY, sel, ICON_BATTERY, "BATTERY PERCENTAGE",
 			g_show_battery);
-	// THEME: the value is the theme's name; every accent-tinted element on
-	// screen (including this value) recolors live as < > cycles it.
+	// THEME: the value is the theme's name (or "RGB" for the cycling
+	// pseudo-theme); every accent-tinted element on screen (including this
+	// value) recolors live as < > cycles it.
 	draw_value_row(SET_ROW_THEME, sel, ICON_SWATCHES, "THEME",
-		       UI_THEMES[g_theme].name);
+		       g_theme < THEME_COUNT ? UI_THEMES[g_theme].name : "RGB");
 	// APPEARANCE: dark/light -- swaps the neutral ramp live, so the whole
 	// panel (and this row) recolors as < > toggles it.
 	draw_value_row(SET_ROW_MODE, sel, ICON_CONTRAST, "APPEARANCE",
@@ -1357,8 +1418,18 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		int32_t name_max = UI_RIGHT - name_x;
 		if (i < ROM_COUNT) {
 			// Right-aligned size column, accent on the selected row.
-			int32_t n = status_fmt_uint(buf, (rom_catalog[i].size + 1023) / 1024);
-			buf[n] = 'K';
+			// GBC ROM sizes are always a power of two (per the cartridge
+			// header size field), so an exact multiple of 1024K is shown
+			// in whole megabytes instead ("1M" rather than "1024K").
+			uint32_t kb = (rom_catalog[i].size + 1023) / 1024;
+			int32_t n;
+			if (kb % 1024 == 0) {
+				n = status_fmt_uint(buf, kb / 1024);
+				buf[n] = 'M';
+			} else {
+				n = status_fmt_uint(buf, kb);
+				buf[n] = 'K';
+			}
 			buf[n + 1] = '\0';
 			int32_t vx = UI_RIGHT - text_w(n + 1);
 			status_text(vx, y + 6, buf, is_sel ? UI_ACCENT : UI_VALUE);
@@ -1412,7 +1483,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	case SET_ROW_FPS: g_show_fps = !g_show_fps; return; // either direction toggles
 	case SET_ROW_BATTERY: g_show_battery = !g_show_battery; return; // either direction toggles
 	case SET_ROW_THEME:
-		apply_theme((g_theme + THEME_COUNT + (uint32_t)dir) % THEME_COUNT);
+		apply_theme((g_theme + THEME_OPTION_COUNT + (uint32_t)dir) % THEME_OPTION_COUNT);
 		return;
 	case SET_ROW_MODE: apply_mode(!g_dark_mode); return; // either direction toggles
 	// RTC fields wrap so either direction reaches any value quickly.
@@ -1882,7 +1953,16 @@ int main() {
 				status_dirty = true;
 			}
 #endif
-			led_show_battery(level);
+			if (g_theme == THEME_RGB) {
+				// The battery icon's fill is fixed (not accent-tied), and
+				// nothing else in the in-game header reads UI_ACCENT, so
+				// the new hue needs no forced repaint here -- only the LED
+				// changes on this tick.
+				update_rgb_theme();
+				led_show_rgb();
+			} else {
+				led_show_battery(level);
+			}
 		}
 
 #if ENABLE_LCD
