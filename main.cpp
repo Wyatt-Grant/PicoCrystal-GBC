@@ -739,7 +739,7 @@ static void menu_text(int32_t x, int32_t y, const char *s, color_t col,
 
 // 7x7 1-bit icons for the menu rows, drawn at 2x (14x14) by draw_icon().
 // MSB is the leftmost pixel.
-enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY, ICON_SWATCHES };
+enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY, ICON_SWATCHES, ICON_CONTRAST };
 
 static const uint8_t _icons7[][7] = {
 	{ 0b1111110,  // ICON_CART -- GB cartridge, notched top-right corner
@@ -805,6 +805,13 @@ static const uint8_t _icons7[][7] = {
 	  0b1110111,
 	  0b1110111,
 	  0b1110111 },
+	{ 0b0011100,  // ICON_CONTRAST -- circle, left half filled (APPEARANCE row)
+	  0b0111010,
+	  0b1111001,
+	  0b1111001,
+	  0b1111001,
+	  0b0111010,
+	  0b0011100 },
 };
 
 static void draw_icon(int32_t x, int32_t y, icon_t icon, color_t col) {
@@ -824,8 +831,13 @@ static void draw_cart_label(int32_t x, int32_t y, color_t col) {
 }
 
 // RGBA4444 layout per rgb565_to_color: R in bits 0-3, A 4-7, B 8-11, G 12-15.
-constexpr color_t STATUS_WHITE = 0xFFFF;
-constexpr color_t STATUS_GREY  = 0x88F8;
+// STATUS_WHITE/GREY carry the primary/secondary text roles; along with the six
+// UI_* neutrals below they are swapped between dark and light by apply_mode()
+// (settings APPEARANCE row), so they are mutable globals, not constexpr. Their
+// initializers are the dark-mode values, so the UI is correct before the stored
+// mode is applied at boot.
+static color_t STATUS_WHITE = 0xFFFF;
+static color_t STATUS_GREY  = 0x88F8;
 
 constexpr color_t status_rgb(uint32_t r4, uint32_t g4, uint32_t b4) {
 	return (color_t)(r4 | 0xF0 | (b4 << 8) | (g4 << 12));
@@ -845,35 +857,84 @@ constexpr ui_theme_t UI_THEMES[] = {
 	{ "BERRY",     status_rgb(15,  4,  7) },
 	{ "PEACH",     status_rgb(15,  9,  4) },
 	{ "LEMON",     status_rgb(14, 13,  3) },
-	{ "SKY",       status_rgb( 4, 10, 15) },
+	{ "BLUEBERRY", status_rgb( 4, 10, 15) },
 	{ "BUBBLEGUM", status_rgb(15,  7, 11) },
 	{ "VANILLA",   status_rgb(14, 13, 10) },
 };
 constexpr uint32_t THEME_COUNT = sizeof(UI_THEMES) / sizeof(UI_THEMES[0]);
 
-// Selected-row pill: the accent knocked down to a dark tint (each channel /4
-// -- MINT's (4,13,8) gives the (1,3,2) pill the UI always had).
+// Selected-row pill (boot menu highlight). Dark mode: the accent knocked down
+// to a dark tint (each channel /4 -- MINT's (4,13,8) gives the (1,3,2) pill the
+// UI always had). Light mode: the accent lifted toward white instead, so the
+// highlight reads as a soft tint on the light card rather than a dark blob.
 constexpr color_t theme_pill(color_t a) {
 	return status_rgb((a & 0xF) >> 2, ((a >> 12) & 0xF) >> 2,
 			  ((a >> 8) & 0xF) >> 2);
 }
+constexpr uint32_t lift4(uint32_t c) { return 15 - (15 - c) * 3 / 16; } // 13/16 toward white
+constexpr color_t light_pill(color_t a) {
+	return status_rgb(lift4(a & 0xF), lift4((a >> 12) & 0xF),
+			  lift4((a >> 8) & 0xF));
+}
 
-static uint8_t g_theme = 0; // UI_THEMES index, persisted in device settings
+static uint8_t g_theme = 0;     // UI_THEMES index, persisted in device settings
+static uint8_t g_dark_mode = 1; // 1 = dark, 0 = light; persisted in device settings
 static color_t UI_ACCENT  = UI_THEMES[0].accent;
 static color_t UI_ROW_SEL = theme_pill(UI_THEMES[0].accent);
 
 static void apply_theme(uint32_t idx) {
 	g_theme = (uint8_t)(idx < THEME_COUNT ? idx : 0);
 	UI_ACCENT = UI_THEMES[g_theme].accent;
-	UI_ROW_SEL = theme_pill(UI_ACCENT);
+	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
 }
 
-constexpr color_t UI_CARD    = status_rgb(1, 1, 1);  // panel body
-constexpr color_t UI_HEADER  = status_rgb(2, 2, 2);  // header band
-constexpr color_t UI_TRACK   = status_rgb(3, 3, 3);  // meter tracks, header rule
-constexpr color_t UI_VALUE   = status_rgb(6, 6, 6);   // unselected values/meter fills
-constexpr color_t UI_BRIGHT  = status_rgb(11, 11, 11); // clock digits (unselected)
-constexpr color_t STATUS_DIM = status_rgb(5, 5, 5);   // faint text: hints, colons
+// Neutral background/text ramp, swapped as a set by apply_mode() (see below).
+// Initialized to the dark-mode values so the UI is correct before the stored
+// mode is applied at boot; light mode inverts them (light card, dark text).
+static color_t UI_CARD    = status_rgb(1, 1, 1);  // panel body
+static color_t UI_HEADER  = status_rgb(2, 2, 2);  // header band
+static color_t UI_TRACK   = status_rgb(3, 3, 3);  // meter tracks, header rule
+static color_t UI_VALUE   = status_rgb(6, 6, 6);   // unselected value text (e.g. ROM size)
+static color_t UI_FILL    = status_rgb(6, 6, 6);   // unselected meter fill (kept dark on the light track)
+static color_t UI_BRIGHT  = status_rgb(11, 11, 11); // clock digits (unselected)
+static color_t STATUS_DIM = status_rgb(5, 5, 5);   // faint text: hints, colons
+
+// Dark/light appearance (settings APPEARANCE row), orthogonal to the accent
+// theme above: it swaps only the neutral ramp and the pill tint direction,
+// leaving the chosen accent (and the amber/red low-battery literals) alone.
+// g_dark_mode (declared with the theme state above) defaults to 1 so a fresh
+// device -- or one whose settings record was reset by an upgrade -- keeps the
+// classic dark look.
+struct ui_mode_t {
+	color_t white, grey, card, header, track, value, fill, bright, dim;
+};
+constexpr ui_mode_t UI_MODES[2] = {
+	// [0] DARK -- the values the UI has always used.
+	{ 0xFFFF, 0x88F8, status_rgb(1, 1, 1), status_rgb(2, 2, 2),
+	  status_rgb(3, 3, 3), status_rgb(6, 6, 6), status_rgb(6, 6, 6),
+	  status_rgb(11, 11, 11), status_rgb(5, 5, 5) },
+	// [1] LIGHT -- light card, dark text. Unselected text (grey/value) stays
+	// light so the accent-colored selected row reads as the focus; the meter
+	// fill stays dark so it's legible against the lighter track.
+	{ status_rgb(1, 1, 1), status_rgb(10, 10, 10), status_rgb(15, 15, 15),
+	  status_rgb(13, 13, 13), status_rgb(11, 11, 11), status_rgb(10, 10, 10),
+	  status_rgb(6, 6, 6), status_rgb(3, 3, 3), status_rgb(9, 9, 9) },
+};
+
+static void apply_mode(uint32_t dark) {
+	g_dark_mode = dark ? 1 : 0;
+	const ui_mode_t &m = UI_MODES[g_dark_mode ? 0 : 1];
+	STATUS_WHITE = m.white;
+	STATUS_GREY  = m.grey;
+	UI_CARD   = m.card;
+	UI_HEADER = m.header;
+	UI_TRACK  = m.track;
+	UI_VALUE  = m.value;
+	UI_FILL   = m.fill;
+	UI_BRIGHT = m.bright;
+	STATUS_DIM = m.dim;
+	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
+}
 
 // Battery icon: a 14x10 rounded body outline plus a 2x4 terminal nub (16px
 // total), its interior filled proportionally to the charge level -- accent
@@ -1098,6 +1159,7 @@ enum settings_row_t : uint32_t {
 	SET_ROW_FPS,
 	SET_ROW_BATTERY,
 	SET_ROW_THEME,
+	SET_ROW_MODE, // APPEARANCE: dark/light
 	SET_ROW_DOW, // the clock rows render as the big segmented clock below
 	SET_ROW_HOUR,
 	SET_ROW_MIN,
@@ -1112,20 +1174,15 @@ static const char *const RTC_DOW_NAMES[7] = {
 constexpr int32_t CLK_SCALE = 4;
 constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 
-// Meter rows (BRIGHT, VOLUME) draw a bar underneath and need the tallest slot;
-// value rows (VSYNC, FPS, BATTERY, THEME) are a single text line and fit in
-// less -- giving them a smaller slot keeps the RTC clock section below clear
-// of draw_menu_hints()'s fixed y=226 as more rows are added (at 34/20 the
-// clock digits end at y=216, same clearance the pre-THEME 36/24 layout had).
-constexpr int32_t METER_ROW_H = 34;
-constexpr int32_t TOGGLE_ROW_H = 20;
-constexpr uint32_t METER_ROW_COUNT = SET_ROW_VSYNC; // rows before VSYNC are meters
+// Every setting row is a single text line now -- BRIGHT/VOLUME carry a compact
+// inline meter bar on the same line rather than a full-width bar underneath --
+// so all rows share one height. Uniform 20px keeps the RTC clock section below
+// clear of draw_menu_hints()'s fixed y=226 (with rows through APPEARANCE the
+// clock anchors at y=174 and the digits end at ~y=208).
+constexpr int32_t ROW_H = 20;
 
 static int32_t settings_row_y(uint32_t row) {
-	if (row < METER_ROW_COUNT)
-		return OFFSET_Y + 10 + (int32_t)row * METER_ROW_H;
-	return OFFSET_Y + 10 + (int32_t)METER_ROW_COUNT * METER_ROW_H +
-	       (int32_t)(row - METER_ROW_COUNT) * TOGGLE_ROW_H;
+	return OFFSET_Y + 10 + (int32_t)row * ROW_H;
 }
 
 // Value row: icon + label, a right-aligned text value where the meter rows
@@ -1138,7 +1195,7 @@ static void draw_value_row(uint32_t row, uint32_t sel, icon_t icon,
 	while (value[n])
 		n++;
 	draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
-	status_text(UI_MARGIN + 22, y + 2, label, is_sel ? STATUS_WHITE : STATUS_GREY);
+	status_text(UI_MARGIN + 22, y + 2, label, is_sel ? UI_ACCENT : STATUS_GREY);
 	status_text(UI_RIGHT - text_w(n), y + 2, value,
 		    is_sel ? UI_ACCENT : STATUS_GREY);
 }
@@ -1153,8 +1210,14 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 
 	char buf[8];
 
-	// Meter rows: icon + label, % value, meter bar underneath. Selection
-	// reads by color -- the selected row's value and fill go accent green.
+	// Meter rows: icon + label, then an inline bar and its % value, all on one
+	// line. Selection reads by color -- the selected row's value and fill go
+	// accent green. The % text is right-aligned at UI_RIGHT, but its width
+	// changes with the digit count (9%..100%), so the bar is anchored to a
+	// fixed slot sized for the widest value ("100%") and holds still as the
+	// number ticks rather than shifting with it.
+	constexpr int32_t MINI_BAR_W = 44, MINI_BAR_H = 8;
+	constexpr int32_t bar_x = UI_RIGHT - text_w(4) - 8 - MINI_BAR_W;
 	for (uint32_t row = 0; row < SET_ROW_VSYNC; row++) {
 		int32_t y = settings_row_y(row);
 		bool is_sel = (row == sel);
@@ -1173,16 +1236,17 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 #endif
 		draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
 		status_text(UI_MARGIN + 22, y + 2, label,
-			    is_sel ? STATUS_WHITE : STATUS_GREY);
+			    is_sel ? UI_ACCENT : STATUS_GREY);
 		int32_t n = status_fmt_uint(buf, value);
 		buf[n] = '%';
 		buf[n + 1] = '\0';
 		status_text(UI_RIGHT - text_w(n + 1), y + 2, buf,
 			    is_sel ? UI_ACCENT : STATUS_GREY);
-		fill_rect(UI_MARGIN, y + 20, UI_RIGHT - UI_MARGIN, 6, UI_TRACK);
-		fill_rect(UI_MARGIN, y + 20,
-			  (int32_t)(value * (UI_RIGHT - UI_MARGIN) / 100), 6,
-			  is_sel ? UI_ACCENT : UI_VALUE);
+		// Bar vertically centered on the 10px-tall glyphs (y+2..y+12).
+		int32_t by = y + 2;
+		fill_rect(bar_x, by, MINI_BAR_W, MINI_BAR_H, UI_TRACK);
+		fill_rect(bar_x, by, (int32_t)(value * MINI_BAR_W / 100), MINI_BAR_H,
+			  is_sel ? UI_ACCENT : UI_FILL);
 	}
 
 	// VSYNC: ON trades a little emulation headroom for tear-free scrolling
@@ -1196,6 +1260,10 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// screen (including this value) recolors live as < > cycles it.
 	draw_value_row(SET_ROW_THEME, sel, ICON_SWATCHES, "THEME",
 		       UI_THEMES[g_theme].name);
+	// APPEARANCE: dark/light -- swaps the neutral ramp live, so the whole
+	// panel (and this row) recolors as < > toggles it.
+	draw_value_row(SET_ROW_MODE, sel, ICON_CONTRAST, "APPEARANCE",
+		       g_dark_mode ? "DARK" : "LIGHT");
 
 	// RTC clock section: DOW : HH : MM as a big segmented clock with a small
 	// caption over each group and the clock icon in the left margin beside
@@ -1346,6 +1414,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	case SET_ROW_THEME:
 		apply_theme((g_theme + THEME_COUNT + (uint32_t)dir) % THEME_COUNT);
 		return;
+	case SET_ROW_MODE: apply_mode(!g_dark_mode); return; // either direction toggles
 	// RTC fields wrap so either direction reaches any value quickly.
 	case SET_ROW_DOW:  g_rtc_dow  = (uint8_t)((g_rtc_dow + 7 + dir) % 7);    break;
 	case SET_ROW_HOUR: g_rtc_hour = (uint8_t)((g_rtc_hour + 24 + dir) % 24); break;
@@ -1459,6 +1528,7 @@ static void settings_menu(bool in_game) {
 			(uint8_t)(g_show_fps ? 1 : 0),
 			(uint8_t)(g_show_battery ? 1 : 0),
 			g_theme,
+			g_dark_mode,
 		};
 		save_storage_settings_store(ds);
 	}
@@ -1577,6 +1647,7 @@ int main() {
 			g_show_fps = ds.show_fps != 0;
 			g_show_battery = ds.show_battery != 0;
 			apply_theme(ds.theme); // out-of-range falls back to MINT
+			apply_mode(ds.dark_mode); // restore dark/light appearance
 #if ENABLE_SOUND
 			audio_output_set_volume(ds.volume); // clamps internally
 #endif

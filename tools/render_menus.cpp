@@ -130,5 +130,19 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/settings_grape.ppm", dir);
 	write_ppm(path);
 
+	// Light mode with the APPEARANCE row selected -- the whole neutral ramp
+	// inverts (light card, dark text) while the accent theme stays put.
+	apply_theme(0); // back to MINT
+	apply_mode(0);  // LIGHT
+	draw_settings_menu(SET_ROW_MODE, 82);
+	snprintf(path, sizeof path, "%s/settings_light.ppm", dir);
+	write_ppm(path);
+	// Boot menu in light mode: the selection pill should read as a soft tint,
+	// not the dark dark-mode blob.
+	draw_boot_menu(1, 82);
+	snprintf(path, sizeof path, "%s/boot_light.ppm", dir);
+	write_ppm(path);
+	apply_mode(1); // restore DARK for any later frames
+
 	return 0;
 }
