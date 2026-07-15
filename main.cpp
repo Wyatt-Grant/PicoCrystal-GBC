@@ -1768,9 +1768,9 @@ int main() {
 #if ENABLE_LCD
 		// Repaint the header when the autosave commit window opens or
 		// closes -- draw_status_bar() swaps the FPS readout for WRITING TO
-		// FLASH. The commit itself only takes ~0.5s, too quick to reliably
-		// notice, so the indicator is held up for at least a full second.
-		constexpr uint64_t SAVING_HOLD_US = 1000000;
+		// FLASH. The commit programs ~1s of 512B chunks; hold the indicator
+		// so it stays on screen a beat past the write and is easy to notice.
+		constexpr uint64_t SAVING_HOLD_US = 2000000;
 		uint64_t saving_now = time_us_64();
 		if (save_storage_saving() && !saving_shown)
 			saving_hold_until = saving_now + SAVING_HOLD_US;
