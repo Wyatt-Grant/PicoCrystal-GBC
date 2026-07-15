@@ -1,5 +1,6 @@
 #include "save_storage.hpp"
 
+#include "flash_sliced.hpp"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
@@ -43,12 +44,18 @@ constexpr uint32_t RESERVED_BYTES_PER_ROM = NUM_SLOTS * SLOT_BYTES;
 // flash op per call (per emulated frame):
 //
 //   IDLE -> ERASING      first cart-RAM write after a save (dirty) starts a
-//                        paced pre-erase of the target slot, one 4KB sector
-//                        (~45ms, the one op that still drops a frame or two)
-//                        every ERASE_SPACING_MS. Already-blank sectors are
-//                        detected via XIP and skipped for free, so in the
-//                        common power-cycle case (slot pre-erased by the
-//                        previous session) this whole phase is a no-op.
+//                        pre-erase of the target slot, one 4KB sector at a
+//                        time. On erase-suspend-capable flash (see
+//                        flash_sliced.*) each sector erase runs for only a
+//                        ~1.5ms on-time per poll, then suspends so both cores
+//                        keep running between polls -- the erase no longer drops
+//                        a frame at all. Otherwise it falls back to one blocking
+//                        ~45ms sector erase every ERASE_SPACING_MS (the old
+//                        behaviour, still the one op that drops a frame or two).
+//                        Already-blank sectors are detected via XIP and skipped
+//                        for free, so in the common power-cycle case (slot
+//                        pre-erased by the previous session) this phase is a
+//                        no-op.
 //   ERASING -> READY     slot fully blank, waiting for the autosave to be due.
 //   READY -> PROGRAMMING interval elapsed and the game has gone quiet (no
 //                        cart-RAM writes for QUIET_POLLS_REQUIRED polls, so we
@@ -66,11 +73,12 @@ constexpr uint32_t RESERVED_BYTES_PER_ROM = NUM_SLOTS * SLOT_BYTES;
 //                        `dirty` is already set again so a clean snapshot
 //                        follows one interval later.
 //
-// Worst case per frame is now one sector erase (~45ms, ~9 of them spread over
-// ~2 seconds) instead of ~500ms in one frame; the program phase costs ~3ms per
-// frame for ~33 frames.
-constexpr uint32_t ERASE_SPACING_MS = 200;
-constexpr uint32_t PROGRAM_CHUNK_BYTES = 4 * FLASH_PAGE_SIZE; // 1KB, ~3ms typ
+// With sliced erase the worst per-frame flash stall is now one erase on-time
+// (~1.5ms, set by ERASE_ON_US in flash_sliced.cpp) or a PROGRAM_CHUNK_BYTES
+// program (~1.4ms) -- no dropped frames. On non-suspend-capable flash the
+// fallback still pays one ~45ms sector erase per ERASE_SPACING_MS.
+constexpr uint32_t ERASE_SPACING_MS = 200;   // fallback (non-sliced) path only
+constexpr uint32_t PROGRAM_CHUNK_BYTES = 2 * FLASH_PAGE_SIZE; // 512B, ~1.4ms typ
 constexpr uint32_t QUIET_POLLS_REQUIRED = 4;
 constexpr uint32_t QUIET_WAIT_MAX_MS = 2000;
 
@@ -155,7 +163,8 @@ uint32_t next_slot = 0;   // slot index the next autosave will erase+program
 enum class save_state_t { IDLE, ERASING, READY, PROGRAMMING };
 save_state_t state = save_state_t::IDLE;
 uint32_t erase_sector = 0;   // next sector index within next_slot to erase
-uint32_t last_erase_ms = 0;  // paces sector erases ERASE_SPACING_MS apart
+uint32_t last_erase_ms = 0;  // paces fallback sector erases ERASE_SPACING_MS apart
+bool erase_in_flight = false; // a sliced erase of erase_sector is suspended on-chip
 uint32_t quiet_polls = 0;    // polls since the last cart-RAM write
 bool due_waiting = false;    // save is due but gated on quiet_polls
 uint32_t due_wait_start_ms = 0;
@@ -227,9 +236,28 @@ void flash_locked_program(uint32_t off, const uint8_t *data, size_t bytes) {
 		multicore_lockout_end_blocking();
 }
 
+// Drive any suspended sliced erase (ERASING state) to completion. A suspended
+// erase leaves the chip in a state where NO other flash op is legal -- neither
+// flash_range_erase/program above nor a fresh sliced erase -- so any code path
+// that is about to touch flash outside the ERASING state must call this first.
+// It also keeps the state machine's bookkeeping (erase_sector) consistent so
+// the next poll continues cleanly.
+void finish_pending_erase() {
+	if (!erase_in_flight)
+		return;
+	flash_sliced_erase_finish();
+	erase_in_flight = false;
+	erase_sector++;
+}
+
 } // namespace
 
 void save_storage_load(uint8_t *cart_ram, size_t size, uint32_t save_slot) {
+	// Probe the flash for erase-suspend support once, at boot, before any
+	// autosave can start a (sliced) erase -- the JEDEC probe uses flash_do_cmd,
+	// which is illegal once an erase is suspended.
+	flash_sliced_init();
+
 	rom_save_slot = save_slot;
 	loaded_rtc_valid = false;
 
@@ -335,19 +363,38 @@ void save_storage_poll(const uint8_t *cart_ram, size_t size) {
 		[[fallthrough]];
 
 	case save_state_t::ERASING:
-		// Skipping already-blank sectors is nearly free (an XIP read), so
-		// only real erases are paced.
+		// Advance a sliced erase already suspended on-chip before touching any
+		// other sector (its contents are undefined while suspended, so no
+		// sector_is_blank() until it completes). One on-time per poll.
+		if (erase_in_flight) {
+			if (flash_sliced_erase_step()) {
+				erase_in_flight = false;
+				erase_sector++;
+			}
+			return; // one erase on-time per poll
+		}
+		// Skipping already-blank sectors is nearly free (an XIP read).
 		while (erase_sector < SLOT_SECTORS &&
 		       sector_is_blank(slot_offset(next_slot) + erase_sector * FLASH_SECTOR_SIZE))
 			erase_sector++;
 		if (erase_sector < SLOT_SECTORS) {
-			if (now - last_erase_ms < ERASE_SPACING_MS)
-				return;
-			flash_locked_erase(slot_offset(next_slot) + erase_sector * FLASH_SECTOR_SIZE,
-					   FLASH_SECTOR_SIZE);
-			erase_sector++;
-			last_erase_ms = now;
-			return; // at most one flash op per poll
+			uint32_t off = slot_offset(next_slot) + erase_sector * FLASH_SECTOR_SIZE;
+			if (flash_sliced_supported()) {
+				// Sliced: run this sector's first on-time now, then step it
+				// across following polls. Handles the "done in one on-time" case.
+				if (flash_sliced_erase_begin(off))
+					erase_sector++;
+				else
+					erase_in_flight = true;
+			} else {
+				// Fallback: one blocking ~45ms sector erase, paced.
+				if (now - last_erase_ms < ERASE_SPACING_MS)
+					return;
+				flash_locked_erase(off, FLASH_SECTOR_SIZE);
+				erase_sector++;
+				last_erase_ms = now;
+			}
+			return; // at most one sector's worth of flash work per poll
 		}
 		state = save_state_t::READY;
 		due_waiting = false;
@@ -467,6 +514,11 @@ void save_storage_settings_store(const device_settings_t &s) {
 	if (save_storage_settings_load(cur) &&
 	    __builtin_memcmp(&cur, &s, sizeof(s)) == 0)
 		return;
+
+	// The in-game settings menu keeps save_storage_poll() running, so an
+	// autosave sector erase can be suspended on-chip right now. No other flash
+	// op is legal while an erase is suspended -- drive it to completion first.
+	finish_pending_erase();
 
 	settings_record_t rec = {
 		SETTINGS_MAGIC,

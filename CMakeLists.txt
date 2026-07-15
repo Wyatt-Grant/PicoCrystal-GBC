@@ -66,6 +66,7 @@ add_executable(${PROJECT_NAME}
     main.cpp
     audio_output.cpp
     save_storage.cpp
+    flash_sliced.cpp
     core/minigb_apu/minigb_apu.c
     ${ROM_GEN_SOURCES}
 )
