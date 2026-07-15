@@ -920,10 +920,17 @@ constexpr int32_t HDR_TOP = 7;    // (24 - 10px glyph height) / 2
 constexpr int32_t UI_MARGIN = 12; // screen-edge margin for all UI content
 constexpr int32_t UI_RIGHT = 240 - UI_MARGIN;
 
+// bottom_gap reserves that many rows at the band's bottom edge (painted in the
+// band color, below the rule) so the hairline rule doesn't sit flush against
+// whatever follows. Used in-game to keep the rule off the top of the scaled
+// GBC frame; menus leave it 0 so the rule butts the card as intended.
 static void draw_header_band(const char *title, uint32_t batt, color_t rule,
-			      bool show_pct = true) {
-	fill_rect(0, 0, SCREEN->w, OFFSET_Y - 1, UI_HEADER);
-	fill_rect(0, OFFSET_Y - 1, SCREEN->w, 1, rule);
+			      bool show_pct = true, int32_t bottom_gap = 0) {
+	int32_t rule_y = OFFSET_Y - 1 - bottom_gap;
+	fill_rect(0, 0, SCREEN->w, rule_y, UI_HEADER);
+	fill_rect(0, rule_y, SCREEN->w, 1, rule);
+	if (bottom_gap > 0)
+		fill_rect(0, rule_y + 1, SCREEN->w, bottom_gap, UI_HEADER);
 	menu_text(UI_MARGIN, HDR_TOP, title, STATUS_GREY, 2, 12);
 	draw_battery_block(UI_RIGHT, HDR_TOP, batt, show_pct);
 }
@@ -940,11 +947,11 @@ static void draw_status_bar(uint32_t fps, uint32_t batt, bool saving) {
 	// 8px advance, not the header's letterspaced 12px: at 16 glyphs the
 	// letterspaced version would run into the battery block.
 	if (saving) {
-		draw_header_band("", batt, UI_TRACK, g_show_battery);
+		draw_header_band("", batt, UI_TRACK, g_show_battery, 1);
 		status_text(UI_MARGIN, HDR_TOP, "WRITING TO FLASH", UI_ACCENT);
 		return;
 	}
-	draw_header_band(g_show_fps ? "FPS" : "", batt, UI_TRACK, g_show_battery);
+	draw_header_band(g_show_fps ? "FPS" : "", batt, UI_TRACK, g_show_battery, 1);
 	if (g_show_fps) {
 		char buf[12];
 		int32_t n = status_fmt_uint(buf, fps);
