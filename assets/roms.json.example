@@ -8,20 +8,25 @@
     "is the tracked template. Underscore-prefixed keys like this one are",
     "ignored by the generator, so you can leave notes in your own file too.",
     "",
-    "Each entry needs a \"file\" (must match a real file in assets/). Both",
-    "\"name\" and \"slot\" are optional -- omit them or set them to null.",
+    "Each entry needs a \"file\" (must match a real file in assets/). The",
+    "\"name\", \"slot\", and \"color\" fields are optional -- omit them or set",
+    "them to null.",
     "  name: boot-menu label, A-Z / 0-9 / space only (lowercase is folded to",
     "        upper), max 24 chars. Defaults to the filename.",
     "  slot: flash save region 0..13. Defaults to list position. Pin it to",
     "        keep a game attached to its existing on-device save when you add,",
     "        remove, or rename ROMs. Slots must be unique.",
+    "  color: hex RGB (\"#3fa9f5\" or the shorthand \"#39f\") that tints the",
+    "        little label sticker on this game's cart icon in the boot menu.",
+    "        Defaults to the UI accent color. Channels are shown at the",
+    "        screen's 4-bit depth, so nearby shades may look identical.",
     "The array sets menu order; any assets/ files not listed here are appended",
     "alphabetically. Entries whose file is missing are skipped with a warning",
     "but keep their slot reserved (so removing/re-adding a game keeps its save)."
   ],
   "roms": [
-    { "file": "polishedcrystal.gbc",  "name": "POKEMON CRYSTAL",   "slot": 0 },
-    { "file": "chromatic_tetris.gbc", "name": "CHROMATIC TETRIS" },
+    { "file": "polishedcrystal.gbc",  "name": "POKEMON CRYSTAL",   "slot": 0, "color": "#f5d020" },
+    { "file": "chromatic_tetris.gbc", "name": "CHROMATIC TETRIS", "color": "#39f" },
     { "file": "some_other_game.gb" }
   ]
 }

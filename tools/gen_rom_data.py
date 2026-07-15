@@ -68,6 +68,31 @@ def display_name(stem):
     return name[:24].strip()
 
 
+def parse_color(value, where):
+    """roms.json "color" -> packed RGBA4444 int (or None if unset).
+
+    Accepts a hex RGB string: "#RRGGBB" or the shorthand "#RGB", with or
+    without the leading '#'. The 8-bit channels are truncated to the screen's
+    4 bits each and packed to match main.cpp's status_rgb() layout (R bits
+    0-3, A 4-7 forced opaque, B 8-11, G 12-15) so the generated color_t can be
+    used by the boot menu directly.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        fail("%s: \"color\" must be a hex RGB string like \"#3fa9f5\"" % where)
+    s = value.strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6 or re.search(r"[^0-9a-fA-F]", s):
+        fail("%s: color '%s' must be a hex RGB string like \"#3fa9f5\" or "
+             "\"#39f\"" % (where, value))
+    r4 = int(s[0:2], 16) >> 4
+    g4 = int(s[2:4], 16) >> 4
+    b4 = int(s[4:6], 16) >> 4
+    return r4 | 0xF0 | (b4 << 8) | (g4 << 12)
+
+
 def validate_rom(path):
     """Return (size, warnings) or die with a message naming the file."""
     size = os.path.getsize(path)
@@ -112,9 +137,10 @@ def validate_rom(path):
 def parse_cfg(cfg_path, roms_by_file, warnings):
     """assets/roms.json: {"roms": [{"file", "name"?, "slot"?}, ...]}.
 
-    A bare JSON array of those entry objects is also accepted. `name` and
-    `slot` are optional (omit or set to null). Returns the ordered entry
-    list [(filename, name_or_None, slot_or_None)]. Entries whose file is
+    A bare JSON array of those entry objects is also accepted. `name`,
+    `slot`, and `color` are optional (omit or set to null). Returns the
+    ordered entry list [(filename, name_or_None, slot_or_None,
+    color_or_None)]. Entries whose file is
     absent from assets/ are skipped with a warning, not an error -- they are
     dormant pins: removing a game shouldn't force a manifest edit, and
     re-adding the file later reactivates its pinned name/slot (reattaching
@@ -179,12 +205,14 @@ def parse_cfg(cfg_path, roms_by_file, warnings):
                 fail("%s: name '%s' contains '%s' -- the boot menu font only "
                      "has A-Z, 0-9, and space" % (where, name, bad))
             name = name[:24].strip() or None
-        entries.append((fname, name, slot))
+
+        color = parse_color(item.get("color"), where)
+        entries.append((fname, name, slot, color))
     return entries, dormant
 
 
 def build_catalog(assets_dir):
-    """Return ordered [(path, display_name, save_slot, size)] plus warnings."""
+    """Return ordered [(path, display_name, save_slot, size, color)] plus warnings."""
     roms_by_file = {}
     for entry in sorted(os.listdir(assets_dir)):
         if entry.lower().endswith((".gb", ".gbc")) and \
@@ -202,8 +230,8 @@ def build_catalog(assets_dir):
 
     # cfg entries first (in cfg order), then any remaining files alphabetically.
     ordered = list(cfg)
-    in_cfg = {fname for fname, _, _ in cfg}
-    ordered += [(f, None, None) for f in sorted(roms_by_file) if f not in in_cfg]
+    in_cfg = {fname for fname, _, _, _ in cfg}
+    ordered += [(f, None, None, None) for f in sorted(roms_by_file) if f not in in_cfg]
 
     if len(ordered) > MAX_ROM_SAVE_SLOTS:
         fail("%d ROMs found, but at most %d fit (each needs a flash save "
@@ -216,7 +244,7 @@ def build_catalog(assets_dir):
     # re-adding the old file would evict the newcomer from the slot its save
     # now lives in.
     taken = dict(dormant)
-    for fname, _, slot in ordered:
+    for fname, _, slot, _ in ordered:
         if slot is not None:
             if slot in taken:
                 fail("roms.json: save slot %d assigned to both '%s' and '%s'"
@@ -225,7 +253,7 @@ def build_catalog(assets_dir):
 
     catalog = []
     total = 0
-    for fname, name, slot in ordered:
+    for fname, name, slot, color in ordered:
         path = roms_by_file[fname]
         size, warns = validate_rom(path)
         warnings += warns
@@ -243,12 +271,12 @@ def build_catalog(assets_dir):
         if '"' in path or "\\" in path or "\n" in path:
             fail("path '%s' contains characters .incbin can't take -- "
                  "please rename" % path)
-        catalog.append((path, name, slot, size))
+        catalog.append((path, name, slot, size, color))
         total += size
 
     if total + FIRMWARE_MARGIN_BYTES > FLASH_REGION_BYTES:
         listing = "\n".join("  %8d KB  %s" % (s // 1024, os.path.basename(p))
-                            for p, _, _, s in catalog)
+                            for p, _, _, s, _ in catalog)
         fail("ROMs total %.2f MB, but only ~%.2f MB of flash is available "
              "for them (16MB chip minus firmware and save storage). Remove "
              "some:\n%s"
@@ -283,7 +311,7 @@ def emit(catalog, out_dir):
          " * ROM from assets/ into flash via .incbin (a multi-megabyte hex-\n"
          " * literal C array would be far slower to compile). */\n\n"
          ".section .rodata\n"]
-    for i, (path, name, _, _) in enumerate(catalog):
+    for i, (path, name, _, _, _) in enumerate(catalog):
         s.append(".align 4\n"
                  ".global rom_%d_data\n"
                  "rom_%d_data:                /* %s */\n"
@@ -309,6 +337,8 @@ struct rom_entry_t {
 	const uint8_t *data;
 	uint32_t size;
 	uint32_t save_slot;
+	// Cart-label tint (RGBA4444) from roms.json "color"; 0 = default accent.
+	uint16_t label_color;
 };
 
 constexpr uint32_t ROM_COUNT = %d;
@@ -317,10 +347,10 @@ extern const rom_entry_t rom_catalog[ROM_COUNT];
 
     c = [HEADER_NOTE, "#include \"rom_data.hpp\"\n\n"
          "const rom_entry_t rom_catalog[ROM_COUNT] = {\n"]
-    for i, (path, name, slot, _) in enumerate(catalog):
+    for i, (path, name, slot, _, color) in enumerate(catalog):
         c.append("\t{ \"%s\", rom_%d_data,\n"
-                 "\t  (uint32_t)(rom_%d_data_end - rom_%d_data), %d }, // %s\n"
-                 % (name, i, i, i, slot, os.path.basename(path)))
+                 "\t  (uint32_t)(rom_%d_data_end - rom_%d_data), %d, 0x%04X }, // %s\n"
+                 % (name, i, i, i, slot, color or 0, os.path.basename(path)))
     c.append("};\n")
 
     os.makedirs(out_dir, exist_ok=True)
@@ -368,10 +398,11 @@ def main():
         sys.stderr.write("gen_rom_data: warning: %s\n" % w)
     emit(catalog, args.out)
     print("gen_rom_data: %d ROM(s), %.2f MB total:" %
-          (len(catalog), sum(sz for _, _, _, sz in catalog) / 1048576.0))
-    for path, name, slot, size in catalog:
-        print("  %-24s  save slot %-2d  %5d KB  (%s)"
-              % (name, slot, size // 1024, os.path.basename(path)))
+          (len(catalog), sum(sz for _, _, _, sz, _ in catalog) / 1048576.0))
+    for path, name, slot, size, color in catalog:
+        tint = "  label 0x%04X" % color if color else ""
+        print("  %-24s  save slot %-2d  %5d KB  (%s)%s"
+              % (name, slot, size // 1024, os.path.basename(path), tint))
 
 
 if __name__ == "__main__":

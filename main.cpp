@@ -814,6 +814,15 @@ static void draw_icon(int32_t x, int32_t y, icon_t icon, color_t col) {
 				fill_rect(x + rx * 2, y + ry * 2, 2, 2, col);
 }
 
+// Recolor just the sticker area of ICON_CART (its inner 3x2 block, rows 3-4 /
+// cols 2-4) after the cart body is drawn. The boot menu calls this when a ROM
+// pins a `color` in roms.json, so each game's cart gets a distinct label.
+static void draw_cart_label(int32_t x, int32_t y, color_t col) {
+	for (int32_t ry = 3; ry <= 4; ry++)
+		for (int32_t rx = 2; rx <= 4; rx++)
+			fill_rect(x + rx * 2, y + ry * 2, 2, 2, col);
+}
+
 // RGBA4444 layout per rgb565_to_color: R in bits 0-3, A 4-7, B 8-11, G 12-15.
 constexpr color_t STATUS_WHITE = 0xFFFF;
 constexpr color_t STATUS_GREY  = 0x88F8;
@@ -1270,6 +1279,10 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		draw_icon(UI_MARGIN, y + 4,
 			  i < ROM_COUNT ? ICON_CART : ICON_SLIDERS,
 			  is_sel ? UI_ACCENT : STATUS_DIM);
+		// Per-ROM cart label tint (roms.json "color"), 0 = leave default.
+		// The selected row stays fully theme-accent, so skip the overlay there.
+		if (i < ROM_COUNT && !is_sel && rom_catalog[i].label_color)
+			draw_cart_label(UI_MARGIN, y + 4, rom_catalog[i].label_color);
 
 		const char *name = i < ROM_COUNT ? rom_catalog[i].name : "SETTINGS";
 		int32_t name_x = UI_MARGIN + 22;
@@ -1298,7 +1311,7 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 			clipped[max_chars] = '\0';
 			name = clipped;
 		}
-		status_text(name_x, y + 6, name, is_sel ? STATUS_WHITE : STATUS_GREY);
+		status_text(name_x, y + 6, name, is_sel ? UI_ACCENT : STATUS_GREY);
 	}
 
 	// Scroll indicators when rows extend past the window.

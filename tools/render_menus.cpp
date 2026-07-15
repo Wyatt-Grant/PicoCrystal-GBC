@@ -49,18 +49,21 @@ struct rom_entry_t {
 	const void *data;
 	uint32_t size;
 	uint32_t save_slot;
+	uint16_t label_color; // RGBA4444 cart-label tint, 0 = default accent
 };
 
 constexpr uint32_t ROM_COUNT = 8;
+// A couple of entries carry a label_color so the rendered boot.ppm exercises
+// the per-ROM cart tint; the rest fall back to the accent (0).
 static const rom_entry_t rom_catalog[ROM_COUNT] = {
-	{ "POKEMON CRYSTAL", nullptr, 8 * 1024 * 1024, 0 },
-	{ "CHROMATIC TETRIS", nullptr, 512 * 1024, 1 },
-	{ "SUPER MARIO BROS", nullptr, 1024 * 1024, 3 },
-	{ "ORACLE OF SEASONS", nullptr, 1024 * 1024, 4 },
-	{ "POKEMON PRISM", nullptr, 2 * 1024 * 1024, 7 },
-	{ "KIRBY DREAM LAND 2", nullptr, 1024 * 1024, 2 },
-	{ "STAR OCEAN BLUE", nullptr, 4 * 1024 * 1024, 5 },
-	{ "POKEMON PINBALL", nullptr, 2 * 1024 * 1024, 6 },
+	{ "POKEMON CRYSTAL", nullptr, 8 * 1024 * 1024, 0, 0xF3F1 },  // yellow-ish
+	{ "CHROMATIC TETRIS", nullptr, 512 * 1024, 1, 0xFF04 },      // blue
+	{ "SUPER MARIO BROS", nullptr, 1024 * 1024, 3, 0 },
+	{ "ORACLE OF SEASONS", nullptr, 1024 * 1024, 4, 0 },
+	{ "POKEMON PRISM", nullptr, 2 * 1024 * 1024, 7, 0 },
+	{ "KIRBY DREAM LAND 2", nullptr, 1024 * 1024, 2, 0 },
+	{ "STAR OCEAN BLUE", nullptr, 4 * 1024 * 1024, 5, 0 },
+	{ "POKEMON PINBALL", nullptr, 2 * 1024 * 1024, 6, 0 },
 };
 
 #include "menu_draw.inc"
