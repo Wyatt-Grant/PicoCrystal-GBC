@@ -87,10 +87,10 @@ static const rom_entry_t rom_catalog[ROM_COUNT] = {
 	{ "POKEMON CRYSTAL", nullptr, 8 * 1024 * 1024, 0, 0xF3F1 },  // yellow-ish
 	{ "CHROMATIC TETRIS", nullptr, 512 * 1024, 1, 0xFF04 },      // blue
 	{ "SUPER MARIO BROS", nullptr, 1024 * 1024, 3, 0 },
-	{ "ORACLE OF SEASONS", nullptr, 1024 * 1024, 4, 0 },
+	{ "ZELDA ORACLE OF SEASONS", nullptr, 1024 * 1024, 4, 0 },
 	{ "POKEMON PRISM", nullptr, 2 * 1024 * 1024, 7, 0 },
 	{ "KIRBY DREAM LAND 2", nullptr, 1024 * 1024, 2, 0 },
-	{ "STAR OCEAN BLUE", nullptr, 4 * 1024 * 1024, 5, 0 },
+	{ "STAR OCEAN BLUE SPHERE", nullptr, 4 * 1024 * 1024, 5, 0 },
 	{ "POKEMON PINBALL", nullptr, 2 * 1024 * 1024, 6, 0 },
 };
 

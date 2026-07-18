@@ -269,7 +269,7 @@ static inline void adjust_volume(int32_t dir) { // dir > 0: up, dir < 0: down
 // picker or a running game well enough to bring brightness back up again.
 static uint8_t g_brightness = 75;
 constexpr uint8_t BRIGHTNESS_STEP = 5; // 0..100 in 20 steps -- 5% per step
-constexpr uint8_t BRIGHTNESS_MIN = 10;
+constexpr uint8_t BRIGHTNESS_MIN = 15; // backlight PWM cuts out entirely below ~15%
 
 static inline void adjust_brightness(int32_t dir) { // dir > 0: up, dir < 0: down
 	int32_t b = (int32_t)g_brightness + dir * BRIGHTNESS_STEP;
@@ -318,13 +318,13 @@ static bool g_boot_last = false;
 static uint8_t g_last_slot = 0xFF;
 
 // The LED reports battery charge: a green->red gradient (green ~= full,
-// red ~= nearly empty) at ~30% brightness so it glows rather than glares.
+// red ~= nearly empty) at ~15% brightness so it glows rather than glares.
 // The usable ~5..100 span maps to the gradient, blended through yellow.
 // Shared by the in-game run loop and the menus (boot ROM picker, settings).
 static void led_show_battery(int level) {
 	if (level < 5)   level = 5;
 	if (level > 100) level = 100;
-	constexpr int BRIGHTNESS = 30;      // ~30% max brightness
+	constexpr int BRIGHTNESS = 15;      // ~15% max brightness
 	int fill = (level - 5) * 100 / 95;  // 0 (empty) .. 100 (full)
 	led((100 - fill) * BRIGHTNESS / 100, // red rises as it drains
 	    fill * BRIGHTNESS / 100,         // green rises as it fills
@@ -920,7 +920,7 @@ static void update_rgb_theme() {
 // the RGB pseudo-theme on screen. Same brightness cap as led_show_battery()
 // so it glows rather than glares.
 static void led_show_rgb() {
-	constexpr int BRIGHTNESS = 30;
+	constexpr int BRIGHTNESS = 15;
 	led((uint8_t)((UI_ACCENT & 0xF) * BRIGHTNESS / 15),
 	    (uint8_t)(((UI_ACCENT >> 12) & 0xF) * BRIGHTNESS / 15),
 	    (uint8_t)(((UI_ACCENT >> 8) & 0xF) * BRIGHTNESS / 15));
@@ -1454,11 +1454,13 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 			buf[n + 1] = '\0';
 			int32_t vx = UI_RIGHT - text_w(n + 1);
 			status_text(vx, y + 6, buf, is_sel ? UI_ACCENT : UI_VALUE);
-			name_max = vx - 8 - name_x;
+			name_max = vx - 4 - name_x;
 		}
 
-		// Clip long titles to the space left of the size column.
-		int32_t max_chars = name_max / STATUS_GLYPH_ADV;
+		// Clip long titles to the space left of the size column: the name's
+		// ink (text_w, no trailing glyph gap) must fit in name_max, so short
+		// size strings ("2M" vs "512K") buy extra name characters.
+		int32_t max_chars = (name_max + STATUS_GLYPH_ADV - 6) / STATUS_GLYPH_ADV;
 		int32_t len = 0;
 		while (name[len])
 			len++;
@@ -1867,7 +1869,7 @@ int main() {
 	// first gb_run_frame_dualfetch() for the same reason.
 	multicore_launch_core1(core1_main);
 
-	led(0, 100, 0); // solid green once init succeeds, before the run loop
+	led(0, 15, 0); // solid green once init succeeds, before the run loop
 
 	// picosystem.cpp's excluded stock loop is what normally refreshes
 	// _io/_lio each frame -- without this, button()/pressed() silently read
@@ -1875,7 +1877,7 @@ int main() {
 	_io = _gpio_get();
 
 	// The LED reports battery charge: a green->red gradient (green ~= full,
-	// red ~= nearly empty) at ~30% brightness. Updated on a cadence rather than
+	// red ~= nearly empty) at ~15% brightness. Updated on a cadence rather than
 	// every frame -- battery() reads the ADC and the charge level changes
 	// slowly, so per-frame polling would only waste cycles and jitter the LED.
 	// Starting the counter at the threshold makes the first loop iteration do
