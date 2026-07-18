@@ -113,6 +113,12 @@ struct device_settings_t {
 	uint8_t dark_mode;    // 1 = dark, 0 = light appearance (main.cpp g_dark_mode).
 			      // New field: grows the struct, so old records fail
 			      // the CRC and reset settings to defaults (dark) once.
+	uint8_t boot_last;    // 0/1: skip the boot menu and auto-boot the last
+			      // game (main.cpp g_boot_last)
+	uint8_t last_slot;    // save_slot of the last-booted ROM -- the stable
+			      // per-game id, not the catalog index, which
+			      // reshuffles when the ROM list is regenerated.
+			      // 0xFF = no game booted yet (main.cpp g_last_slot)
 };
 // Growing this struct invalidates the previously stored record (the CRC is
 // computed over the whole payload), so settings reset to defaults once on

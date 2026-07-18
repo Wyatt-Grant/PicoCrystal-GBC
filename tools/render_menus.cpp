@@ -37,12 +37,40 @@ static uint8_t g_brightness = 70;
 static bool g_show_fps = true;     // draw_status_bar renders both header pieces
 static bool g_show_battery = true;
 
+// PicoSystem SDK color/hardware stubs for the RGB pseudo-theme path: hsv()
+// packs like the firmware's color_t (R 0-3, A 4-7, B 8-11, G 12-15, see
+// write_ppm below); led() only drives hardware, a no-op here.
+static color_t hsv(float h, float s, float v) {
+	float r = v, g = v, b = v;
+	if (s > 0.0f) {
+		h = (h - (int)h) * 6.0f;
+		int i = (int)h;
+		float f = h - (float)i;
+		float p = v * (1.0f - s);
+		float q = v * (1.0f - s * f);
+		float t = v * (1.0f - s * (1.0f - f));
+		switch (i) {
+		case 0:  r = v; g = t; b = p; break;
+		case 1:  r = q; g = v; b = p; break;
+		case 2:  r = p; g = v; b = t; break;
+		case 3:  r = p; g = q; b = v; break;
+		case 4:  r = t; g = p; b = v; break;
+		default: r = v; g = p; b = q; break;
+		}
+	}
+	uint16_t R = (uint16_t)(r * 15.0f), G = (uint16_t)(g * 15.0f),
+		 B = (uint16_t)(b * 15.0f);
+	return (color_t)((R & 0xF) | (0xF << 4) | ((B & 0xF) << 8) | ((G & 0xF) << 12));
+}
+static void led(int, int, int) {}
+
 #include "ui_draw.inc"
 
 static uint8_t g_rtc_dow = 2; // TUE
 static uint8_t g_rtc_hour = 14;
 static uint8_t g_rtc_min = 32;
 static bool g_vsync = true; // render the settings screen with the toggle ON
+static bool g_boot_last = true; // BOOT LAST GAME row rendered ON
 
 struct rom_entry_t {
 	const char *name;

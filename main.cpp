@@ -310,6 +310,13 @@ static volatile bool g_vsync = false;
 static bool g_show_fps = true;
 static bool g_show_battery = true;
 
+// BOOT LAST GAME (settings menu row, persisted): when on, main() skips the
+// boot ROM picker and boots straight into the last-played game; holding B
+// during power-on forces the picker anyway. g_last_slot tracks the last
+// game by its save_slot (stable across catalog reshuffles), 0xFF = none yet.
+static bool g_boot_last = false;
+static uint8_t g_last_slot = 0xFF;
+
 // The LED reports battery charge: a green->red gradient (green ~= full,
 // red ~= nearly empty) at ~30% brightness so it glows rather than glares.
 // The usable ~5..100 span maps to the gradient, blended through yellow.
@@ -1213,6 +1220,7 @@ enum settings_row_t : uint32_t {
 	SET_ROW_VSYNC,
 	SET_ROW_FPS,
 	SET_ROW_BATTERY,
+	SET_ROW_BOOT_LAST,
 	SET_ROW_THEME,
 	SET_ROW_MODE, // APPEARANCE: dark/light
 	SET_ROW_DOW, // the clock rows render as the big segmented clock below
@@ -1231,10 +1239,10 @@ constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 
 // Every setting row is a single text line now -- BRIGHT/VOLUME carry a compact
 // inline meter bar on the same line rather than a full-width bar underneath --
-// so all rows share one height. Uniform 20px keeps the RTC clock section below
+// so all rows share one height. Uniform 18px keeps the RTC clock section below
 // clear of draw_menu_hints()'s fixed y=226 (with rows through APPEARANCE the
-// clock anchors at y=174 and the digits end at ~y=208).
-constexpr int32_t ROW_H = 20;
+// clock anchors at y=178 and the digits end at ~y=212).
+constexpr int32_t ROW_H = 18;
 
 static int32_t settings_row_y(uint32_t row) {
 	return OFFSET_Y + 10 + (int32_t)row * ROW_H;
@@ -1325,6 +1333,10 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	draw_toggle_row(SET_ROW_FPS, sel, ICON_BOLT, "FPS", g_show_fps);
 	draw_toggle_row(SET_ROW_BATTERY, sel, ICON_BATTERY, "BATTERY PERCENTAGE",
 			g_show_battery);
+	// BOOT LAST GAME: ON skips the boot ROM picker and auto-boots the
+	// last-played game (hold B during power-on to get the picker back).
+	draw_toggle_row(SET_ROW_BOOT_LAST, sel, ICON_CART, "BOOT LAST GAME",
+			g_boot_last);
 	// THEME: the value is the theme's name (or "RGB" for the cycling
 	// pseudo-theme); every accent-tinted element on screen (including this
 	// value) recolors live as < > cycles it.
@@ -1339,8 +1351,8 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// caption over each group and the clock icon in the left margin beside
 	// the digits; the selected group (the one < > adjusts) goes accent
 	// green. No label row -- the captions + icon carry the meaning, and the
-	// saved height is what buys the toggle rows their breathing room while
-	// staying clear of draw_menu_hints()'s fixed y=226.
+	// saved height (plus the 18px row pitch) is what keeps the toggle rows
+	// and this clock clear of draw_menu_hints()'s fixed y=226.
 	bool clk_sel = (sel >= SET_ROW_DOW);
 
 	struct {
@@ -1481,6 +1493,29 @@ static bool g_settings_edited = false;
 // would override the edit on the next boot.
 static bool g_rtc_edited = false;
 
+// Snapshot the settings globals and persist them: one synchronous ~50ms
+// flash write, skipped inside the store when nothing actually differs from
+// the record already on flash. Shared by the settings-menu close and main()'s
+// last-booted-game recording. The initializer order mirrors device_settings_t.
+static void store_device_settings() {
+	device_settings_t ds = {
+		g_brightness, g_rtc_dow, g_rtc_hour, g_rtc_min,
+#if ENABLE_SOUND
+		audio_output_get_volume(),
+#else
+		0,
+#endif
+		(uint8_t)(g_vsync ? 1 : 0),
+		(uint8_t)(g_show_fps ? 1 : 0),
+		(uint8_t)(g_show_battery ? 1 : 0),
+		g_theme,
+		g_dark_mode,
+		(uint8_t)(g_boot_last ? 1 : 0),
+		g_last_slot,
+	};
+	save_storage_settings_store(ds);
+}
+
 static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	g_settings_edited = true;
 	switch (row) {
@@ -1491,6 +1526,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	case SET_ROW_VSYNC: g_vsync = !g_vsync; return; // either direction toggles
 	case SET_ROW_FPS: g_show_fps = !g_show_fps; return; // either direction toggles
 	case SET_ROW_BATTERY: g_show_battery = !g_show_battery; return; // either direction toggles
+	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
 	case SET_ROW_THEME:
 		apply_theme((g_theme + THEME_OPTION_COUNT + (uint32_t)dir) % THEME_OPTION_COUNT);
 		return;
@@ -1597,20 +1633,7 @@ static void settings_menu(bool in_game) {
 
 	if (g_settings_edited) {
 		g_settings_edited = false;
-		device_settings_t ds = {
-			g_brightness, g_rtc_dow, g_rtc_hour, g_rtc_min,
-#if ENABLE_SOUND
-			audio_output_get_volume(),
-#else
-			0,
-#endif
-			(uint8_t)(g_vsync ? 1 : 0),
-			(uint8_t)(g_show_fps ? 1 : 0),
-			(uint8_t)(g_show_battery ? 1 : 0),
-			g_theme,
-			g_dark_mode,
-		};
-		save_storage_settings_store(ds);
+		store_device_settings();
 	}
 
 	// Drain the closing press so B (or the Y+X chord) doesn't leak into
@@ -1728,6 +1751,8 @@ int main() {
 			g_show_battery = ds.show_battery != 0;
 			apply_theme(ds.theme); // out-of-range falls back to MINT
 			apply_mode(ds.dark_mode); // restore dark/light appearance
+			g_boot_last = ds.boot_last != 0;
+			g_last_slot = ds.last_slot;
 #if ENABLE_SOUND
 			audio_output_set_volume(ds.volume); // clamps internally
 #endif
@@ -1743,7 +1768,34 @@ int main() {
 	backlight(g_brightness);
 
 #if ENABLE_LCD
-	uint32_t rom_index = rom_select();
+	// BOOT LAST GAME: skip the picker and jump straight to the last-played
+	// game, unless B is held during power-on (the escape hatch back to the
+	// menu -- X can't serve, held at power-on it forces DFU boot). A last
+	// slot that no longer matches the catalog (never recorded, or the ROM
+	// list changed) falls through to the picker as before.
+	uint32_t rom_index = UINT32_MAX;
+	if (g_boot_last) {
+		// Read live GPIO -- the same seeding rom_select() does -- so the
+		// held-B check reflects real state, not the zero-initialized _io.
+		_io = _gpio_get();
+		if (!button(picosystem::B))
+			for (uint32_t i = 0; i < ROM_COUNT; i++)
+				if (rom_catalog[i].save_slot == g_last_slot) {
+					rom_index = i;
+					break;
+				}
+	}
+	if (rom_index == UINT32_MAX)
+		rom_index = rom_select();
+
+	// Record the booted game so BOOT LAST GAME knows where to return -- kept
+	// current even while the toggle is off, so enabling it later already
+	// points at the right game. Auto-boots leave the slot unchanged, so the
+	// store's no-op check means flash is only written when switching games.
+	if ((uint8_t)rom_catalog[rom_index].save_slot != g_last_slot) {
+		g_last_slot = (uint8_t)rom_catalog[rom_index].save_slot;
+		store_device_settings();
+	}
 #else
 	// No display to pick from in this diagnostic build -- always boot the
 	// first catalog entry.
