@@ -2147,7 +2147,7 @@ int main() {
 		// leaving the LED dark for up to 30 frames.
 		if (status_fullscreen() && saving) {
 			if ((saving_now >> 18) & 1) // ~262ms half-period
-				led(20, 8, 0);
+				led(0, 4, 20);
 			else
 				led(0, 0, 0);
 			saving_led = true;
