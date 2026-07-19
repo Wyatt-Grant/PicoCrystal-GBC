@@ -481,9 +481,34 @@ namespace picosystem {
     _screen_command(INVON);
     sleep_ms(115);
     _screen_command(SLPOUT);
-    _screen_command(DISPON);
     _screen_command(CASET,     4, "\x00\x00\x00\xef");
     _screen_command(RASET,     4, "\x00\x00\x00\xef");
+
+    // Clear GRAM to black BEFORE switching the display on. GRAM powers up
+    // holding random noise and nothing else in this sequence writes it, so
+    // a DISPON here would put confetti on the glass until main() pushes its
+    // first frame -- normally hidden by the backlight being off, but any
+    // light leaking in early (the backlight pin floats until _init_hardware
+    // claims it, and panels retain charge across quick power cycles) makes
+    // it flash at boot. 240x240 @ 12bpp = 86,400 bytes; bump the SPI clock
+    // for the bulk write (~22ms at 31.25MHz) and drop back for commands.
+    {
+      uint8_t zeros[360]; // one 240px row at 12bpp
+      memset(zeros, 0, sizeof(zeros));
+      gpio_put(CS, 0);
+      gpio_put(DC, 0); // command mode
+      uint8_t ramwr = RAMWR;
+      spi_write_blocking(spi0, &ramwr, 1);
+      gpio_put(DC, 1); // data mode
+      spi_set_baudrate(spi0, 31250000);
+      for(int i = 0; i < 240; i++) {
+        spi_write_blocking(spi0, zeros, sizeof(zeros));
+      }
+      spi_set_baudrate(spi0, 8000000);
+      gpio_put(CS, 1);
+    }
+
+    _screen_command(DISPON);
     _screen_command(RAMWR);
 
     // switch st7789 into data mode so that we can start transmitting frame

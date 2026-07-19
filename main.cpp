@@ -1779,6 +1779,16 @@ int main() {
 		for (int32_t x = 0; x < SCREEN->w; x++)
 			*SCREEN->p(x, y) = 0; // black border around the GBC frame
 
+	// Push the black frame to the panel before the backlight ever comes on:
+	// nothing in the init sequence clears GRAM, so from DISPON until the
+	// first flip the panel is scanning power-on noise. The picker used to
+	// flip within a frame of backlight-on, masking it; with autoboot and
+	// TE-armed vsync the first flip can now land tens of ms later, long
+	// enough for the noise to flash visibly at boot.
+	_flip();
+	while (_in_flip)
+		tight_loop_contents();
+
 	// Restore the persisted device settings (brightness, volume, staged RTC)
 	// before anything is displayed, so the boot menu already comes up with
 	// the user's values. Defaults (g_brightness = 75, volume muted, clock
