@@ -67,13 +67,16 @@ namespace picosystem {
   // before clearing it, independent of how long the loop took to get back
   // around to polling.
   //
-  // VSYNC (the ST7789 TE pin, rising edge = start of panel vblank): starts an
-  // armed display flip exactly at vblank, for main.cpp's tear-free vsync
-  // setting. The GRAM write the DMA feeds (~21 rows/ms at 62.5MHz SPI /
-  // 12bpp) outruns the panel's own scan-out, so a write that *starts* at
-  // vblank stays ahead of the beam for the whole refresh -- no panel-level
-  // tear. Armed-but-still-flipping should be impossible (flips are ~11ms,
-  // TE period 25ms); if it ever happens the arm survives for the next TE.
+  // VSYNC (the ST7789 TE pin, rising edge = beam entering the off-glass dead
+  // zone at scanline 240 -- see the STE command in init): starts an armed
+  // display flip there, for main.cpp's tear-free vsync setting. The GRAM
+  // write the DMA feeds (~19.65 rows/ms -- 53 PIO cycles per 2px at 125MHz,
+  // see screen.pio) is slightly SLOWER than the panel's own 60Hz scan-out
+  // (~20.6 rows/ms), but a flip started at line 240 has the 80 dead lines +
+  // back porch (~4.5ms) of head start, which the beam's ~2.45us/row gain
+  // never claws back within one frame -- no panel-level tear anywhere.
+  // Armed-but-still-flipping should be impossible (flips are ~12.2ms, TE
+  // period ~16.7ms); if it ever happens the arm survives for the next TE.
   static void _gpio_irq_handler(uint gpio, uint32_t event_mask) {
     if(gpio == VSYNC) {
       #ifndef PIXEL_DOUBLE
@@ -164,6 +167,31 @@ namespace picosystem {
   void _wait_vsync() {
     while(gpio_get(VSYNC))  {}  // if in vsync already wait for it to end
     while(!gpio_get(VSYNC)) {}  // now wait for vsync to occur
+  }
+
+  // Measure the panel's real TE (vblank) period by timing 16 consecutive
+  // rising edges on the TE pin. The ST7789's frame rate comes from its
+  // internal RC oscillator, so the true period varies unit to unit around
+  // the nominal value -- main.cpp uses this boot-time measurement both to
+  // sanity-check the panel rate and to lock its vsync pacer / audio pacing
+  // to the panel's actual clock. Returns the average period in microseconds,
+  // or 0 if the TE pin never pulses (timeout ~700ms, comfortably above 16
+  // intervals even at the old 40Hz rate). Blocking; call once at startup,
+  // after the screen is initialised.
+  uint32_t _measure_te_period_us() {
+    constexpr uint32_t INTERVALS = 16;
+    const uint64_t deadline = time_us_64() + 700000;
+    auto wait_rising_edge = [&]() -> bool {
+      while(gpio_get(VSYNC))  { if(time_us_64() > deadline) return false; }
+      while(!gpio_get(VSYNC)) { if(time_us_64() > deadline) return false; }
+      return true;
+    };
+    if(!wait_rising_edge()) return 0;
+    const uint64_t t0 = time_us_64();
+    for(uint32_t i = 0; i < INTERVALS; i++) {
+      if(!wait_rising_edge()) return 0;
+    }
+    return (uint32_t)((time_us_64() - t0) / INTERVALS);
   }
 
   bool _is_flipping() {
@@ -417,6 +445,17 @@ namespace picosystem {
     sleep_ms(5);
     _screen_command(MADCTL,    1, "\x04");
     _screen_command(TEON,      1, "\x00");
+    // Move the TE pulse from vblank start to scanline 240 (STE, big-endian
+    // N). The controller scans 320 lines but only 0..239 are bonded to
+    // glass, so with the stock vblank pulse a flip DMA gets only the ~12
+    // back-porch lines (~0.6ms) of head start before the beam re-enters row
+    // 0 -- and at 60Hz the beam (~20.6 rows/ms) is slightly faster than the
+    // DMA (~19.65 rows/ms), leaving the two essentially tied at row 239:
+    // unit-to-unit oscillator variance then shows as occasional bottom-edge
+    // tear. Pulsing at line 240 instead starts the flip at the top of the
+    // 80-line dead zone, growing the head start to ~92 line-times (~4.5ms)
+    // -- the beam can no longer catch the DMA anywhere on the panel.
+    _screen_command(STE,       2, "\x00\xF0");
     _screen_command(FRMCTR2,   5, "\x0C\x0C\x00\x33\x33");
     _screen_command(COLMOD,    1, "\x03");
     _screen_command(GAMSET,    1, "\x01");
@@ -428,7 +467,15 @@ namespace picosystem {
     _screen_command(VRHS,      1, "\x12");
     _screen_command(VDVS,      1, "\x20");
     _screen_command(PWRCTRL1,  2, "\xA4\xA1");
-    _screen_command(FRCTRL2,   1, "\x1E");
+    // Frame rate control: RTNA=0x0F (the ST7789 power-on default) runs the
+    // panel at a nominal 60Hz instead of the stock SDK's 0x1E (~39Hz). At
+    // 60Hz the TE period (~16.7ms) nearly matches the GBC's 59.73Hz frame
+    // rate, so main.cpp's vsync mode can present essentially every emulated
+    // frame and pace itself off TE (see the pacer there). The flip DMA
+    // (~12.2ms full frame) still fits inside one TE period, and started at
+    // the STE tear scanline it stays ahead of the faster 60Hz beam (see the
+    // TE IRQ note above _gpio_irq_handler).
+    _screen_command(FRCTRL2,   1, "\x0F");
     _screen_command(GMCTRP1,  14, "\xD0\x04\x0D\x11\x13\x2B\x3F\x54\x4C\x18\x0D\x0B\x1F\x23");
     _screen_command(GMCTRN1,  14, "\xD0\x04\x0C\x11\x13\x2C\x3F\x44\x51\x2F\x1F\x1F\x20\x23");
     _screen_command(INVON);
@@ -460,7 +507,7 @@ namespace picosystem {
     // armed flip starts exactly at vblank (see _gpio_irq_handler). The
     // callback itself was registered by init_button_latch() above; always
     // enabled -- when nothing is armed the handler is a compare and return,
-    // 40 times a second.
+    // ~60 times a second.
     gpio_set_irq_enabled(VSYNC, GPIO_IRQ_EDGE_RISE, true);
 
     // setup the screen updating pio program

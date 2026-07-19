@@ -47,6 +47,31 @@ audio_sample_t stage_buf[AUDIO_SAMPLES_TOTAL];
 // One-pole high-pass state (core1 only). See render_frame for why.
 int32_t hpf_x1 = 0, hpf_y1 = 0;
 
+// Playback pacing (see audio_output_set_frame_period). frame_period_us is
+// how often the emulator actually produces a frame's worth of samples --
+// 16742us at authentic GBC pace, or the measured panel TE period when
+// main.cpp's TE-paced vsync mode locks emulation to the panel clock.
+// pace_timer is the claimed DREQ timer index, -1 until core1_init runs.
+volatile uint32_t frame_period_us = 16742;
+volatile int pace_timer = -1;
+
+// Program the DREQ timer so consumption runs a hair (+~0.05%) above the
+// production rate of AUDIO_SAMPLES per frame_period_us. Drift then always
+// lands on the graceful side -- a few-microsecond PWM hold at a buffer
+// boundary -- rather than the bad side, where an unconsumed buffer is
+// eventually overwritten and a whole frame of audio skips. Divisor is
+// sys_clk cycles per sample: frame_period_us * 250 / AUDIO_SAMPLES cycles
+// at 250MHz, minus 1/2500th for the margin (16742us -> 7637 - 3 = 7634,
+// ~32757Hz against ~32732Hz production -- matching the retired hardcoded
+// 1/7635 setting).
+void retune_pace_timer() {
+	if (pace_timer < 0)
+		return;
+	uint32_t div = (uint32_t)((uint64_t)frame_period_us * 250u / AUDIO_SAMPLES);
+	div -= div / 2500;
+	dma_timer_set_fraction((uint)pace_timer, 1, (uint16_t)div);
+}
+
 // minigb_apu deliberately keeps each of its (up to 4) channels quiet
 // internally -- VOL_INIT_MAX in minigb_apu.h is AUDIO_SAMPLE_MAX/8 -- so that
 // summing several at once doesn't overflow. In practice most frames don't
@@ -118,21 +143,20 @@ void audio_output_core1_init() {
 	// removes ~549 IRQs/frame of core1 overhead.
 	//
 	// Rate choice: production is AUDIO_SAMPLES per paced frame -- 548
-	// samples / 16742us = ~32732Hz -- not the nominal 32768Hz (minigb_apu's
-	// integer truncation of samples-per-vsync). Pace consumption a touch
-	// *above* production (250MHz / 7635 = ~32745Hz, +0.04%): drift then
-	// always lands on the graceful side -- a few-microsecond hold at a
-	// buffer boundary -- rather than the bad side, where an unconsumed
-	// buffer eventually gets overwritten and a whole frame of audio skips.
-	int timer = dma_claim_unused_timer(true);
-	dma_timer_set_fraction(timer, 1, 7635);
+	// samples per frame_period_us (16742us authentic = ~32732Hz -- not the
+	// nominal 32768Hz, minigb_apu's integer truncation of samples-per-vsync).
+	// Consumption is paced a touch above production; see retune_pace_timer()
+	// for the rationale and audio_output_set_frame_period() for how the rate
+	// follows the emulator's actual pace.
+	pace_timer = dma_claim_unused_timer(true);
+	retune_pace_timer();
 
 	dma_channel_claim(AUDIO_DMA_CH);
 	dma_channel_config cfg = dma_channel_get_default_config(AUDIO_DMA_CH);
 	channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
 	channel_config_set_read_increment(&cfg, true);
 	channel_config_set_write_increment(&cfg, false);
-	channel_config_set_dreq(&cfg, dma_get_timer_dreq(timer));
+	channel_config_set_dreq(&cfg, dma_get_timer_dreq((uint)pace_timer));
 	dma_channel_configure(AUDIO_DMA_CH, &cfg,
 			      &pwm_hw->slice[pwm_gpio_to_slice_num(AUDIO_PIN)].cc,
 			      nullptr, AUDIO_SAMPLES, false);
@@ -223,6 +247,17 @@ void __not_in_flash_func(audio_output_render_frame)(struct minigb_apu_ctx *ctx) 
 		buf_pending = true;
 	}
 	restore_interrupts(save);
+}
+
+void audio_output_set_frame_period(uint32_t frame_us) {
+	if (frame_us == 0)
+		return;
+	frame_period_us = frame_us;
+	// Before core1_init has claimed the timer this just stores the period
+	// (core1_init retunes from it); afterwards it reprograms the DREQ timer
+	// live -- a single aligned register write, safe from either core while
+	// playback runs.
+	retune_pace_timer();
 }
 
 void audio_output_set_volume(uint16_t percent) {

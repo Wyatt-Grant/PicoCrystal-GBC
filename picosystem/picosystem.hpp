@@ -73,6 +73,7 @@ namespace picosystem {
   extern volatile uint32_t _io_press_latch;  // buttons seen low since last poll (irq-set)
   extern volatile bool  _in_flip;            // display flip DMA in flight
   extern volatile bool  _flip_armed;         // TE irq starts a flip at next panel vblank
+  uint32_t    _measure_te_period_us();       // boot-time panel TE period measurement
   extern uint32_t       dma_channel;         // display flip DMA channel
   extern int32_t        _camx, _camy;        // camera
   extern blend_func_t   _bf;                 // blend function

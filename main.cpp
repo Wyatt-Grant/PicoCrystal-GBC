@@ -289,18 +289,51 @@ static inline void adjust_brightness(int32_t dir) { // dir > 0: up, dir < 0: dow
 // but shear is visible on scrolls.
 //
 // ON: the main loop arms _flip_armed instead and the ST7789 TE interrupt
-// starts the flip DMA at panel vblank (hardware.cpp _gpio_irq_handler) --
-// GRAM writes started at vblank outrun the panel beam, so no panel-level
-// tear. Buffer-level tear (emulator overwriting rows mid-stream) is prevented
+// starts the flip DMA as the beam enters the off-glass dead zone (STE tear
+// scanline 240; hardware.cpp _gpio_irq_handler) -- the ~4.5ms head start
+// keeps the GRAM write ahead of the panel beam, so no panel-level tear. Buffer-level tear (emulator overwriting rows mid-stream) is prevented
 // by core1 chasing the flip DMA's read_addr before storing each scaled row
 // (see render_line_job). Cost when the chase engages: core1's stores briefly
-// throttle to the DMA's ~21 rows/ms streaming rate. The arming policy in the
-// main loop keeps that rare -- this is what the reverted always-on version
-// got wrong (it armed every frame, so catch-up sprints were permanently
-// throttled and core0 stalled behind the chase through the VRAM fence).
+// throttle to the DMA's ~19.65 rows/ms streaming rate. The arming policy in
+// the main loop keeps that rare -- this is what the reverted always-on
+// version got wrong (it armed every frame, so catch-up sprints were
+// permanently throttled and core0 stalled behind the chase through the VRAM
+// fence).
+//
+// Since the panel moved to ~60Hz (hardware.cpp FRCTRL2), the TE rate nearly
+// matches the GBC's 59.73Hz, so vsync ON can additionally pace emulation off
+// TE itself (g_te_pace below) -- every emulated frame is presented, with no
+// judder from the residual rate mismatch.
 //
 // volatile: written by core0 (settings menu), read by core1's store path.
 static volatile bool g_vsync = false;
+
+// Authentic GBC frame period: 70224 cycles / 4.194304MHz.
+constexpr uint64_t GB_FRAME_US = 16742;
+
+// Boot-time measurement of the panel's real TE period (its RC oscillator
+// varies unit to unit around the nominal ~60Hz), and whether it landed close
+// enough to the GBC rate (58.5-61.5Hz) to enable TE-paced vsync: when ahead
+// of schedule with a flip armed, the pacer waits for the TE IRQ to consume
+// the arm instead of busy-waiting on the wall clock, locking emulation 1:1
+// to the panel (zero tear, zero judder, speed error under ~2% worst case and
+// typically <0.5%). When the measurement fails the gate, vsync ON falls back
+// to the wall-clock pacer: still tear-free, with an occasional repeated
+// panel frame from the rate mismatch. Set once at boot, read-only after.
+static uint32_t g_te_period_us = 0;
+static bool g_te_pace = false;
+
+// Audio playback pacing follows the emulator's actual frame period: the
+// panel's measured TE period while TE-paced vsync is active, authentic pace
+// otherwise. Keeping consumption tuned just above true production is what
+// prevents both dropped audio frames (production ahead) and audible
+// flat-line buzz (consumption far ahead) -- see audio_output.cpp.
+static void apply_audio_pacing() {
+#if ENABLE_SOUND
+	audio_output_set_frame_period(
+		g_vsync && g_te_pace ? g_te_period_us : (uint32_t)GB_FRAME_US);
+#endif
+}
 
 // Header toggles (settings menu FPS/BATTERY PERCENTAGE rows, persisted).
 // g_show_fps gates the FPS counter in the in-game header band
@@ -511,9 +544,9 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 	// Vsync chase: never overwrite framebuffer rows an in-flight flip DMA
 	// hasn't streamed yet. read_addr is published before _in_flip is raised
 	// (see hardware.cpp's TE handler), so this can never pass on a stale
-	// address. In steady state it never spins: the DMA streams ~21 rows/ms
-	// while the emulator writes ~14 rows/ms at authentic pace, and the
-	// 24-row letterbox gives the reader a head start -- the spin only
+	// address. In steady state it never spins: the DMA streams ~19.65
+	// rows/ms while the emulator writes ~14 rows/ms at authentic pace, and
+	// the 24-row letterbox gives the reader a head start -- the spin only
 	// engages when emulation bursts ahead within a frame, and the main
 	// loop's arming policy keeps flips away from catch-up sprints.
 	if (g_vsync) {
@@ -932,7 +965,7 @@ static void led_show_rgb() {
 static color_t UI_CARD    = status_rgb(1, 1, 1);  // panel body
 static color_t UI_HEADER  = status_rgb(2, 2, 2);  // header band
 static color_t UI_TRACK   = status_rgb(3, 3, 3);  // meter tracks, header rule
-static color_t UI_VALUE   = status_rgb(6, 6, 6);   // unselected value text (e.g. ROM size)
+static color_t UI_VALUE   = status_rgb(6, 6, 6);   // unselected value text (currently unused)
 static color_t UI_FILL    = status_rgb(6, 6, 6);   // unselected meter fill (kept dark on the light track)
 static color_t UI_BRIGHT  = status_rgb(11, 11, 11); // clock digits (unselected)
 static color_t STATUS_DIM = status_rgb(5, 5, 5);   // faint text: hints, colons
@@ -1327,9 +1360,24 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	}
 
 	// VSYNC: ON trades a little emulation headroom for tear-free scrolling
-	// (TE-synchronised flips; see g_vsync's comment). FPS/BATTERY toggle the
-	// matching piece of the in-game header (draw_status_bar()).
-	draw_toggle_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", g_vsync);
+	// (TE-synchronised flips; see g_vsync's comment). When the boot TE
+	// measurement passed the pacing gate, the ON value shows the panel's
+	// measured refresh rate ("60HZ") -- emulation locks 1:1 to it; a plain
+	// "ON" means the panel measured outside 58.5-61.5Hz and vsync is running
+	// the wall-clock fallback (tear-free, but with a periodic repeated
+	// frame). FPS/BATTERY toggle the matching piece of the in-game header
+	// (draw_status_bar()).
+	if (g_vsync && g_te_pace) {
+		char hz[8];
+		int32_t n = status_fmt_uint(hz,
+			(1000000u + g_te_period_us / 2) / g_te_period_us);
+		hz[n] = 'H';
+		hz[n + 1] = 'Z';
+		hz[n + 2] = '\0';
+		draw_value_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", hz);
+	} else {
+		draw_toggle_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", g_vsync);
+	}
 	draw_toggle_row(SET_ROW_FPS, sel, ICON_BOLT, "FPS", g_show_fps);
 	draw_toggle_row(SET_ROW_BATTERY, sel, ICON_BATTERY, "BATTERY PERCENTAGE",
 			g_show_battery);
@@ -1397,7 +1445,7 @@ static void draw_scroll_arrow(int32_t x, int32_t y, bool down, color_t c) {
 		fill_rect(x - k, down ? y - k : y + k, 1 + 2 * k, 1, c);
 }
 
-// Boot ROM-select body: catalog rows (icon, name, size) plus the trailing
+// Boot ROM-select body: catalog rows (icon, name) plus the trailing
 // SETTINGS row, the selected row drawn as a highlight pill. Catalogs taller
 // than the screen scroll: a sticky window offset follows the selection.
 static void draw_boot_menu(uint32_t sel, uint32_t batt) {
@@ -1414,7 +1462,6 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 
 	draw_menu_frame("BOOT", batt);
 
-	char buf[8];
 	const uint32_t rows = total < VISIBLE_ROWS ? total : VISIBLE_ROWS;
 	for (uint32_t r = 0; r < rows; r++) {
 		uint32_t i = first + r;
@@ -1437,29 +1484,12 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		const char *name = i < ROM_COUNT ? rom_catalog[i].name : "SETTINGS";
 		int32_t name_x = UI_MARGIN + 22;
 		int32_t name_max = UI_RIGHT - name_x;
-		if (i < ROM_COUNT) {
-			// Right-aligned size column, accent on the selected row.
-			// GBC ROM sizes are always a power of two (per the cartridge
-			// header size field), so an exact multiple of 1024K is shown
-			// in whole megabytes instead ("1M" rather than "1024K").
-			uint32_t kb = (rom_catalog[i].size + 1023) / 1024;
-			int32_t n;
-			if (kb % 1024 == 0) {
-				n = status_fmt_uint(buf, kb / 1024);
-				buf[n] = 'M';
-			} else {
-				n = status_fmt_uint(buf, kb);
-				buf[n] = 'K';
-			}
-			buf[n + 1] = '\0';
-			int32_t vx = UI_RIGHT - text_w(n + 1);
-			status_text(vx, y + 6, buf, is_sel ? UI_ACCENT : UI_VALUE);
-			name_max = vx - 4 - name_x;
-		}
 
-		// Clip long titles to the space left of the size column: the name's
-		// ink (text_w, no trailing glyph gap) must fit in name_max, so short
-		// size strings ("2M" vs "512K") buy extra name characters.
+		// Clip long titles to the full row width: the name's ink (text_w, no
+		// trailing glyph gap) must fit in name_max. At the current metrics
+		// that's 24 glyphs -- the same cap gen_rom_data.py applies to catalog
+		// names -- so in practice nothing gets ".."-clipped anymore (the old
+		// right-aligned size column used to cost ~4 name characters).
 		int32_t max_chars = (name_max + STATUS_GLYPH_ADV - 6) / STATUS_GLYPH_ADV;
 		int32_t len = 0;
 		while (name[len])
@@ -1525,7 +1555,10 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 #if ENABLE_SOUND
 	case SET_ROW_VOLUME: adjust_volume(dir); return;
 #endif
-	case SET_ROW_VSYNC: g_vsync = !g_vsync; return; // either direction toggles
+	case SET_ROW_VSYNC: // either direction toggles
+		g_vsync = !g_vsync;
+		apply_audio_pacing(); // TE-paced vsync shifts the production rate
+		return;
 	case SET_ROW_FPS: g_show_fps = !g_show_fps; return; // either direction toggles
 	case SET_ROW_BATTERY: g_show_battery = !g_show_battery; return; // either direction toggles
 	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
@@ -1732,6 +1765,12 @@ static void __not_in_flash_func(core1_main)() {
 int main() {
 	_init_hardware(); // includes the 250MHz/1.20V overclock (see hardware.cpp)
 
+	// Measure the panel's true TE period (~270ms, backlight is still off) and
+	// decide whether it is close enough to the GBC's 59.73Hz for TE-paced
+	// vsync -- see g_te_period_us/g_te_pace. Gate: 58.5-61.5Hz.
+	g_te_period_us = _measure_te_period_us();
+	g_te_pace = g_te_period_us >= 16260 && g_te_period_us <= 17094;
+
 	for (int32_t y = 0; y < SCREEN->h; y++)
 		for (int32_t x = 0; x < SCREEN->w; x++)
 			*SCREEN->p(x, y) = 0; // black border around the GBC frame
@@ -1760,6 +1799,11 @@ int main() {
 #endif
 		}
 	}
+
+	// With the restored vsync setting and the TE measurement both in hand,
+	// pin the audio production-rate assumption before core1 (which claims
+	// and tunes the pacing timer) is launched.
+	apply_audio_pacing();
 
 	// _init_hardware() explicitly sets backlight(0) as part of setup (screen
 	// off while the caller gets ready) -- the stock boot sequence in the
@@ -1899,17 +1943,19 @@ int main() {
 	uint64_t fps_window_start = time_us_64();
 #endif
 
-	// Real-time pacer (replaces _wait_vsync()). The panel refreshes at 40Hz
-	// but the GBC runs at 59.73Hz -- gating each emulated frame on vsync
-	// capped the game at 40/59.73 = 67% speed no matter how fast emulation
-	// got, and silently swallowed every other optimization's gains. Instead,
-	// pace to the GBC's true frame period: run flat-out while behind real
-	// time, and only wait when a frame finishes early, so the game can never
-	// run *faster* than authentic speed. The cost is losing vsync alignment
-	// on _flip() (possible shear on fast scrolls); tearing was already
-	// half-accepted anyway, since emulation draws into the same buffer the
-	// flip DMA reads from.
-	constexpr uint64_t GB_FRAME_US = 16742; // 70224 cycles / 4.194304MHz
+	// Real-time pacer (replaces _wait_vsync()). Pace to the GBC's true frame
+	// period: run flat-out while behind real time, and only wait when a
+	// frame finishes early, so the game can never run *faster* than
+	// authentic speed. (The original blanket _wait_vsync() gating dated from
+	// the 40Hz panel days, where it capped the game at 40/59.73 = 67% speed
+	// no matter how fast emulation got; the panel now runs at ~60Hz, and
+	// when its measured rate is close enough -- g_te_pace -- the vsync-ON
+	// path waits on the TE-consumed arm instead of the wall clock, locking
+	// emulation 1:1 to the panel with no speed cap. See the arming policy at
+	// the bottom of the loop.) With vsync OFF the cost is losing vsync
+	// alignment on _flip() (possible shear on fast scrolls); tearing was
+	// already half-accepted anyway, since emulation draws into the same
+	// buffer the flip DMA reads from.
 	uint64_t frame_due = time_us_64();
 	g_rtc_last_us = frame_due; // discard boot/menu time predating the game
 
@@ -2072,20 +2118,55 @@ int main() {
 		// Vsync arming policy (the frame is complete in the buffer here --
 		// the ring drain above guarantees it). On-schedule frames always
 		// arm: the writer then paces at the authentic ~14 rows/ms next
-		// frame, which the flip DMA's ~21 rows/ms outruns, so core1's chase
-		// stays a no-op. Behind-schedule frames (catch-up sprints, where
-		// emulation runs flat-out and WOULD collide with the DMA) skip
-		// arming so the chase never throttles the sprint -- that throttling
-		// is what got the always-on version reverted. Every 3rd sprint
-		// frame arms anyway so the screen keeps moving through sustained
-		// slowdown; cheap there, because an emulator that can't hit 60fps
-		// writes rows slower than the DMA streams them.
-		if (g_vsync && (now < frame_due || ++vsync_skipped >= 3)) {
-			vsync_skipped = 0;
-			_flip_armed = true;
+		// frame, which the flip DMA's ~19.65 rows/ms outruns, so core1's
+		// chase stays a no-op. Mildly-behind frames (debt under one frame)
+		// arm too, even if the previous flip is still in flight -- the TE
+		// handler holds the arm until that flip drains, and the chase
+		// bounds any overlap; refusing to arm here (an earlier version
+		// required !_in_flip) silently dropped the first presentation after
+		// every minor stall, a visible hitch at an FPS meter still reading
+		// 59-60. Deeper behind (catch-up sprints,
+		// where emulation runs flat-out and WOULD collide with the DMA),
+		// skip arming so the chase never throttles the sprint -- that
+		// throttling is what got the always-on version reverted. Every 3rd
+		// sprint frame arms anyway so the screen keeps moving through
+		// sustained slowdown; cheap there, because an emulator that can't
+		// hit 60fps writes rows slower than the DMA streams them.
+		bool armed = false;
+		if (g_vsync) {
+			if (now < frame_due)
+				armed = true; // on schedule
+			else if (now - frame_due < GB_FRAME_US)
+				armed = true; // mild slip: present it, TE holds the arm
+			else if (++vsync_skipped >= 3)
+				armed = true; // sustained sprint: keep the panel moving
+			if (armed) {
+				vsync_skipped = 0;
+				_flip_armed = true;
+			}
 		}
 
-		if (now < frame_due) {
+		if (armed && g_te_pace && now < frame_due) {
+			// TE-paced (panel measured close to 59.73Hz at boot): instead
+			// of holding to the wall clock, wait for the TE IRQ to consume
+			// the arm -- emulation locks 1:1 to the panel's true rate, so
+			// every frame is presented with zero tear and zero judder. The
+			// deadline only guards against TE dying mid-game (never seen;
+			// the boot measurement already proved the pin pulses) -- the
+			// arm would survive to a later TE either way.
+			const uint64_t deadline = frame_due + GB_FRAME_US;
+			while (_flip_armed && time_us_64() < deadline)
+				tight_loop_contents();
+			if (!_flip_armed) {
+				// Resync the pacer to the panel clock: TE is the authority
+				// on when this frame ended, and letting wall-clock skew
+				// accumulate against a panel running ±0.5% off 59.73Hz
+				// would eventually shove every frame into the sprint path
+				// (panel slow) or bank an unbounded ahead-of-time credit
+				// (panel fast).
+				frame_due = time_us_64();
+			}
+		} else if (now < frame_due) {
 			// Ahead of real time: hold the line at authentic game speed.
 			while (time_us_64() < frame_due)
 				tight_loop_contents();

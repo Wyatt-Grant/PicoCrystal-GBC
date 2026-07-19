@@ -71,6 +71,8 @@ static uint8_t g_rtc_hour = 14;
 static uint8_t g_rtc_min = 32;
 static bool g_vsync = true; // render the settings screen with the toggle ON
 static bool g_boot_last = true; // BOOT LAST GAME row rendered ON
+static bool g_te_pace = true;             // render the VSYNC row TE-locked...
+static uint32_t g_te_period_us = 16667;   // ...showing "60HZ"
 
 struct rom_entry_t {
 	const char *name;

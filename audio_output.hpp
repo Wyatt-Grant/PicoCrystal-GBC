@@ -45,6 +45,15 @@ void audio_output_core1_init();
 // scalars/arrays).
 void audio_output_render_frame(struct minigb_apu_ctx *ctx);
 
+// Tells the playback side how often the emulator actually produces a frame
+// of AUDIO_SAMPLES samples, in microseconds -- 16742 (the default) at
+// authentic GBC pace, or the measured panel TE period while main.cpp's
+// TE-paced vsync mode locks emulation to the panel clock. Playback DREQ
+// pacing is retuned to sit just above that production rate so drift always
+// resolves as a harmless microsecond-scale hold instead of a dropped audio
+// frame. Callable from core0 at any time (before or after core1 starts).
+void audio_output_set_frame_period(uint32_t frame_us);
+
 // Master volume as a percentage of the raw mixed signal (0-800 -- see
 // audio_output.cpp for why 100/"unity" is too quiet), applied during the
 // downmix in audio_output_render_frame(); the soft-knee limiter there keeps
