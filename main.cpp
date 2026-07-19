@@ -279,31 +279,32 @@ static inline void adjust_brightness(int32_t dir) { // dir > 0: up, dir < 0: dow
 	backlight(g_brightness);
 }
 
-// Tear-free display toggle (settings menu VSYNC row, persisted). This never
-// paces emulation -- the game runs at its authentic 59.73Hz with normal audio
-// in both modes; the toggle only decides *when the panel gets a copy* of the
-// framebuffer.
+// Tear-free display toggle (settings menu VSYNC row, persisted).
 //
 // OFF (default): the stock path. _flip() fires straight from the main loop,
 // racing both the panel scan-out and core1's scanline writes -- zero overhead,
-// but shear is visible on scrolls.
+// but shear is visible on scrolls. The game runs at its authentic 59.73Hz off
+// the wall-clock pacer.
 //
-// ON: the main loop arms _flip_armed instead and the ST7789 TE interrupt
-// starts the flip DMA as the beam enters the off-glass dead zone (STE tear
-// scanline 240; hardware.cpp _gpio_irq_handler) -- the ~4.5ms head start
-// keeps the GRAM write ahead of the panel beam, so no panel-level tear. Buffer-level tear (emulator overwriting rows mid-stream) is prevented
-// by core1 chasing the flip DMA's read_addr before storing each scaled row
-// (see render_line_job). Cost when the chase engages: core1's stores briefly
-// throttle to the DMA's ~19.65 rows/ms streaming rate. The arming policy in
-// the main loop keeps that rare -- this is what the reverted always-on
-// version got wrong (it armed every frame, so catch-up sprints were
-// permanently throttled and core0 stalled behind the chase through the VRAM
-// fence).
+// ON: normally fully TE-LOCKED (g_te_pace; the panel runs at ~60Hz since the
+// hardware.cpp FRCTRL2 change, so this no longer costs game speed). Every
+// frame arms _flip_armed and the pacer then WAITS for the ST7789 TE
+// interrupt to consume the arm and start the flip DMA (at STE tear scanline
+// 240, where the beam enters the off-glass dead zone -- the ~4.5ms head
+// start keeps the GRAM write ahead of the beam, so no panel-level tear).
+// The wait is what makes the lock airtight against buffer-level tear too:
+// the next frame's rows only start landing once the flip DMA is already
+// streaming, and core1's per-row read_addr chase (render_line_job) keeps the
+// writer behind it -- a flip can never stream a half-written frame. Cost:
+// the chase briefly paces core1's stores to the DMA's ~19.65 rows/ms.
+// Emulation runs at the panel's measured rate (audio pacing retunes to
+// match -- tempo, not pitch); the settings row shows the rate.
 //
-// Since the panel moved to ~60Hz (hardware.cpp FRCTRL2), the TE rate nearly
-// matches the GBC's 59.73Hz, so vsync ON can additionally pace emulation off
-// TE itself (g_te_pace below) -- every emulated frame is presented, with no
-// judder from the residual rate mismatch.
+// History: the reverted 2026-07 "always-on" version armed every frame but
+// did NOT wait for the flip to start, so pending arms fired mid-write
+// (tears) and the chase throttled catch-up sprints through the VRAM fence
+// (perf); and at the then-40Hz panel a full lock would have meant 67% game
+// speed. The 60Hz panel is what made the lock viable.
 //
 // volatile: written by core0 (settings menu), read by core1's store path.
 static volatile bool g_vsync = false;
@@ -312,14 +313,16 @@ static volatile bool g_vsync = false;
 constexpr uint64_t GB_FRAME_US = 16742;
 
 // Boot-time measurement of the panel's real TE period (its RC oscillator
-// varies unit to unit around the nominal ~60Hz), and whether it landed close
-// enough to the GBC rate (58.5-61.5Hz) to enable TE-paced vsync: when ahead
-// of schedule with a flip armed, the pacer waits for the TE IRQ to consume
-// the arm instead of busy-waiting on the wall clock, locking emulation 1:1
-// to the panel (zero tear, zero judder, speed error under ~2% worst case and
-// typically <0.5%). When the measurement fails the gate, vsync ON falls back
-// to the wall-clock pacer: still tear-free, with an occasional repeated
-// panel frame from the rate mismatch. Set once at boot, read-only after.
+// varies unit to unit around the nominal ~60Hz), and whether it passed the
+// sanity gate (54-66Hz) that enables TE-locked vsync: with vsync ON, every
+// frame arms a flip and emulation waits for the TE IRQ to consume it before
+// continuing -- the game runs at exactly the panel's rate, every frame is
+// presented, and the shared framebuffer is coherent at every flip (see the
+// pacer). Game speed and music tempo (not pitch -- audio pacing retunes,
+// see apply_audio_pacing) follow the panel's true rate; the settings VSYNC
+// row displays it. When the measurement fails the gate, vsync ON falls back
+// to the wall-clock pacer, which can still tear (pending arm consumed
+// mid-write). Set once at boot, read-only after.
 static uint32_t g_te_period_us = 0;
 static bool g_te_pace = false;
 
@@ -1361,12 +1364,11 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 
 	// VSYNC: ON trades a little emulation headroom for tear-free scrolling
 	// (TE-synchronised flips; see g_vsync's comment). When the boot TE
-	// measurement passed the pacing gate, the ON value shows the panel's
+	// measurement passed the lock gate, the ON value shows the panel's
 	// measured refresh rate ("60HZ") -- emulation locks 1:1 to it; a plain
-	// "ON" means the panel measured outside 58.5-61.5Hz and vsync is running
-	// the wall-clock fallback (tear-free, but with a periodic repeated
-	// frame). FPS/BATTERY toggle the matching piece of the in-game header
-	// (draw_status_bar()).
+	// "ON" means the panel measured outside 54-66Hz and vsync is running
+	// the degraded wall-clock fallback. FPS/BATTERY toggle the matching
+	// piece of the in-game header (draw_status_bar()).
 	if (g_vsync && g_te_pace) {
 		char hz[8];
 		int32_t n = status_fmt_uint(hz,
@@ -1766,10 +1768,12 @@ int main() {
 	_init_hardware(); // includes the 250MHz/1.20V overclock (see hardware.cpp)
 
 	// Measure the panel's true TE period (~270ms, backlight is still off) and
-	// decide whether it is close enough to the GBC's 59.73Hz for TE-paced
-	// vsync -- see g_te_period_us/g_te_pace. Gate: 58.5-61.5Hz.
+	// decide whether TE-locked vsync is usable -- see g_te_period_us /
+	// g_te_pace. Gate: 54-66Hz, generous enough for the ST7789 RC
+	// oscillator's unit-to-unit spread; outside it means the measurement
+	// itself is suspect (TE glitching), not just an off-nominal panel.
 	g_te_period_us = _measure_te_period_us();
-	g_te_pace = g_te_period_us >= 16260 && g_te_period_us <= 17094;
+	g_te_pace = g_te_period_us >= 15152 && g_te_period_us <= 18519;
 
 	for (int32_t y = 0; y < SCREEN->h; y++)
 		for (int32_t x = 0; x < SCREEN->w; x++)
@@ -2115,65 +2119,63 @@ int main() {
 		frame_due += GB_FRAME_US;
 		uint64_t now = time_us_64();
 
-		// Vsync arming policy (the frame is complete in the buffer here --
-		// the ring drain above guarantees it). On-schedule frames always
-		// arm: the writer then paces at the authentic ~14 rows/ms next
-		// frame, which the flip DMA's ~19.65 rows/ms outruns, so core1's
-		// chase stays a no-op. Mildly-behind frames (debt under one frame)
-		// arm too, even if the previous flip is still in flight -- the TE
-		// handler holds the arm until that flip drains, and the chase
-		// bounds any overlap; refusing to arm here (an earlier version
-		// required !_in_flip) silently dropped the first presentation after
-		// every minor stall, a visible hitch at an FPS meter still reading
-		// 59-60. Deeper behind (catch-up sprints,
-		// where emulation runs flat-out and WOULD collide with the DMA),
-		// skip arming so the chase never throttles the sprint -- that
-		// throttling is what got the always-on version reverted. Every 3rd
-		// sprint frame arms anyway so the screen keeps moving through
-		// sustained slowdown; cheap there, because an emulator that can't
-		// hit 60fps writes rows slower than the DMA streams them.
-		bool armed = false;
-		if (g_vsync) {
-			if (now < frame_due)
-				armed = true; // on schedule
-			else if (now - frame_due < GB_FRAME_US)
-				armed = true; // mild slip: present it, TE holds the arm
-			else if (++vsync_skipped >= 3)
-				armed = true; // sustained sprint: keep the panel moving
-			if (armed) {
+		if (g_vsync && g_te_pace) {
+			// TE lock: the frame is complete in the buffer (ring drained
+			// above), so arm unconditionally and wait for the TE IRQ to
+			// consume the arm before emulating any further. Emulation runs
+			// at exactly the panel's measured rate, every frame is
+			// presented, and -- the part no arming heuristic can deliver --
+			// the buffer is *coherent at every flip*: the next frame's rows
+			// only start landing after the flip DMA is already streaming,
+			// so the writer stays behind the DMA (core1's chase enforces
+			// it) and a flip can never stream a half-written frame. The
+			// earlier wall-clock arming schemes all shared that hole: an
+			// arm pending while emulation ran ahead meant TE could fire
+			// mid-write and stream a mixed buffer (new rows on top, old
+			// below) -- the residual "still tears with vsync on" reports.
+			//
+			// No catch-up sprints in this mode: after a stall (flash erase,
+			// settings menu) we simply resume at panel rate. Wall-clock
+			// debt repayment bought nothing a player can see -- gameplay
+			// isn't wall-anchored and the RTC ticks off the wall clock
+			// independently (rtc poll below).
+			//
+			// A frame that overruns one TE period just misses that TE: the
+			// panel repeats the previous (complete) frame once -- a hitch,
+			// never a tear. The deadline only guards against TE dying
+			// mid-game (never seen; boot measurement proved the pin
+			// pulses).
+			_flip_armed = true;
+			const uint64_t deadline = now + 2 * GB_FRAME_US;
+			while (_flip_armed && time_us_64() < deadline)
+				tight_loop_contents();
+			// Keep the wall-clock bookkeeping current so toggling vsync
+			// OFF mid-game doesn't inherit stale debt.
+			frame_due = time_us_64();
+		} else {
+			// Wall-clock pacer -- vsync OFF, or ON with a panel whose TE
+			// measurement failed the (wide, 54-66Hz) lock gate. In the
+			// latter, should-never-happen case the old arming policy
+			// applies: on-schedule frames arm; behind-schedule frames skip
+			// arming (so the chase never throttles a catch-up sprint)
+			// except every 3rd, so the screen keeps moving through
+			// sustained slowdown. Tear-free is NOT guaranteed here -- a
+			// pending arm can be consumed mid-write of the next frame --
+			// it's strictly a degraded fallback.
+			if (g_vsync && (now < frame_due || ++vsync_skipped >= 3)) {
 				vsync_skipped = 0;
 				_flip_armed = true;
 			}
-		}
 
-		if (armed && g_te_pace && now < frame_due) {
-			// TE-paced (panel measured close to 59.73Hz at boot): instead
-			// of holding to the wall clock, wait for the TE IRQ to consume
-			// the arm -- emulation locks 1:1 to the panel's true rate, so
-			// every frame is presented with zero tear and zero judder. The
-			// deadline only guards against TE dying mid-game (never seen;
-			// the boot measurement already proved the pin pulses) -- the
-			// arm would survive to a later TE either way.
-			const uint64_t deadline = frame_due + GB_FRAME_US;
-			while (_flip_armed && time_us_64() < deadline)
-				tight_loop_contents();
-			if (!_flip_armed) {
-				// Resync the pacer to the panel clock: TE is the authority
-				// on when this frame ended, and letting wall-clock skew
-				// accumulate against a panel running ±0.5% off 59.73Hz
-				// would eventually shove every frame into the sprint path
-				// (panel slow) or bank an unbounded ahead-of-time credit
-				// (panel fast).
-				frame_due = time_us_64();
+			if (now < frame_due) {
+				// Ahead of real time: hold at authentic game speed.
+				while (time_us_64() < frame_due)
+					tight_loop_contents();
+			} else if (now - frame_due > 4 * GB_FRAME_US) {
+				// Fell badly behind (e.g. a save-flash erase pause): drop
+				// the accumulated debt instead of fast-forwarding.
+				frame_due = now;
 			}
-		} else if (now < frame_due) {
-			// Ahead of real time: hold the line at authentic game speed.
-			while (time_us_64() < frame_due)
-				tight_loop_contents();
-		} else if (now - frame_due > 4 * GB_FRAME_US) {
-			// Fell badly behind (e.g. a save-flash erase pause): drop the
-			// accumulated debt instead of fast-forwarding to repay it.
-			frame_due = now;
 		}
 
 		if (!g_vsync)
