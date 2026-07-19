@@ -34,8 +34,22 @@ constexpr int32_t OFFSET_Y = 24;
 constexpr uint16_t VOLUME_MAX = 800;
 static uint16_t audio_output_get_volume() { return 320; } // reads back as 40%
 static uint8_t g_brightness = 70;
-static bool g_show_fps = true;     // draw_status_bar renders both header pieces
-static bool g_show_battery = true;
+// Mirrors main.cpp's STATUS BAR mode enum + helpers (they sit outside the
+// fenced ranges, next to the other globals stubbed here).
+enum status_bar_mode_t : uint8_t {
+	STATUS_FPS_PCT,
+	STATUS_FPS,
+	STATUS_PCT,
+	STATUS_ICON,
+	STATUS_FULLSCREEN,
+	STATUS_MODE_COUNT,
+};
+static uint8_t g_status_bar = STATUS_FPS_PCT; // both header pieces render
+static inline bool status_show_fps() { return g_status_bar <= STATUS_FPS; }
+static inline bool status_show_pct() {
+	return g_status_bar == STATUS_FPS_PCT || g_status_bar == STATUS_PCT;
+}
+static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREEN; }
 
 // PicoSystem SDK color/hardware stubs for the RGB pseudo-theme path: hsv()
 // packs like the firmware's color_t (R 0-3, A 4-7, B 8-11, G 12-15, see
@@ -140,21 +154,28 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/statusbar.ppm", dir);
 	write_ppm(path);
 
-	// The BATTERY PERCENTAGE toggle off: "<n>%" text gone from every
-	// header (in-game, boot, settings), icon stays.
-	g_show_battery = false;
+	// STATUS BAR mode FPS: "<n>%" text gone from every header (in-game,
+	// boot, settings), FPS readout and icon stay.
+	g_status_bar = STATUS_FPS;
 	memset(_fb, 0, sizeof _fb);
 	draw_status_bar(60, 82, false);
 	snprintf(path, sizeof path, "%s/statusbar_nopct.ppm", dir);
 	write_ppm(path);
 
-	draw_settings_menu(SET_ROW_BATTERY, 82);
+	draw_settings_menu(SET_ROW_STATUS, 82);
 	snprintf(path, sizeof path, "%s/settings_nopct.ppm", dir);
+	write_ppm(path);
+
+	// ICON mode: header carries only the battery icon.
+	g_status_bar = STATUS_ICON;
+	memset(_fb, 0, sizeof _fb);
+	draw_status_bar(60, 82, false);
+	snprintf(path, sizeof path, "%s/statusbar_icon.ppm", dir);
 	write_ppm(path);
 
 	// A non-default theme with the THEME row selected -- every
 	// accent-tinted element should recolor.
-	g_show_battery = true;
+	g_status_bar = STATUS_FPS_PCT;
 	apply_theme(1); // GRAPE
 	draw_settings_menu(SET_ROW_THEME, 82);
 	snprintf(path, sizeof path, "%s/settings_grape.ppm", dir);

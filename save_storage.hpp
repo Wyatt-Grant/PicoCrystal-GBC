@@ -104,8 +104,9 @@ struct device_settings_t {
 	uint8_t rtc_min;    // 0..59
 	uint16_t volume;    // audio_output native range, 0..800
 	uint8_t vsync;        // 0/1: tear-free TE-synchronised flips (main.cpp g_vsync)
-	uint8_t show_fps;     // 0/1: show FPS counter in-game (main.cpp g_show_fps)
-	uint8_t show_battery; // 0/1: show battery % text in all headers, icon always shows (main.cpp g_show_battery)
+	uint8_t status_bar;   // status_bar_mode_t (main.cpp g_status_bar): 0 FPS+PCT,
+			      // 1 FPS, 2 PERCENT, 3 ICON, 4 FULLSCREEN (no in-game
+			      // header, game frame centered)
 	uint8_t theme;        // UI accent theme: a UI_THEMES index, or THEME_RGB
 			      // (== THEME_COUNT) for the cycling pseudo-theme
 			      // (main.cpp g_theme). Was reserved0, always stored

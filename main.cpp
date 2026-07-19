@@ -338,13 +338,26 @@ static void apply_audio_pacing() {
 #endif
 }
 
-// Header toggles (settings menu FPS/BATTERY PERCENTAGE rows, persisted).
-// g_show_fps gates the FPS counter in the in-game header band
-// (draw_status_bar(), main()'s run loop); g_show_battery gates the battery
-// "<n>%" text in every header -- in-game, boot menu, and settings menu alike.
-// The battery icon itself always shows, its fill conveying the level.
-static bool g_show_fps = true;
-static bool g_show_battery = true;
+// STATUS BAR mode (settings menu row, persisted). Picks what the in-game
+// header band shows: the FPS counter, the battery "<n>%" text, both, or
+// neither -- the battery icon itself always shows in every bar mode, its fill
+// conveying the level. The percent choice also applies to the boot/settings
+// menu headers. FULLSCREEN drops the in-game header entirely and centers the
+// scaled GBC frame vertically (see g_game_offset_y); menus keep their band.
+enum status_bar_mode_t : uint8_t {
+	STATUS_FPS_PCT,
+	STATUS_FPS,
+	STATUS_PCT,
+	STATUS_ICON,
+	STATUS_FULLSCREEN,
+	STATUS_MODE_COUNT,
+};
+static uint8_t g_status_bar = STATUS_FPS_PCT;
+static inline bool status_show_fps() { return g_status_bar <= STATUS_FPS; }
+static inline bool status_show_pct() {
+	return g_status_bar == STATUS_FPS_PCT || g_status_bar == STATUS_PCT;
+}
+static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREEN; }
 
 // BOOT LAST GAME (settings menu row, persisted): when on, main() skips the
 // boot ROM picker and boots straight into the last-played game; holding B
@@ -354,13 +367,13 @@ static bool g_boot_last = false;
 static uint8_t g_last_slot = 0xFF;
 
 // The LED reports battery charge: a green->red gradient (green ~= full,
-// red ~= nearly empty) at ~15% brightness so it glows rather than glares.
+// red ~= nearly empty) at ~20% brightness so it glows rather than glares.
 // The usable ~5..100 span maps to the gradient, blended through yellow.
 // Shared by the in-game run loop and the menus (boot ROM picker, settings).
 static void led_show_battery(int level) {
 	if (level < 5)   level = 5;
 	if (level > 100) level = 100;
-	constexpr int BRIGHTNESS = 15;      // ~15% max brightness
+	constexpr int BRIGHTNESS = 20;      // ~20% max brightness
 	int fill = (level - 5) * 100 / 95;  // 0 (empty) .. 100 (full)
 	led((100 - fill) * BRIGHTNESS / 100, // red rises as it drains
 	    fill * BRIGHTNESS / 100,         // green rises as it fills
@@ -406,6 +419,16 @@ constexpr int32_t SCALED_W = 240;
 constexpr int32_t SCALED_H = 216;
 constexpr int32_t OFFSET_X = (240 - SCALED_W) / 2;
 constexpr int32_t OFFSET_Y = 240 - SCALED_H;
+
+// Where the game frame actually lands: OFFSET_Y (under the header band)
+// normally, or centered (12px letterbox top and bottom) in the FULLSCREEN
+// status-bar mode. Read by core1's scanline writer; only changed while
+// emulation is paused (settings menu open / before the run loop starts), when
+// core1's line callback can't be running and the line ring is drained.
+static volatile int32_t g_game_offset_y = OFFSET_Y;
+static void apply_game_offset() {
+	g_game_offset_y = status_fullscreen() ? (240 - SCALED_H) / 2 : OFFSET_Y;
+}
 
 // 1.5x is a clean 3:2 ratio, so no per-pixel division or index table is needed
 // -- source pixels pair up (s0, s1) and expand to three output pixels
@@ -549,18 +572,19 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 	// (see hardware.cpp's TE handler), so this can never pass on a stale
 	// address. In steady state it never spins: the DMA streams ~19.65
 	// rows/ms while the emulator writes ~14 rows/ms at authentic pace, and
-	// the 24-row letterbox gives the reader a head start -- the spin only
+	// the top letterbox (24 rows; 12 in FULLSCREEN) gives the reader a
+	// head start -- the spin only
 	// engages when emulation bursts ahead within a frame, and the main
 	// loop's arming policy keeps flips away from catch-up sprints.
 	if (g_vsync) {
-		const uint32_t last_row = (uint32_t)(OFFSET_Y + 3 * k) + (odd ? 2u : 0u);
+		const uint32_t last_row = (uint32_t)(g_game_offset_y + 3 * k) + (odd ? 2u : 0u);
 		const uintptr_t chase_end = (uintptr_t)SCREEN->data +
 			(uintptr_t)(last_row + 1) * SCALED_W * sizeof(color_t);
 		while (_in_flip && dma_hw->ch[dma_channel].read_addr < chase_end)
 			tight_loop_contents();
 	}
 
-	color_t *dst = SCREEN->p(OFFSET_X, OFFSET_Y + 3 * k + (odd ? 2 : 0));
+	color_t *dst = SCREEN->p(OFFSET_X, g_game_offset_y + 3 * k + (odd ? 2 : 0));
 
 	// Horizontal scale 1.5x with a blended middle column per pixel pair.
 	if (cgb) {
@@ -589,7 +613,7 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 
 	if (odd) {
 		// Row 3k+1: smoothed average of the stored even row and this odd row.
-		color_t *mid = SCREEN->p(OFFSET_X, OFFSET_Y + 3 * k + 1);
+		color_t *mid = SCREEN->p(OFFSET_X, g_game_offset_y + 3 * k + 1);
 		for (int32_t x = 0; x < SCALED_W; x++)
 			mid[x] = blend_avg(_prev_row[x], dst[x]);
 	} else {
@@ -827,7 +851,8 @@ static const uint8_t _icons7[][7] = {
 	  0b1111111,
 	  0b0001000,
 	  0b0111110 },
-	{ 0b0001100,  // ICON_BOLT -- lightning bolt (FPS row)
+	{ 0b0001100,  // ICON_BOLT -- lightning bolt (currently unused; kept so
+		      // the table tracks icon_t index-for-index)
 	  0b0011000,
 	  0b0110000,
 	  0b1111100,
@@ -956,7 +981,7 @@ static void update_rgb_theme() {
 // the RGB pseudo-theme on screen. Same brightness cap as led_show_battery()
 // so it glows rather than glares.
 static void led_show_rgb() {
-	constexpr int BRIGHTNESS = 15;
+	constexpr int BRIGHTNESS = 20;
 	led((uint8_t)((UI_ACCENT & 0xF) * BRIGHTNESS / 15),
 	    (uint8_t)(((UI_ACCENT >> 12) & 0xF) * BRIGHTNESS / 15),
 	    (uint8_t)(((UI_ACCENT >> 8) & 0xF) * BRIGHTNESS / 15));
@@ -1046,8 +1071,8 @@ static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
 
 // "<n>% [icon]", right-aligned so the icon's right edge lands at `right`.
 // Shared by the in-game status bar and the menu card headers. show_pct=false
-// drops the "<n>%" text and keeps the icon (the in-game BATTERY PERCENTAGE
-// toggle -- the icon's fill still shows the level at a glance).
+// drops the "<n>%" text and keeps the icon (STATUS BAR modes without PCT --
+// the icon's fill still shows the level at a glance).
 //
 // The icon (17x13, see draw_battery_icon) is 3px taller than the "<n>%"
 // text (6x10 glyphs at status_text's 2x scale), so drawing both at the same
@@ -1099,23 +1124,27 @@ static void draw_header_band(const char *title, uint32_t batt, color_t rule,
 }
 
 // In-game status bar. Repainted only when a shown value changes (~1x/sec), so
-// the cost is negligible and it stays off the per-frame budget. The settings
-// menu independently toggles the FPS readout (g_show_fps -- an empty title
-// skips the label/number) and the battery percentage text (g_show_battery --
-// the icon itself always shows).
+// the cost is negligible and it stays off the per-frame budget. The STATUS BAR
+// setting (g_status_bar) picks the text shown: the FPS readout (an empty title
+// skips the label/number), the battery percentage, both, or neither -- the
+// icon itself always shows. In FULLSCREEN mode the run loop never calls this
+// (there is no header band); the guard below is just belt-and-braces.
 static void draw_status_bar(uint32_t fps, uint32_t batt, bool saving) {
+	if (status_fullscreen())
+		return;
 	// An in-flight autosave commit replaces the FPS readout with a WRITING
 	// TO FLASH indicator -- shown even with the FPS toggle off, so a
 	// power-off during the flash write window is always signposted. Normal
 	// 8px advance, not the header's letterspaced 12px: at 16 glyphs the
 	// letterspaced version would run into the battery block.
 	if (saving) {
-		draw_header_band("", batt, STATUS_RULE, g_show_battery, 1);
+		draw_header_band("", batt, STATUS_RULE, status_show_pct(), 1);
 		status_text(UI_MARGIN, HDR_TOP, "WRITING TO FLASH", UI_ACCENT);
 		return;
 	}
-	draw_header_band(g_show_fps ? "FPS" : "", batt, STATUS_RULE, g_show_battery, 1);
-	if (g_show_fps) {
+	draw_header_band(status_show_fps() ? "FPS" : "", batt, STATUS_RULE,
+			 status_show_pct(), 1);
+	if (status_show_fps()) {
 		char buf[12];
 		int32_t n = status_fmt_uint(buf, fps);
 		buf[n] = '\0';
@@ -1135,11 +1164,12 @@ static void draw_status_bar(uint32_t fps, uint32_t batt, bool saving) {
 
 // Fills the whole screen with the panel color and draws the header band with
 // a green accent rule (the in-game FPS overlay draws its own grey-ruled band
-// directly via draw_header_band()). Menu headers follow the BATTERY
-// PERCENTAGE toggle just like the in-game header.
+// directly via draw_header_band()). Menu headers follow the STATUS BAR mode's
+// percent choice just like the in-game header (and keep their band even in
+// FULLSCREEN mode -- only the in-game header disappears).
 static void draw_menu_frame(const char *title, uint32_t batt) {
 	fill_rect(0, OFFSET_Y, SCREEN->w, SCREEN->h - OFFSET_Y, UI_CARD);
-	draw_header_band(title, batt, UI_ACCENT, g_show_battery);
+	draw_header_band(title, batt, UI_ACCENT, status_show_pct());
 }
 
 // Dim, centered control hints along the bottom of the panel.
@@ -1254,8 +1284,7 @@ enum settings_row_t : uint32_t {
 	SET_ROW_VOLUME,
 #endif
 	SET_ROW_VSYNC,
-	SET_ROW_FPS,
-	SET_ROW_BATTERY,
+	SET_ROW_STATUS,
 	SET_ROW_BOOT_LAST,
 	SET_ROW_THEME,
 	SET_ROW_MODE, // APPEARANCE: dark/light
@@ -1277,7 +1306,7 @@ constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 // inline meter bar on the same line rather than a full-width bar underneath --
 // so all rows share one height. Uniform 18px keeps the RTC clock section below
 // clear of draw_menu_hints()'s fixed y=226 (with rows through APPEARANCE the
-// clock anchors at y=178 and the digits end at ~y=212).
+// clock anchors at y=160 and the digits end at ~y=194).
 constexpr int32_t ROW_H = 18;
 
 static int32_t settings_row_y(uint32_t row) {
@@ -1367,10 +1396,9 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// measurement passed the lock gate, the ON value shows the panel's
 	// measured refresh rate ("60HZ") -- emulation locks 1:1 to it; a plain
 	// "ON" means the panel measured outside 54-66Hz and vsync is running
-	// the degraded wall-clock fallback. FPS/BATTERY toggle the matching
-	// piece of the in-game header (draw_status_bar()).
+	// the degraded wall-clock fallback.
 	if (g_vsync && g_te_pace) {
-		char hz[8];
+		char hz[13]; // status_fmt_uint worst case (10 digits) + "HZ" + NUL
 		int32_t n = status_fmt_uint(hz,
 			(1000000u + g_te_period_us / 2) / g_te_period_us);
 		hz[n] = 'H';
@@ -1380,9 +1408,14 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	} else {
 		draw_toggle_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", g_vsync);
 	}
-	draw_toggle_row(SET_ROW_FPS, sel, ICON_BOLT, "FPS", g_show_fps);
-	draw_toggle_row(SET_ROW_BATTERY, sel, ICON_BATTERY, "BATTERY PERCENTAGE",
-			g_show_battery);
+	// STATUS BAR: what the in-game header shows -- FPS and/or battery % text
+	// (the icon always shows), just the icon, or FULLSCREEN (no header, game
+	// frame centered). The percent choice also drives the menu headers.
+	static const char *const STATUS_MODE_NAMES[STATUS_MODE_COUNT] = {
+		"FPS+PCT", "FPS", "PERCENT", "ICON", "FULLSCREEN",
+	};
+	draw_value_row(SET_ROW_STATUS, sel, ICON_BATTERY, "STATUS BAR",
+		       STATUS_MODE_NAMES[g_status_bar]);
 	// BOOT LAST GAME: ON skips the boot ROM picker and auto-boots the
 	// last-played game (hold B during power-on to get the picker back).
 	draw_toggle_row(SET_ROW_BOOT_LAST, sel, ICON_CART, "BOOT LAST GAME",
@@ -1540,8 +1573,7 @@ static void store_device_settings() {
 		0,
 #endif
 		(uint8_t)(g_vsync ? 1 : 0),
-		(uint8_t)(g_show_fps ? 1 : 0),
-		(uint8_t)(g_show_battery ? 1 : 0),
+		g_status_bar,
 		g_theme,
 		g_dark_mode,
 		(uint8_t)(g_boot_last ? 1 : 0),
@@ -1561,8 +1593,11 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		g_vsync = !g_vsync;
 		apply_audio_pacing(); // TE-paced vsync shifts the production rate
 		return;
-	case SET_ROW_FPS: g_show_fps = !g_show_fps; return; // either direction toggles
-	case SET_ROW_BATTERY: g_show_battery = !g_show_battery; return; // either direction toggles
+	case SET_ROW_STATUS: // < > cycle the five modes, wrapping
+		g_status_bar = (uint8_t)((g_status_bar + STATUS_MODE_COUNT +
+					  (uint32_t)dir) % STATUS_MODE_COUNT);
+		apply_game_offset();
+		return;
 	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
 	case SET_ROW_THEME:
 		apply_theme((g_theme + THEME_OPTION_COUNT + (uint32_t)dir) % THEME_OPTION_COUNT);
@@ -1802,8 +1837,9 @@ int main() {
 			g_rtc_hour = ds.rtc_hour % 24;
 			g_rtc_min  = ds.rtc_min  % 60;
 			g_vsync = ds.vsync != 0;
-			g_show_fps = ds.show_fps != 0;
-			g_show_battery = ds.show_battery != 0;
+			g_status_bar = ds.status_bar < STATUS_MODE_COUNT
+				     ? ds.status_bar : (uint8_t)STATUS_FPS_PCT;
+			apply_game_offset();
 			apply_theme(ds.theme); // out-of-range falls back to MINT
 			apply_mode(ds.dark_mode); // restore dark/light appearance
 			g_boot_last = ds.boot_last != 0;
@@ -1951,6 +1987,7 @@ int main() {
 	uint32_t fps_shown = 0;
 	bool saving_shown = false;       // WRITING TO FLASH indicator painted
 	uint64_t saving_hold_until = 0;  // keeps it up past a fast commit
+	bool saving_led = false;         // FULLSCREEN save blink owns the LED
 	int32_t batt_shown = -1;
 	uint64_t batt_hold_until = 0; // displayed level pinned until this time
 	uint32_t fps_frames = 0;
@@ -1976,6 +2013,18 @@ int main() {
 	// Consecutive behind-schedule frames that skipped arming a vsync flip --
 	// see the arming policy at the bottom of the loop.
 	uint32_t vsync_skipped = 0;
+
+#if ENABLE_LCD
+	// The boot menu's pixels are still in the framebuffer. The game only
+	// repaints its own SCALED_H rows and the header (when shown) covers the
+	// rest -- but in FULLSCREEN the 12px letterbox bands are never painted,
+	// so menu remnants would peek out above and below the game. Clear to
+	// black before the first frame, letting any in-flight menu flip finish
+	// first so the wipe can't blank rows the DMA is still streaming.
+	while (_in_flip)
+		tight_loop_contents();
+	memset(SCREEN->data, 0, SCREEN->w * SCREEN->h * sizeof(color_t));
+#endif
 
 	while (true) {
 		_lio = _io;
@@ -2089,6 +2138,24 @@ int main() {
 		}
 
 #if ENABLE_LCD
+		// FULLSCREEN has no header band to carry the WRITING TO FLASH
+		// indicator, so the LED signposts the flash-commit window instead:
+		// a ~2Hz orange blink. Runs after the battery tick above so the
+		// blink wins the LED for the frame; when the window closes the
+		// forced battery_count makes the next iteration's tick restore the
+		// normal battery gradient (or RGB hue) immediately instead of
+		// leaving the LED dark for up to 30 frames.
+		if (status_fullscreen() && saving) {
+			if ((saving_now >> 18) & 1) // ~262ms half-period
+				led(20, 8, 0);
+			else
+				led(0, 0, 0);
+			saving_led = true;
+		} else if (saving_led) {
+			saving_led = false;
+			battery_count = BATTERY_UPDATE_FRAMES;
+		}
+
 		// FPS = emulated frames completed over the last ~1s wall-clock
 		// window. The pacer below caps the loop at the GBC's authentic
 		// 59.73Hz, so "60" means full speed and anything lower is genuine
@@ -2105,7 +2172,7 @@ int main() {
 				status_dirty = true;
 			}
 		}
-		if (status_dirty) {
+		if (status_dirty && !status_fullscreen()) {
 			// The header band is rows 0..OFFSET_Y-1 -- the very rows an
 			// in-flight vsync flip streams first. Same chase as core1's;
 			// ~1x/sec and worst-case ~1ms, so off the frame budget.
