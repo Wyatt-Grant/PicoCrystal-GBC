@@ -269,113 +269,57 @@ uint16_t audio_output_get_volume() {
 	return volume_percent;
 }
 
-namespace {
-
-// One cycle of int16 sine for the chime synth (32767*sin(2*pi*i/256)),
-// read with linear interpolation -- together these keep the synth's own
-// quantization products well under the piezo's noise floor, where the old
-// uninterpolated int8 table put audible grit on every partial.
-const int16_t sine_tab[256] = {
-	     0,    804,   1608,   2410,   3212,   4011,   4808,   5602,   6393,   7179,
-	  7962,   8739,   9512,  10278,  11039,  11793,  12539,  13279,  14010,  14732,
-	 15446,  16151,  16846,  17530,  18204,  18868,  19519,  20159,  20787,  21403,
-	 22005,  22594,  23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
-	 27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,  30273,  30571,
-	 30852,  31113,  31356,  31580,  31785,  31971,  32137,  32285,  32412,  32521,
-	 32609,  32678,  32728,  32757,  32767,  32757,  32728,  32678,  32609,  32521,
-	 32412,  32285,  32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
-	 30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,  27245,  26790,
-	 26319,  25832,  25329,  24811,  24279,  23731,  23170,  22594,  22005,  21403,
-	 20787,  20159,  19519,  18868,  18204,  17530,  16846,  16151,  15446,  14732,
-	 14010,  13279,  12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
-	  6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,      0,   -804,
-	 -1608,  -2410,  -3212,  -4011,  -4808,  -5602,  -6393,  -7179,  -7962,  -8739,
-	 -9512, -10278, -11039, -11793, -12539, -13279, -14010, -14732, -15446, -16151,
-	-16846, -17530, -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
-	-23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790, -27245, -27683,
-	-28105, -28510, -28898, -29268, -29621, -29956, -30273, -30571, -30852, -31113,
-	-31356, -31580, -31785, -31971, -32137, -32285, -32412, -32521, -32609, -32678,
-	-32728, -32757, -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
-	-32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571, -30273, -29956,
-	-29621, -29268, -28898, -28510, -28105, -27683, -27245, -26790, -26319, -25832,
-	-25329, -24811, -24279, -23731, -23170, -22594, -22005, -21403, -20787, -20159,
-	-19519, -18868, -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
-	-12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,  -6393,  -5602,
-	 -4808,  -4011,  -3212,  -2410,  -1608,   -804,
-};
-
-// Interpolated table read: phase is Q16 with the top 8 bits of the whole
-// part indexing the table, the next 8 the fraction between entries.
-inline int32_t sine_q16(uint32_t phase) {
-	uint32_t idx = (phase >> 16) & 0xFF;
-	int32_t a = sine_tab[idx];
-	int32_t b = sine_tab[(idx + 1) & 0xFF];
-	return a + (((b - a) * (int32_t)((phase >> 8) & 0xFF)) >> 8);
-}
-
-} // namespace
-
-void audio_output_play_chime_blocking(const chime_partial_t *partials,
-				      uint32_t n_partials, uint32_t dur_ms) {
-	constexpr uint32_t MAX_PARTIALS = 12;
+void audio_output_play_boot_jingle() {
 	uint32_t vol = volume_percent;
-	if (vol == 0 || n_partials == 0 || n_partials > MAX_PARTIALS)
+	if (vol == 0)
 		return;
-	// A full-swing strike at unity already spans the whole duty range, so
-	// the >100% loudness-compression territory (meant for the APU's quiet
-	// mix) is clamped off rather than run through a limiter here.
+	// A full-swing square at unity is already the loudest signal the piezo
+	// can reproduce, so the >100% loudness-compression territory (meant
+	// for the APU's quiet mix) is clamped off rather than limited here.
 	if (vol > 100)
 		vol = 100;
 
 	constexpr uint32_t RATE = 32768;
 	constexpr int32_t FULL = 2032; // full DAC swing around the center duty
-	constexpr uint32_t FADE_MS = 80; // master fade to silence at the end
-	const uint32_t len = dur_ms * RATE / 1000;
-	const uint32_t fade_len = FADE_MS * RATE / 1000;
 
-	// Q16 phase accumulators and Q8 per-partial ring-out envelopes, plus
-	// each partial's onset/attack-end sample indices.
-	uint32_t phase[MAX_PARTIALS], inc[MAX_PARTIALS], env[MAX_PARTIALS];
-	uint32_t on_at[MAX_PARTIALS], full_at[MAX_PARTIALS];
-	int32_t amp_sum = 0;
-	for (uint32_t p = 0; p < n_partials; p++) {
-		phase[p] = 0;
-		inc[p] = (uint32_t)(((uint64_t)partials[p].freq_hz << 16) / RATE);
-		env[p] = (uint32_t)partials[p].amp << 8;
-		on_at[p] = partials[p].start_ms * RATE / 1000;
-		full_at[p] = on_at[p] + partials[p].attack_ms * RATE / 1000;
-		amp_sum += partials[p].amp;
-	}
-	// Worst-case mix magnitude (every partial peaking in phase), used to
-	// normalize the sum to the DAC swing -- conservative, so the mix can
-	// never wrap however the partials align.
-	const int32_t norm = amp_sum << 15;
+	// Straight from the boot ROM's register writes (see the header):
+	// NR12=$F3 steps the 4-bit envelope down every 3/64s -- exactly 1536
+	// samples at this rate -- and a full 15..0 ring-down takes ~703ms.
+	constexpr uint32_t ENV_STEP = RATE * 3 / 64;
+	// Q16 phase increments for the two notes: 131072/125 Hz ($783) and
+	// 131072/63 Hz ($7C1); inc = freq * 65536 / RATE = 2^18 / divider.
+	constexpr uint32_t NOTE1_INC = (1u << 18) / 125;
+	constexpr uint32_t NOTE2_INC = (1u << 18) / 63;
+	// The BIOS triggers note 2 two scroll-counter ticks (4 GB frames,
+	// ~67ms) after note 1, restarting the envelope at 15.
+	constexpr uint32_t NOTE2_AT = RATE * 67 / 1000;
+	constexpr uint32_t LEN = NOTE2_AT + 15 * ENV_STEP; // note 2 rings to 0
+
+	uint32_t phase = 0, inc = NOTE1_INC;
+	int32_t env = 15;
+	uint32_t env_count = 0;
 
 	uint64_t t0 = time_us_64();
-	for (uint32_t i = 0; i < len; i++) {
+	for (uint32_t i = 0; i < LEN; i++) {
 		uint64_t due = t0 + (uint64_t)i * 1000000u / RATE;
 		while (time_us_64() < due)
 			tight_loop_contents();
-		int32_t acc = 0;
-		for (uint32_t p = 0; p < n_partials; p++) {
-			if (i < on_at[p])
-				continue;
-			int32_t s = sine_q16(phase[p]) * (int32_t)(env[p] >> 8) >> 8;
-			phase[p] += inc[p];
-			if (i < full_at[p]) {
-				// Linear swell from silence over the attack.
-				s = (int32_t)((int64_t)s * (i - on_at[p]) /
-					      (full_at[p] - on_at[p]));
-			} else {
-				env[p] -= env[p] >> partials[p].decay_shift;
-			}
-			acc += s;
+		if (i == NOTE2_AT) { // retrigger: new freq, envelope back to 15
+			inc = NOTE2_INC;
+			env = 15;
+			env_count = 0;
 		}
-		int32_t s = (int32_t)((int64_t)acc * FULL * 256 / norm);
-		if (len - i < fade_len) // take the residual ring to true zero
-			s = (int32_t)((int64_t)s * (len - i) / fade_len);
-		s = s * (int32_t)vol / 100;
+		if (++env_count >= ENV_STEP) {
+			env_count = 0;
+			if (env > 0)
+				env--;
+		}
+		// 50% duty square (NR11=$80) scaled by the envelope level.
+		int32_t s = FULL * env / 15 * (int32_t)vol / 100;
+		if (!(phase & 0x8000))
+			s = -s;
 		pwm_set_gpio_level(AUDIO_PIN, (uint16_t)(PWM_WRAP / 2 + 1 + s));
+		phase += inc;
 	}
 	pwm_set_gpio_level(AUDIO_PIN, PWM_WRAP / 2);
 }

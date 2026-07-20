@@ -1977,38 +1977,20 @@ static void nostalgic_boot_splash() {
 		sleep(65);
 	}
 
-	// Colors settled -- ring the chime: the recording's low ding then its
-	// high ding, resynthesized as overlapping bell strikes from the
-	// partials measured in the source recording (frequency / relative
-	// amplitude via DFT peak pick, ~60Hz resolution) -- both dings are
-	// inharmonic struck-chime spectra, not single tones. One synthesis
-	// pass: the low strike swells in slowly and keeps ringing under the
-	// high one (onset 400ms, snappier swell), exactly like the recording;
-	// the shared ring-out doubles as the hold before the cut. Muted (or
-	// soundless build): hold the same beat silently so the splash still
-	// reads.
+	// Colors settled -- ring the chime: the boot ROM's own "ba-ding",
+	// emulated from the APU register writes in gbc_bios.bin (see
+	// audio_output_play_boot_jingle), and its ring-down doubles as the
+	// hold before the cut. Muted (or soundless build): hold the same beat
+	// silently so the splash still reads.
 #if ENABLE_SOUND
-	if (audio_output_get_volume() > 0) {
-		static const chime_partial_t boot_chime[] = {
-			// freq, amp, decay, start, attack -- low strike
-			{  220,  72, 14,   0, 250 },
-			{  466, 148, 14,   0, 250 },
-			{  700, 255, 14,   0, 250 },
-			{ 1048,  89, 13,   0, 250 },
-			{ 1318,  59, 13,   0, 250 },
-			{ 1582,  95, 13,   0, 250 },
-			// high strike, riding on the low one's ring
-			{ 2086, 250, 13, 400, 100 },
-			{ 4174, 255, 12, 400, 100 },
-			{ 6814,  36, 11, 400, 100 }, // sparkle, kept gentle
-		};
-		audio_output_play_chime_blocking(boot_chime, 9, 1200);
-	} else {
-		sleep(1200);
-	}
+	if (audio_output_get_volume() > 0)
+		audio_output_play_boot_jingle();
+	else
+		sleep(800);
 #else
-	sleep(1200);
+	sleep(800);
 #endif
+	sleep(150); // beat of silence before the cut, like the original
 
 	// Cut to black before emulation, same push-and-wait as the power-on
 	// GRAM clear, so the game's first frame doesn't tear out of the splash.
