@@ -64,6 +64,37 @@ void audio_output_set_frame_period(uint32_t frame_us);
 void audio_output_set_volume(uint16_t percent);
 uint16_t audio_output_get_volume();
 
+// One sine component of the synthesized boot chime (see below): frequency,
+// relative amplitude 0-255, when it starts sounding and how fast it swells
+// in, and its ring-out rate -- the partial loses amp >> decay_shift per
+// sample once its attack ends (an exponential decay with a time constant of
+// 2^decay_shift samples at 32768Hz -- 13 is ~250ms, 14 ~500ms). Per-partial
+// onsets let two overlapping bell strikes render as one seamless pass (the
+// first strike keeps ringing under the second, like the recording), and
+// per-partial decay reproduces how struck chimes shed their high partials
+// faster than the fundamental.
+struct chime_partial_t {
+	uint16_t freq_hz;
+	uint8_t amp;
+	uint8_t decay_shift;
+	uint16_t start_ms;
+	uint16_t attack_ms;
+};
+
+// Synthesizes the whole chime -- a sum of delayed, swelling, decaying sine
+// partials -- in one pass, streamed straight through the PWM DAC,
+// busy-waiting on core0 until it finishes. A ~80ms master fade at the end
+// takes whatever is still ringing cleanly to silence (no cut-off click).
+// Only valid between audio_output_init() (the carrier must be configured)
+// and audio_output_core1_init() (afterwards the DMA engine owns the CC
+// register). Software-paced: at boot nothing else runs, so a time_us_64()
+// spin per sample is jitter-free enough. Applies the master volume
+// (unity-clamped -- the 0-800 loudness-compression range only makes sense
+// against the APU's deliberately quiet mix, not a full-scale tone) and
+// recenters the output to silence when done. No-op at volume 0.
+void audio_output_play_chime_blocking(const chime_partial_t *partials,
+				      uint32_t n_partials, uint32_t dur_ms);
+
 // Forces the PWM output to its centered (silent) level. Intended for
 // skipping synthesis entirely while volume is 0 (real per-sample PSG
 // synthesis, not free) without leaving the speaker stuck at whatever

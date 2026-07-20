@@ -120,6 +120,8 @@ struct device_settings_t {
 			      // per-game id, not the catalog index, which
 			      // reshuffles when the ROM list is regenerated.
 			      // 0xFF = no game booted yet (main.cpp g_last_slot)
+	uint8_t nostalgic_boot; // 0/1: Game Boy-style boot splash + chime when a
+			      // game launches (main.cpp g_nostalgic_boot)
 };
 // Growing this struct invalidates the previously stored record (the CRC is
 // computed over the whole payload), so settings reset to defaults once on
