@@ -372,17 +372,25 @@ static uint8_t g_last_slot = 0xFF;
 // DAC) rings out before emulation starts. See nostalgic_boot_splash().
 static bool g_nostalgic_boot = true;
 
+// Shared LED brightness cap: ~20% at full backlight, scaled down with the
+// screen brightness setting so a dimmed screen gets a matching dim LED.
+// Used by every LED indicator (battery, RGB theme, flash-write blink).
+static inline int led_brightness() {
+	return 20 * g_brightness / 100;
+}
+
 // The LED reports battery charge: a green->red gradient (green ~= full,
-// red ~= nearly empty) at ~20% brightness so it glows rather than glares.
-// The usable ~5..100 span maps to the gradient, blended through yellow.
-// Shared by the in-game run loop and the menus (boot ROM picker, settings).
+// red ~= nearly empty) at the shared led_brightness() cap so it glows
+// rather than glares. The usable ~5..100 span maps to the gradient, blended
+// through yellow. Shared by the in-game run loop and the menus (boot ROM
+// picker, settings).
 static void led_show_battery(int level) {
 	if (level < 5)   level = 5;
 	if (level > 100) level = 100;
-	constexpr int BRIGHTNESS = 20;      // ~20% max brightness
-	int fill = (level - 5) * 100 / 95;  // 0 (empty) .. 100 (full)
-	led((100 - fill) * BRIGHTNESS / 100, // red rises as it drains
-	    fill * BRIGHTNESS / 100,         // green rises as it fills
+	const int brightness = led_brightness();
+	int fill = (level - 5) * 100 / 95;   // 0 (empty) .. 100 (full)
+	led((100 - fill) * brightness / 100, // red rises as it drains
+	    fill * brightness / 100,         // green rises as it fills
 	    0);
 }
 
@@ -986,10 +994,10 @@ static void update_rgb_theme() {
 // the RGB pseudo-theme on screen. Same brightness cap as led_show_battery()
 // so it glows rather than glares.
 static void led_show_rgb() {
-	constexpr int BRIGHTNESS = 20;
-	led((uint8_t)((UI_ACCENT & 0xF) * BRIGHTNESS / 15),
-	    (uint8_t)(((UI_ACCENT >> 12) & 0xF) * BRIGHTNESS / 15),
-	    (uint8_t)(((UI_ACCENT >> 8) & 0xF) * BRIGHTNESS / 15));
+	const int brightness = led_brightness();
+	led((uint8_t)((UI_ACCENT & 0xF) * brightness / 15),
+	    (uint8_t)(((UI_ACCENT >> 12) & 0xF) * brightness / 15),
+	    (uint8_t)(((UI_ACCENT >> 8) & 0xF) * brightness / 15));
 }
 
 // Neutral background/text ramp, swapped as a set by apply_mode() (see below).
@@ -1134,19 +1142,9 @@ static void draw_header_band(const char *title, uint32_t batt, color_t rule,
 // skips the label/number), the battery percentage, both, or neither -- the
 // icon itself always shows. In FULLSCREEN mode the run loop never calls this
 // (there is no header band); the guard below is just belt-and-braces.
-static void draw_status_bar(uint32_t fps, uint32_t batt, bool saving) {
+static void draw_status_bar(uint32_t fps, uint32_t batt) {
 	if (status_fullscreen())
 		return;
-	// An in-flight autosave commit replaces the FPS readout with a WRITING
-	// TO FLASH indicator -- shown even with the FPS toggle off, so a
-	// power-off during the flash write window is always signposted. Normal
-	// 8px advance, not the header's letterspaced 12px: at 16 glyphs the
-	// letterspaced version would run into the battery block.
-	if (saving) {
-		draw_header_band("", batt, STATUS_RULE, status_show_pct(), 1);
-		status_text(UI_MARGIN, HDR_TOP, "WRITING TO FLASH", UI_ACCENT);
-		return;
-	}
 	draw_header_band(status_show_fps() ? "FPS" : "", batt, STATUS_RULE,
 			 status_show_pct(), 1);
 	if (status_show_fps()) {
@@ -1923,15 +1921,16 @@ static void nostalgic_boot_splash() {
 	const bool dark = g_dark_mode != 0;
 	const color_t bg = dark ? status_rgb(0, 0, 0) : status_rgb(15, 15, 15);
 	const color_t ink = dark ? status_rgb(15, 15, 15) : status_rgb(1, 1, 1);
-	// The settled letter colors, one per layer: blue "Pic", green "oC",
-	// magenta "ry", red "sta", yellow "l". All bright enough to read on
-	// either field.
+	// The settled letter colors, one per layer: cyan "Pic", mint "oC",
+	// purple "ry", pink "sta", pale-yellow "l" -- the vaporwave palette
+	// (#01cdfe #05ffa1 #b967ff #ff71ce #fffb96), quantized to 4-bit
+	// channels. All bright enough to read on either field.
 	const color_t layer_colors[BOOT_LOGO_LAYERS] = {
-		status_rgb(1, 1, 15),  // blue
-		status_rgb(0, 12, 2),  // green
-		status_rgb(15, 3, 15), // magenta
-		status_rgb(15, 1, 1),  // red
-		status_rgb(15, 13, 0), // yellow
+		status_rgb(0, 12, 15), // cyan   #01cdfe
+		status_rgb(0, 15, 9),  // mint   #05ffa1
+		status_rgb(11, 6, 15), // purple #b967ff
+		status_rgb(15, 7, 12), // pink   #ff71ce
+		status_rgb(15, 15, 9), // yellow #fffb96
 	};
 	constexpr int32_t SCALE = 2;
 	constexpr int32_t logo_x = (240 - BOOT_LOGO_W * SCALE) / 2;
@@ -2237,9 +2236,9 @@ int main() {
 	// the first battery poll (immediate, see battery_count above) paint the
 	// bar on the first frame instead of leaving it blank for a second.
 	uint32_t fps_shown = 0;
-	bool saving_shown = false;       // WRITING TO FLASH indicator painted
-	uint64_t saving_hold_until = 0;  // keeps it up past a fast commit
-	bool saving_led = false;         // FULLSCREEN save blink owns the LED
+	bool saving_shown = false;       // commit window seen last frame (edge)
+	uint64_t saving_hold_until = 0;  // keeps the blink up past a fast commit
+	bool saving_led = false;         // save blink owns the LED
 	int32_t batt_shown = -1;
 	uint64_t batt_hold_until = 0; // displayed level pinned until this time
 	uint32_t fps_frames = 0;
@@ -2345,19 +2344,15 @@ int main() {
 		save_storage_poll(cart_ram, sizeof(cart_ram));
 
 #if ENABLE_LCD
-		// Repaint the header when the autosave commit window opens or
-		// closes -- draw_status_bar() swaps the FPS readout for WRITING TO
-		// FLASH. The commit programs ~1s of 512B chunks; hold the indicator
-		// so it stays on screen a beat past the write and is easy to notice.
+		// Track the autosave commit window for the LED blink below. The
+		// commit programs ~1s of 512B chunks; hold the window open a beat
+		// past the write so the blink is easy to notice.
 		constexpr uint64_t SAVING_HOLD_US = 2000000;
 		uint64_t saving_now = time_us_64();
 		if (save_storage_saving() && !saving_shown)
 			saving_hold_until = saving_now + SAVING_HOLD_US;
 		bool saving = save_storage_saving() || saving_now < saving_hold_until;
-		if (saving != saving_shown) {
-			saving_shown = saving;
-			status_dirty = true;
-		}
+		saving_shown = saving;
 #endif
 
 		if (++battery_count >= BATTERY_UPDATE_FRAMES) {
@@ -2390,18 +2385,19 @@ int main() {
 		}
 
 #if ENABLE_LCD
-		// FULLSCREEN has no header band to carry the WRITING TO FLASH
-		// indicator, so the LED signposts the flash-commit window instead:
-		// a ~2Hz orange blink. Runs after the battery tick above so the
-		// blink wins the LED for the frame; when the window closes the
-		// forced battery_count makes the next iteration's tick restore the
-		// normal battery gradient (or RGB hue) immediately instead of
+		// The LED signposts the flash-commit window: a fast cyan/magenta
+		// blink, in every screen mode -- so a power-off during the write
+		// window is always signposted. Runs after the battery tick above
+		// so the blink wins the LED for the frame; when the window closes
+		// the forced battery_count makes the next iteration's tick restore
+		// the normal battery gradient (or RGB hue) immediately instead of
 		// leaving the LED dark for up to 30 frames.
-		if (status_fullscreen() && saving) {
-			if ((saving_now >> 18) & 1) // ~262ms half-period
-				led(0, 4, 20);
+		if (saving) {
+			const int b = led_brightness();
+			if ((saving_now >> 17) & 1) // ~131ms half-period, ~3.8Hz
+				led(0, b, b);  // cyan
 			else
-				led(0, 0, 0);
+				led(b, 0, b);  // magenta
 			saving_led = true;
 		} else if (saving_led) {
 			saving_led = false;
@@ -2434,8 +2430,7 @@ int main() {
 				while (_in_flip && dma_hw->ch[dma_channel].read_addr < hdr_end)
 					tight_loop_contents();
 			}
-			draw_status_bar(fps_shown, batt_shown < 0 ? 0 : (uint32_t)batt_shown,
-					saving_shown);
+			draw_status_bar(fps_shown, batt_shown < 0 ? 0 : (uint32_t)batt_shown);
 		}
 
 		// Let core1 finish this frame's queued scanlines before flipping,

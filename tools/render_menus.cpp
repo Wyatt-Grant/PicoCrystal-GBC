@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
 	write_ppm(path);
 
 	memset(_fb, 0, sizeof _fb);
-	draw_status_bar(60, 82, false);
+	draw_status_bar(60, 82);
 	snprintf(path, sizeof path, "%s/statusbar.ppm", dir);
 	write_ppm(path);
 
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
 	// boot, settings), FPS readout and icon stay.
 	g_status_bar = STATUS_FPS;
 	memset(_fb, 0, sizeof _fb);
-	draw_status_bar(60, 82, false);
+	draw_status_bar(60, 82);
 	snprintf(path, sizeof path, "%s/statusbar_nopct.ppm", dir);
 	write_ppm(path);
 
@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
 	// ICON mode: header carries only the battery icon.
 	g_status_bar = STATUS_ICON;
 	memset(_fb, 0, sizeof _fb);
-	draw_status_bar(60, 82, false);
+	draw_status_bar(60, 82);
 	snprintf(path, sizeof path, "%s/statusbar_icon.ppm", dir);
 	write_ppm(path);
 
