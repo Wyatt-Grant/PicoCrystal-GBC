@@ -2230,15 +2230,17 @@ int main() {
 	constexpr int BATTERY_UPDATE_FRAMES = 30;
 	int battery_count = BATTERY_UPDATE_FRAMES;
 
+	// Flash-commit LED blink state (see the blink block in the loop).
+	bool saving_shown = false;       // commit window seen last frame (edge)
+	uint64_t saving_hold_until = 0;  // keeps the blink up past a fast commit
+	bool saving_led = false;         // save blink owns the LED
+
 #if ENABLE_LCD
 	// Status bar state: the values currently painted in the top letterbox,
 	// plus a ~1s wall-clock window for the FPS count. batt_shown = -1 makes
 	// the first battery poll (immediate, see battery_count above) paint the
 	// bar on the first frame instead of leaving it blank for a second.
 	uint32_t fps_shown = 0;
-	bool saving_shown = false;       // commit window seen last frame (edge)
-	uint64_t saving_hold_until = 0;  // keeps the blink up past a fast commit
-	bool saving_led = false;         // save blink owns the LED
 	int32_t batt_shown = -1;
 	uint64_t batt_hold_until = 0; // displayed level pinned until this time
 	uint32_t fps_frames = 0;
@@ -2343,7 +2345,6 @@ int main() {
 
 		save_storage_poll(cart_ram, sizeof(cart_ram));
 
-#if ENABLE_LCD
 		// Track the autosave commit window for the LED blink below. The
 		// commit programs ~1s of 512B chunks; hold the window open a beat
 		// past the write so the blink is easy to notice.
@@ -2353,7 +2354,6 @@ int main() {
 			saving_hold_until = saving_now + SAVING_HOLD_US;
 		bool saving = save_storage_saving() || saving_now < saving_hold_until;
 		saving_shown = saving;
-#endif
 
 		if (++battery_count >= BATTERY_UPDATE_FRAMES) {
 			battery_count = 0;
@@ -2376,26 +2376,27 @@ int main() {
 				// The battery icon's fill is fixed (not accent-tied), and
 				// nothing else in the in-game header reads UI_ACCENT, so
 				// the new hue needs no forced repaint here -- only the LED
-				// changes on this tick.
+				// changes on this tick. While the save blink owns the LED,
+				// skip the write so no battery/theme color sneaks into the
+				// blue/magenta blink.
 				update_rgb_theme();
-				led_show_rgb();
-			} else {
+				if (!saving)
+					led_show_rgb();
+			} else if (!saving) {
 				led_show_battery(level);
 			}
 		}
 
-#if ENABLE_LCD
-		// The LED signposts the flash-commit window: a fast cyan/magenta
+		// The LED signposts the flash-commit window: a fast blue/magenta
 		// blink, in every screen mode -- so a power-off during the write
-		// window is always signposted. Runs after the battery tick above
-		// so the blink wins the LED for the frame; when the window closes
-		// the forced battery_count makes the next iteration's tick restore
-		// the normal battery gradient (or RGB hue) immediately instead of
-		// leaving the LED dark for up to 30 frames.
+		// window is always signposted. When the window closes the forced
+		// battery_count makes the next iteration's tick restore the normal
+		// battery gradient (or RGB hue) immediately instead of leaving the
+		// LED dark for up to 30 frames.
 		if (saving) {
 			const int b = led_brightness();
 			if ((saving_now >> 17) & 1) // ~131ms half-period, ~3.8Hz
-				led(0, b, b);  // cyan
+				led(0, 0, b);  // blue
 			else
 				led(b, 0, b);  // magenta
 			saving_led = true;
@@ -2404,6 +2405,7 @@ int main() {
 			battery_count = BATTERY_UPDATE_FRAMES;
 		}
 
+#if ENABLE_LCD
 		// FPS = emulated frames completed over the last ~1s wall-clock
 		// window. The pacer below caps the loop at the GBC's authentic
 		// 59.73Hz, so "60" means full speed and anything lower is genuine
