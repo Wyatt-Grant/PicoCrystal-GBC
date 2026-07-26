@@ -690,6 +690,10 @@ static const uint8_t _font3x5[][5] = {
 	{0b001, 0b010, 0b100, 0b010, 0b001}, // <  (39) -- settings "adjust" hint
 	{0b000, 0b010, 0b000, 0b010, 0b000}, // :  (40) -- clock separator
 	{0b000, 0b000, 0b000, 0b000, 0b010}, // .  (41) -- long-title ellipsis
+	// Up/down triangles for the clock editor's "adjust" hint, mirrored about
+	// the same two rows so the pair reads as one "^v" unit.
+	{0b000, 0b000, 0b010, 0b111, 0b000}, // ^  (42)
+	{0b000, 0b000, 0b111, 0b010, 0b000}, // v  (43)
 };
 
 static int32_t status_glyph(char c) {
@@ -727,6 +731,8 @@ static int32_t status_glyph(char c) {
 		case '<': return 39;
 		case ':': return 40;
 		case '.': return 41;
+		case '^': return 42;
+		case 'v': return 43;
 	}
 	return -1; // anything else (space) just advances
 }
@@ -1537,12 +1543,140 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 			   : "< > ADJUST   B BACK"));
 }
 
-// The clock editor: DOW : HH : MM as a big segmented display with a small
-// caption over each group and the clock icon in the left margin beside the
-// digits; the selected group (the one < > adjusts) goes accent green. No
-// label row -- the captions + icon carry the meaning. Its own screen since
-// the settings list outgrew hosting it inline; UP/DOWN pick the group here,
-// matching the settings list rather than the usual clock-setting transpose.
+// Solid triangle, apex up or down, `size` rows tall (2*size-1 px wide at the
+// base): the boot menu's scroll indicator at the default size, the clock
+// editor's up/down adjust markers a notch bigger.
+static void draw_scroll_arrow(int32_t x, int32_t y, bool down, color_t c,
+			       int32_t size = 3) {
+	for (int32_t k = 0; k < size; k++)
+		fill_rect(x - k, down ? y - k : y + k, 1 + 2 * k, 1, c);
+}
+
+// ---- Analog dial (clock editor) -------------------------------------------
+// sin(k * 6 degrees) * 256 for the 60 minute positions around a clock face.
+// Everything on the dial -- ticks, both hands -- lands on one of those 60
+// angles, so the whole thing is integer math: no <cmath> in a per-frame path
+// on an FPU-less part, and no trig stub needed in tools/render_menus.cpp.
+// Cosine is the same table a quarter turn along: cos(k) == SIN60[(k + 15) % 60].
+static const int16_t SIN60[60] = {
+	   0,   27,   53,   79,  104,  128,  150,  171,  190,  207,
+	 222,  234,  243,  250,  255,  256,  255,  250,  243,  234,
+	 222,  207,  190,  171,  150,  128,  104,   79,   53,   27,
+	   0,  -27,  -53,  -79, -104, -128, -150, -171, -190, -207,
+	-222, -234, -243, -250, -255, -256, -255, -250, -243, -234,
+	-222, -207, -190, -171, -150, -128, -104,  -79,  -53,  -27,
+};
+
+// Point at dial angle `k` (0 = 12 o'clock, increasing clockwise), `r` from the
+// centre. Screen y grows downward, hence the negated cosine.
+static inline int32_t dial_x(int32_t cx, int32_t r, int32_t k) {
+	return cx + r * SIN60[k % 60] / 256;
+}
+static inline int32_t dial_y(int32_t cy, int32_t r, int32_t k) {
+	return cy - r * SIN60[(k + 15) % 60] / 256;
+}
+
+// Filled disc (r_in = 0) or annulus: every pixel whose squared distance from
+// the centre falls in [r_in^2, r_out^2]. A per-pixel distance test over the
+// bounding box -- ~13k iterations at the dial's radius, nothing next to the
+// menu loop's 16ms frame, and it keeps the shape obviously correct.
+static void fill_ring(int32_t cx, int32_t cy, int32_t r_out, int32_t r_in,
+		       color_t c) {
+	const int32_t o2 = r_out * r_out, i2 = r_in * r_in;
+	for (int32_t dy = -r_out; dy <= r_out; dy++) {
+		color_t *row = SCREEN->p(cx, cy + dy);
+		for (int32_t dx = -r_out; dx <= r_out; dx++) {
+			int32_t d2 = dx * dx + dy * dy;
+			if (d2 <= o2 && d2 >= i2)
+				row[dx] = c;
+		}
+	}
+}
+
+// Bresenham, 1px wide. Only ever called with both endpoints inside the dial,
+// so like fill_rect it doesn't clip.
+static void draw_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, color_t c) {
+	int32_t dx = x1 - x0, dy = y1 - y0;
+	int32_t sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+	dx = dx < 0 ? -dx : dx;
+	dy = dy < 0 ? -dy : dy;
+	int32_t err = dx - dy;
+	while (true) {
+		*SCREEN->p(x0, y0) = c;
+		if (x0 == x1 && y0 == y1)
+			return;
+		int32_t e2 = 2 * err;
+		if (e2 > -dy) { err -= dy; x0 += sx; }
+		if (e2 <  dx) { err += dx; y0 += sy; }
+	}
+}
+
+// A clock hand: `thick` parallel lines from the centre out to dial angle `k`.
+// The copies are offset along the shallower axis (vertically for a mostly
+// horizontal hand, horizontally otherwise), which is close enough to
+// perpendicular at these lengths to keep the hand an even width all the way
+// round, and centred so the hand grows about its own axis rather than
+// drifting off the pivot.
+static void draw_hand(int32_t cx, int32_t cy, int32_t k, int32_t len,
+		       int32_t thick, color_t c) {
+	int32_t x1 = dial_x(cx, len, k), y1 = dial_y(cy, len, k);
+	bool wide = (x1 - cx) * (x1 - cx) >= (y1 - cy) * (y1 - cy);
+	for (int32_t i = 0; i < thick; i++) {
+		int32_t o = i - thick / 2;
+		int32_t ox = wide ? 0 : o, oy = wide ? o : 0;
+		draw_line(cx + ox, cy + oy, x1 + ox, y1 + oy, c);
+	}
+}
+
+// The analog face at the top of the clock editor: a dial plate with hour ticks
+// (the quarters longer and brighter), an AM/PM marker and the weekday in
+// little windows above and below the pivot, and the hour/minute hands. The
+// group currently being edited lights up here too -- adjusting HR swings an
+// accent-colored hour hand, MIN the minute hand, DAY the weekday window -- so
+// the dial doubles as the selection indicator rather than just decoration.
+static void draw_clock_face(int32_t cx, int32_t cy, int32_t r, uint32_t field) {
+	fill_ring(cx, cy, r - 3, 0, UI_HEADER);  // plate
+	fill_ring(cx, cy, r, r - 2, STATUS_DIM); // bezel
+
+	for (int32_t h = 0; h < 12; h++) {
+		bool quarter = (h % 3) == 0;
+		int32_t k = h * 5;
+		int32_t outer = r - 6, inner = outer - (quarter ? 7 : 3);
+		draw_hand(dial_x(cx, inner, k), dial_y(cy, inner, k), k,
+			  outer - inner, quarter ? 2 : 1,
+			  quarter ? STATUS_GREY : STATUS_DIM);
+	}
+
+	// AM/PM above the pivot, weekday below -- the two things the digits'
+	// 24-hour "14" and "TUE" say, restated where a watch face would put them.
+	status_text(cx - text_w(2) / 2, cy - 27, g_rtc_hour < 12 ? "AM" : "PM",
+		    STATUS_DIM);
+	status_text(cx - text_w(3) / 2, cy + 17, RTC_DOW_NAMES[g_rtc_dow],
+		    field == CLK_ROW_DOW ? UI_ACCENT : STATUS_GREY);
+
+	// Hands last, over the windows. The hour hand carries the minutes as a
+	// fifth of an hour, so it sits between the ticks instead of snapping.
+	draw_hand(cx, cy, (g_rtc_hour % 12) * 5 + g_rtc_min / 12, r - 26, 3,
+		  field == CLK_ROW_HOUR ? UI_ACCENT : UI_BRIGHT);
+	draw_hand(cx, cy, g_rtc_min, r - 12, 2,
+		  field == CLK_ROW_MIN ? UI_ACCENT : UI_BRIGHT);
+	fill_ring(cx, cy, 3, 0, UI_ACCENT); // pivot cap
+	fill_ring(cx, cy, 1, 0, UI_HEADER);
+}
+
+// Selected-group highlight behind the big digits -- the settings list's
+// two-rect pill shape (draw_row_highlight), sized to a group instead of a row.
+static void draw_group_pill(int32_t x, int32_t y, int32_t w, int32_t h) {
+	fill_rect(x + 1, y, w - 2, h, UI_ROW_SEL);
+	fill_rect(x, y + 1, w, h - 2, UI_ROW_SEL);
+}
+
+// The clock editor: an analog face over DOW : HH : MM as a big segmented
+// display, a small caption above each group and up/down arrows flanking the
+// selected one. < > walk the groups, UP/DOWN adjust the selected value -- the
+// arrows are drawn where the D-pad presses them, and the dial's matching hand
+// (or its weekday window) goes accent as it moves. Its own screen since the
+// settings list outgrew hosting it inline.
 static void draw_clock_menu(uint32_t field, uint32_t batt) {
 	draw_menu_frame("CLOCK", batt);
 
@@ -1554,44 +1688,47 @@ static void draw_clock_menu(uint32_t field, uint32_t batt) {
 		const char *text; // pre-rendered group text (weekday name / digits)
 		const char *label;
 		int32_t label_len;
+		int32_t glyphs;
 		uint32_t field;
 	} grp[3] = {
-		{ RTC_DOW_NAMES[g_rtc_dow], "DAY", 3, CLK_ROW_DOW  },
-		{ buf,                      "HR",  2, CLK_ROW_HOUR },
-		{ buf + 4,                  "MIN", 3, CLK_ROW_MIN  },
+		{ RTC_DOW_NAMES[g_rtc_dow], "DAY", 3, 3, CLK_ROW_DOW  },
+		{ buf,                      "HR",  2, 2, CLK_ROW_HOUR },
+		{ buf + 4,                  "MIN", 3, 2, CLK_ROW_MIN  },
 	};
 
-	// Vertically centered in the card -- the header rule (OFFSET_Y - 1) to
-	// draw_menu_hints()'s fixed y=226, so center y=125. The caption + 20px
-	// digits stack is 34px tall, putting the captions at y=108 and the
-	// digits at 122..142.
-	int32_t gy = OFFSET_Y + 84; // group captions
-	int32_t dy = gy + 14;       // big glyphs
-	// Icon vertically centered on the 20px-tall digits ((20 - 14px icon)/2).
-	draw_icon(UI_MARGIN, dy + 3, ICON_CLOCK, UI_ACCENT);
+	// Face on top, readout under it. The stack below the dial is fixed:
+	// captions at 146, up arrows at 162, the 20px digits at 175 (their pill
+	// 171..199), down arrows ending at 207 -- clear of draw_menu_hints()'s
+	// fixed y=226. That leaves the card's top 120px for the dial, which
+	// centres at y=84 with r=52 and still clears the header rule at
+	// OFFSET_Y - 1 by 8px.
+	constexpr int32_t gy = 146;      // group captions
+	constexpr int32_t dy = 175;      // big glyphs
+	constexpr int32_t ARROW_UP = 162, ARROW_DN = 207;
+	draw_clock_face(SCREEN->w / 2, 84, 52, field);
+
 	int32_t x = (SCREEN->w - text_w(9, CLK_SCALE, CLK_ADV)) / 2;
 	for (int32_t i = 0; i < 3; i++) {
 		bool is_sel = (grp[i].field == field);
-		int32_t glyphs = i == 0 ? 3 : 2;
-		int32_t gw = text_w(glyphs, CLK_SCALE, CLK_ADV);
+		int32_t gw = text_w(grp[i].glyphs, CLK_SCALE, CLK_ADV);
+		if (is_sel) {
+			draw_group_pill(x - 6, dy - 5, gw + 12, 30);
+			int32_t ax = x + gw / 2;
+			draw_scroll_arrow(ax, ARROW_UP, false, UI_ACCENT, 4);
+			draw_scroll_arrow(ax, ARROW_DN, true, UI_ACCENT, 4);
+		}
 		menu_text(x + (gw - text_w(grp[i].label_len)) / 2, gy, grp[i].label,
 			  is_sel ? UI_ACCENT : STATUS_DIM, 2, STATUS_GLYPH_ADV);
 		menu_text(x, dy, grp[i].text, is_sel ? UI_ACCENT : UI_BRIGHT,
 			  CLK_SCALE, CLK_ADV);
-		x += glyphs * CLK_ADV;
+		x += grp[i].glyphs * CLK_ADV;
 		if (i < 2) {
 			menu_text(x, dy, ":", STATUS_DIM, CLK_SCALE, CLK_ADV);
 			x += CLK_ADV;
 		}
 	}
 
-	draw_menu_hints("< > ADJUST   B BACK");
-}
-
-// Small solid triangle, apex up or down -- the boot menu's scroll indicator.
-static void draw_scroll_arrow(int32_t x, int32_t y, bool down, color_t c) {
-	for (int32_t k = 0; k < 3; k++)
-		fill_rect(x - k, down ? y - k : y + k, 1 + 2 * k, 1, c);
+	draw_menu_hints("^v ADJUST  <> FIELD  B BACK");
 }
 
 // Boot ROM-select body: catalog rows (icon, name) plus the trailing
@@ -1733,7 +1870,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	}
 }
 
-// The clock editor's < >, split out of settings_step because the fields live
+// The clock editor's UP/DOWN, split out of settings_step because the fields live
 // on their own screen. Marks both dirty flags: g_settings_edited persists the
 // staged clock with the rest of the settings, g_rtc_edited additionally forces
 // the autosave that keeps an in-game edit from losing to the older RTC record
@@ -1800,21 +1937,25 @@ static void menu_drain_buttons() {
 		 button(picosystem::X) || button(picosystem::Y));
 }
 
-// < > with hold-to-repeat (initial delay, then fast) so the wider ranges
-// (MIN 0..59, HR 0..23) aren't dozens of individual taps. Returns the
-// direction to step this frame, or 0.
-static int32_t menu_adjust_dir(uint64_t &next_repeat) {
+// An opposed button pair with hold-to-repeat (initial delay, then fast) so the
+// wider ranges (MIN 0..59, HR 0..23) aren't dozens of individual taps. Returns
+// the direction to step this frame, or 0.
+static int32_t menu_repeat_dir(uint32_t neg, uint32_t pos, uint64_t &next_repeat) {
 	uint64_t now = time_us_64();
-	if (pressed(picosystem::LEFT) || pressed(picosystem::RIGHT)) {
+	if (pressed(pos) || pressed(neg)) {
 		next_repeat = now + 350000;
-		return pressed(picosystem::RIGHT) ? +1 : -1;
+		return pressed(pos) ? +1 : -1;
 	}
-	if ((button(picosystem::LEFT) || button(picosystem::RIGHT)) &&
-	    now >= next_repeat) {
+	if ((button(pos) || button(neg)) && now >= next_repeat) {
 		next_repeat = now + 60000;
-		return button(picosystem::RIGHT) ? +1 : -1;
+		return button(pos) ? +1 : -1;
 	}
 	return 0;
+}
+
+// The settings list's < > adjust.
+static int32_t menu_adjust_dir(uint64_t &next_repeat) {
+	return menu_repeat_dir(picosystem::LEFT, picosystem::RIGHT, next_repeat);
 }
 
 // The clock editor, opened with A from the settings list's CLOCK row. Edits
@@ -1836,12 +1977,17 @@ static void clock_menu(bool in_game) {
 		if (pressed(picosystem::B) ||
 		    (button(picosystem::X) && button(picosystem::Y)))
 			break;
-		if (pressed(picosystem::UP))
+		// < > walk the fields (they read left-to-right on screen),
+		// UP/DOWN spin the selected value -- the transpose of the
+		// settings list, but the one that matches a row of adjustable
+		// segments.
+		if (pressed(picosystem::LEFT))
 			field = (field + CLK_ROW_COUNT - 1) % CLK_ROW_COUNT;
-		if (pressed(picosystem::DOWN))
+		if (pressed(picosystem::RIGHT))
 			field = (field + 1) % CLK_ROW_COUNT;
 
-		int32_t dir = menu_adjust_dir(next_repeat);
+		int32_t dir = menu_repeat_dir(picosystem::DOWN, picosystem::UP,
+					      next_repeat);
 		if (dir)
 			clock_step(field, dir, in_game);
 

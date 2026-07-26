@@ -248,7 +248,9 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/settings_clock.ppm", dir);
 	write_ppm(path);
 
-	draw_clock_menu(CLK_ROW_HOUR, 82);
+	// The editor with DAY selected -- the group the dial answers with its
+	// weekday window rather than a hand.
+	draw_clock_menu(CLK_ROW_DOW, 82);
 	snprintf(path, sizeof path, "%s/clock_menu.ppm", dir);
 	write_ppm(path);
 
@@ -339,6 +341,11 @@ int main(int argc, char **argv) {
 	write_ppm(path);
 	draw_settings_menu(SET_ROW_BRIGHT, 82);
 	snprintf(path, sizeof path, "%s/settings_light_mint.ppm", dir);
+	write_ppm(path);
+	// The dial's plate/bezel/hands all come out of the neutral ramp, so the
+	// clock editor gets a light-mode shot of its own.
+	draw_clock_menu(CLK_ROW_MIN, 82);
+	snprintf(path, sizeof path, "%s/clock_light.ppm", dir);
 	write_ppm(path);
 	apply_mode(1); // DARK
 

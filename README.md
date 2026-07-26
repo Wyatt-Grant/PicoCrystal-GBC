@@ -95,8 +95,9 @@ the chosen accent, so any theme works either way:
   <img src="screenshots/settings-light.png"  alt="Settings, light mode"     width="24%">
 </p>
 
-The MBC3 real-time clock has its own segmented display at the bottom of the
-settings screen, and the STATUS BAR setting can drop the header entirely for a
+The MBC3 real-time clock gets its own screen off the settings list: an analog
+face over a segmented DAY/HR/MIN readout, `<` `>` to pick a field and up/down
+to spin it. The STATUS BAR setting can drop the header entirely for a
 letterboxed fullscreen canvas:
 
 <p align="center">
