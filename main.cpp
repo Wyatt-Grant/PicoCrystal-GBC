@@ -1339,10 +1339,18 @@ enum settings_row_t : uint32_t {
 	SET_ROW_NOSTALGIC,
 	SET_ROW_THEME,
 	SET_ROW_MODE, // APPEARANCE: dark/light
-	SET_ROW_DOW, // the clock rows render as the big segmented clock below
-	SET_ROW_HOUR,
-	SET_ROW_MIN,
+	SET_ROW_CLOCK, // A opens the segmented editor (draw_clock_menu)
 	SET_ROW_COUNT,
+};
+
+// Fields of the clock editor -- its own screen (clock_menu), reached with A
+// from SET_ROW_CLOCK. Separate from settings_row_t because the two screens
+// have separate selections; the shared row metrics below don't apply here.
+enum clock_field_t : uint32_t {
+	CLK_ROW_DOW,
+	CLK_ROW_HOUR,
+	CLK_ROW_MIN,
+	CLK_ROW_COUNT,
 };
 
 static const char *const RTC_DOW_NAMES[7] = {
@@ -1353,16 +1361,15 @@ static const char *const RTC_DOW_NAMES[7] = {
 constexpr int32_t CLK_SCALE = 4;
 constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 
-// Every setting row is a single text line now -- BRIGHT/VOLUME carry a compact
+// Every setting row is a single text line -- BRIGHT/VOLUME carry a compact
 // inline meter bar on the same line rather than a full-width bar underneath --
-// so all rows share one height. Uniform 16px keeps the RTC clock section below
-// clear of draw_menu_hints()'s fixed y=226 (with rows through APPEARANCE the
-// clock anchors at y=178 and the digits end at ~y=212). Was 18px until the
-// SAVE INTERVAL row was added: nine rows at 16px land the clock exactly where
-// eight at 18px did. The 10px glyphs leave a 6px gap, and the selection pill
-// (20px tall, drawn from y-4) fills its slot without touching the neighbouring
-// row's text.
-constexpr int32_t ROW_H = 16;
+// so all rows share one height. Back to 18px now that the big segmented clock
+// moved to its own screen (draw_clock_menu) and CLOCK is one ordinary row:
+// ten rows at 18px put the last one at y=196, its glyphs ending at y=208 and
+// its selection pill at y=212, still clear of draw_menu_hints()'s fixed y=226.
+// The 10px glyphs leave an 8px gap, and the pill (20px tall, drawn from y-4)
+// fills its slot without touching the neighbouring row's text.
+constexpr int32_t ROW_H = 18;
 
 static int32_t settings_row_y(uint32_t row) {
 	return OFFSET_Y + 10 + (int32_t)row * ROW_H;
@@ -1501,35 +1508,70 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// panel (and this row) recolors as < > toggles it.
 	draw_value_row(SET_ROW_MODE, sel, ICON_CONTRAST, "APPEARANCE",
 		       g_dark_mode ? "DARK" : "LIGHT");
+	// CLOCK: a summary row ("MON 13:45") that opens the segmented editor on
+	// A -- the big display was a fifth of the panel for a setting touched
+	// about once, and the space it freed is what put ROW_H back to 18.
+	// In-game the caller refreshes g_rtc_* from the live MBC3 clock each
+	// frame, so this value ticks rather than showing the boot-time staging.
+	{
+		char clk[10]; // "DOW HH:MM" + NUL
+		const char *dow = RTC_DOW_NAMES[g_rtc_dow];
+		clk[0] = dow[0];
+		clk[1] = dow[1];
+		clk[2] = dow[2];
+		clk[3] = ' ';
+		status_fmt_uint_pad(clk + 4, g_rtc_hour, 2);
+		clk[6] = ':';
+		status_fmt_uint_pad(clk + 7, g_rtc_min, 2);
+		clk[9] = '\0';
+		draw_value_row(SET_ROW_CLOCK, sel, ICON_CLOCK, "CLOCK", clk);
+	}
 
-	// RTC clock section: DOW : HH : MM as a big segmented clock with a small
-	// caption over each group and the clock icon in the left margin beside
-	// the digits; the selected group (the one < > adjusts) goes accent
-	// green. No label row -- the captions + icon carry the meaning, and the
-	// height that saves (together with ROW_H) is what keeps the toggle rows
-	// and this clock clear of draw_menu_hints()'s fixed y=226.
-	bool clk_sel = (sel >= SET_ROW_DOW);
+	// Two rows say something the row itself doesn't: CLOCK is the only one
+	// that opens a screen rather than cycling in place, and MANUAL's save
+	// chord is invisible otherwise.
+	draw_menu_hints(sel == SET_ROW_CLOCK
+			? "A EDIT   B BACK"
+			: (sel == SET_ROW_SAVE && save_interval_manual()
+			   ? "< > ADJUST   X+B SAVES"
+			   : "< > ADJUST   B BACK"));
+}
+
+// The clock editor: DOW : HH : MM as a big segmented display with a small
+// caption over each group and the clock icon in the left margin beside the
+// digits; the selected group (the one < > adjusts) goes accent green. No
+// label row -- the captions + icon carry the meaning. Its own screen since
+// the settings list outgrew hosting it inline; UP/DOWN pick the group here,
+// matching the settings list rather than the usual clock-setting transpose.
+static void draw_clock_menu(uint32_t field, uint32_t batt) {
+	draw_menu_frame("CLOCK", batt);
+
+	char buf[8];
+	status_fmt_uint_pad(buf, g_rtc_hour, 2);
+	status_fmt_uint_pad(buf + 4, g_rtc_min, 2);
 
 	struct {
 		const char *text; // pre-rendered group text (weekday name / digits)
 		const char *label;
 		int32_t label_len;
-		uint32_t row;
+		uint32_t field;
 	} grp[3] = {
-		{ RTC_DOW_NAMES[g_rtc_dow], "DAY", 3, SET_ROW_DOW  },
-		{ buf,                      "HR",  2, SET_ROW_HOUR },
-		{ buf + 4,                  "MIN", 3, SET_ROW_MIN  },
+		{ RTC_DOW_NAMES[g_rtc_dow], "DAY", 3, CLK_ROW_DOW  },
+		{ buf,                      "HR",  2, CLK_ROW_HOUR },
+		{ buf + 4,                  "MIN", 3, CLK_ROW_MIN  },
 	};
-	status_fmt_uint_pad(buf, g_rtc_hour, 2);
-	status_fmt_uint_pad(buf + 4, g_rtc_min, 2);
 
-	int32_t gy = settings_row_y(SET_ROW_DOW); // group captions
-	int32_t dy = gy + 14;                     // big glyphs
+	// Vertically centered in the card -- the header rule (OFFSET_Y - 1) to
+	// draw_menu_hints()'s fixed y=226, so center y=125. The caption + 20px
+	// digits stack is 34px tall, putting the captions at y=108 and the
+	// digits at 122..142.
+	int32_t gy = OFFSET_Y + 84; // group captions
+	int32_t dy = gy + 14;       // big glyphs
 	// Icon vertically centered on the 20px-tall digits ((20 - 14px icon)/2).
-	draw_icon(UI_MARGIN, dy + 3, ICON_CLOCK, clk_sel ? UI_ACCENT : STATUS_GREY);
+	draw_icon(UI_MARGIN, dy + 3, ICON_CLOCK, UI_ACCENT);
 	int32_t x = (SCREEN->w - text_w(9, CLK_SCALE, CLK_ADV)) / 2;
 	for (int32_t i = 0; i < 3; i++) {
-		bool is_sel = (grp[i].row == sel);
+		bool is_sel = (grp[i].field == field);
 		int32_t glyphs = i == 0 ? 3 : 2;
 		int32_t gw = text_w(glyphs, CLK_SCALE, CLK_ADV);
 		menu_text(x + (gw - text_w(grp[i].label_len)) / 2, gy, grp[i].label,
@@ -1543,11 +1585,7 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 		}
 	}
 
-	// MANUAL is the one setting whose meaning isn't obvious from the row --
-	// surface the chord that actually writes the save while it's selected.
-	draw_menu_hints(sel == SET_ROW_SAVE && save_interval_manual()
-			? "< > ADJUST   X+B SAVES"
-			: "< > ADJUST   B BACK");
+	draw_menu_hints("< > ADJUST   B BACK");
 }
 
 // Small solid triangle, apex up or down -- the boot menu's scroll indicator.
@@ -1661,6 +1699,11 @@ static void store_device_settings() {
 }
 
 static void settings_step(uint32_t row, int32_t dir, bool in_game) {
+	// CLOCK opens clock_menu on A and has nothing to cycle in place --
+	// checked before the dirty flag so browsing onto it and pressing < >
+	// can't schedule a flash write that changes nothing.
+	if (row == SET_ROW_CLOCK)
+		return;
 	g_settings_edited = true;
 	switch (row) {
 	case SET_ROW_BRIGHT: adjust_brightness(dir); return;
@@ -1687,14 +1730,132 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		apply_theme((g_theme + THEME_OPTION_COUNT + (uint32_t)dir) % THEME_OPTION_COUNT);
 		return;
 	case SET_ROW_MODE: apply_mode(!g_dark_mode); return; // either direction toggles
-	// RTC fields wrap so either direction reaches any value quickly.
-	case SET_ROW_DOW:  g_rtc_dow  = (uint8_t)((g_rtc_dow + 7 + dir) % 7);    break;
-	case SET_ROW_HOUR: g_rtc_hour = (uint8_t)((g_rtc_hour + 24 + dir) % 24); break;
-	case SET_ROW_MIN:  g_rtc_min  = (uint8_t)((g_rtc_min + 60 + dir) % 60);  break;
 	}
-	g_rtc_edited = true; // only the clock rows fall through the switch
+}
+
+// The clock editor's < >, split out of settings_step because the fields live
+// on their own screen. Marks both dirty flags: g_settings_edited persists the
+// staged clock with the rest of the settings, g_rtc_edited additionally forces
+// the autosave that keeps an in-game edit from losing to the older RTC record
+// already on flash (see settings_menu's close path).
+static void clock_step(uint32_t field, int32_t dir, bool in_game) {
+	// RTC fields wrap so either direction reaches any value quickly.
+	switch (field) {
+	case CLK_ROW_DOW:  g_rtc_dow  = (uint8_t)((g_rtc_dow + 7 + dir) % 7);    break;
+	case CLK_ROW_HOUR: g_rtc_hour = (uint8_t)((g_rtc_hour + 24 + dir) % 24); break;
+	case CLK_ROW_MIN:  g_rtc_min  = (uint8_t)((g_rtc_min + 60 + dir) % 60);  break;
+	}
+	g_settings_edited = true;
+	g_rtc_edited = true;
 	if (in_game)
 		rtc_apply_to_gb();
+}
+
+// Stage the live MBC3 clock into the g_rtc_* globals the menus display and
+// edit, instead of the stale boot-time staging. The day counter ticks past 6
+// as play spans midnights; fold it back to a weekday (the only meaning the
+// games give it). Called every frame while a menu is open in-game, so the
+// CLOCK row and the editor both tick with the game's clock.
+static void rtc_stage_from_gb() {
+	g_rtc_dow = (uint8_t)(((gb.rtc_real.reg.yday |
+				((uint16_t)(gb.rtc_real.reg.high & 1) << 8))) % 7);
+	g_rtc_hour = gb.rtc_real.reg.hour;
+	g_rtc_min = gb.rtc_real.reg.min;
+}
+
+// One input sample, shared by both modal menu loops.
+static void menu_read_input() {
+	_lio = _io;
+	_io = _gpio_get() & ~_io_press_latch;
+	_io_press_latch = 0;
+}
+
+// Per-frame housekeeping while a menu is open over a paused game. Without it
+// the emulator's clock and autosave stall for as long as the menu is up, so
+// every menu loop that can run in-game must call it.
+static void menu_pause_tick() {
+#if ENABLE_SOUND
+	// Hold the speaker at a clean silent level while paused instead of
+	// stuck at whatever it last played.
+	audio_output_mute();
+#endif
+	// Wall time keeps flowing into the clock while the game is paused here
+	// (real MBC3 behavior), and an in-menu autosave then commits a fresh
+	// RTC snapshot.
+	rtc_host_tick();
+	// Keep autosave flushing -- the player may well open this right after
+	// an in-game save.
+	save_storage_poll(cart_ram, sizeof(cart_ram));
+	rtc_stage_from_gb();
+}
+
+// Block until every action button is released. Used both on entry (the press
+// that opened a screen is still held and would otherwise act on it) and on
+// exit (so the closing press doesn't leak into whatever resumes underneath).
+static void menu_drain_buttons() {
+	do {
+		menu_read_input();
+		sleep(8);
+	} while (button(picosystem::A) || button(picosystem::B) ||
+		 button(picosystem::X) || button(picosystem::Y));
+}
+
+// < > with hold-to-repeat (initial delay, then fast) so the wider ranges
+// (MIN 0..59, HR 0..23) aren't dozens of individual taps. Returns the
+// direction to step this frame, or 0.
+static int32_t menu_adjust_dir(uint64_t &next_repeat) {
+	uint64_t now = time_us_64();
+	if (pressed(picosystem::LEFT) || pressed(picosystem::RIGHT)) {
+		next_repeat = now + 350000;
+		return pressed(picosystem::RIGHT) ? +1 : -1;
+	}
+	if ((button(picosystem::LEFT) || button(picosystem::RIGHT)) &&
+	    now >= next_repeat) {
+		next_repeat = now + 60000;
+		return button(picosystem::RIGHT) ? +1 : -1;
+	}
+	return 0;
+}
+
+// The clock editor, opened with A from the settings list's CLOCK row. Edits
+// the same g_rtc_* staging and sets the same dirty flags, so settings_menu's
+// close path persists whatever happens here -- this screen writes nothing to
+// flash itself.
+static void clock_menu(bool in_game) {
+	uint32_t field = CLK_ROW_HOUR; // the field most likely being fixed
+	menu_battery_poll batt;
+	uint64_t next_repeat = 0;
+
+	// The A that opened this screen is still held; ignore input until it
+	// (and anything else) is released.
+	menu_drain_buttons();
+
+	while (true) {
+		menu_read_input();
+
+		if (pressed(picosystem::B) ||
+		    (button(picosystem::X) && button(picosystem::Y)))
+			break;
+		if (pressed(picosystem::UP))
+			field = (field + CLK_ROW_COUNT - 1) % CLK_ROW_COUNT;
+		if (pressed(picosystem::DOWN))
+			field = (field + 1) % CLK_ROW_COUNT;
+
+		int32_t dir = menu_adjust_dir(next_repeat);
+		if (dir)
+			clock_step(field, dir, in_game);
+
+		if (in_game)
+			menu_pause_tick();
+
+		draw_clock_menu(field, batt.poll());
+		_flip();
+		sleep(16); // no timing requirements -- just input polling headroom
+	}
+
+	// The closing B is still held: drain it here or settings_menu reads the
+	// same press as its own "back" and closes out from under this return.
+	menu_drain_buttons();
 }
 
 // Modal settings screen, shared by the boot menu (its SETTINGS row, or Y+X)
@@ -1703,15 +1864,8 @@ static void settings_menu(bool in_game) {
 	uint32_t sel = 0;
 	menu_battery_poll batt;
 
-	if (in_game) {
-		// Show the live MBC3 clock, not the stale boot-time staging. The
-		// day counter ticks past 6 as play spans midnights; fold it back
-		// to a weekday (the only meaning the games give it).
-		g_rtc_dow = (uint8_t)(((gb.rtc_real.reg.yday |
-					((uint16_t)(gb.rtc_real.reg.high & 1) << 8))) % 7);
-		g_rtc_hour = gb.rtc_real.reg.hour;
-		g_rtc_min = gb.rtc_real.reg.min;
-	}
+	if (in_game)
+		rtc_stage_from_gb();
 
 	// The buttons that opened the menu (Y+X, or A on the boot menu's
 	// SETTINGS row) are still held on the first iterations -- ignore input
@@ -1721,9 +1875,7 @@ static void settings_menu(bool in_game) {
 	uint64_t next_repeat = 0;
 
 	while (true) {
-		_lio = _io;
-		_io = _gpio_get() & ~_io_press_latch;
-		_io_press_latch = 0;
+		menu_read_input();
 
 		if (wait_release) {
 			if (!(button(picosystem::A) || button(picosystem::B) ||
@@ -1737,38 +1889,20 @@ static void settings_menu(bool in_game) {
 				sel = (sel + SET_ROW_COUNT - 1) % SET_ROW_COUNT;
 			if (pressed(picosystem::DOWN))
 				sel = (sel + 1) % SET_ROW_COUNT;
-
-			// Left/Right adjust the selected row, with hold-to-repeat
-			// (initial delay, then fast) so the wider ranges (MIN
-			// 0..59, HR 0..23) aren't dozens of individual taps.
-			int32_t dir = 0;
-			uint64_t now = time_us_64();
-			if (pressed(picosystem::LEFT) || pressed(picosystem::RIGHT)) {
-				dir = pressed(picosystem::RIGHT) ? +1 : -1;
-				next_repeat = now + 350000;
-			} else if ((button(picosystem::LEFT) || button(picosystem::RIGHT)) &&
-				   now >= next_repeat) {
-				dir = button(picosystem::RIGHT) ? +1 : -1;
-				next_repeat = now + 60000;
+			// A opens the row's own screen -- only CLOCK has one.
+			if (pressed(picosystem::A) && sel == SET_ROW_CLOCK) {
+				clock_menu(in_game);
+				next_repeat = 0;
+				continue; // its drain already consumed this frame's input
 			}
+
+			int32_t dir = menu_adjust_dir(next_repeat);
 			if (dir)
 				settings_step(sel, dir, in_game);
 		}
 
-		if (in_game) {
-#if ENABLE_SOUND
-			// Hold the speaker at a clean silent level while paused
-			// instead of stuck at whatever it last played.
-			audio_output_mute();
-#endif
-			// Wall time keeps flowing into the clock while the game is
-			// paused here (real MBC3 behavior), and an in-menu autosave
-			// then commits a fresh RTC snapshot.
-			rtc_host_tick();
-			// Keep autosave flushing -- the player may well open this
-			// right after an in-game save.
-			save_storage_poll(cart_ram, sizeof(cart_ram));
-		}
+		if (in_game)
+			menu_pause_tick();
 
 		draw_settings_menu(sel, batt.poll());
 		_flip();
@@ -1799,13 +1933,7 @@ static void settings_menu(bool in_game) {
 
 	// Drain the closing press so B (or the Y+X chord) doesn't leak into
 	// whatever screen resumes underneath (game or boot menu).
-	do {
-		_lio = _io;
-		_io = _gpio_get() & ~_io_press_latch;
-		_io_press_latch = 0;
-		sleep(8);
-	} while (button(picosystem::A) || button(picosystem::B) ||
-		 button(picosystem::X) || button(picosystem::Y));
+	menu_drain_buttons();
 }
 
 // Boot-time ROM picker. Runs once in main(), before gb_init() -- nothing

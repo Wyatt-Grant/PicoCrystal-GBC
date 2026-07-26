@@ -243,8 +243,13 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/settings.ppm", dir);
 	write_ppm(path);
 
-	draw_settings_menu(SET_ROW_HOUR, 82);
+	// The CLOCK row selected in the list, and the editor it opens on A.
+	draw_settings_menu(SET_ROW_CLOCK, 82);
 	snprintf(path, sizeof path, "%s/settings_clock.ppm", dir);
+	write_ppm(path);
+
+	draw_clock_menu(CLK_ROW_HOUR, 82);
+	snprintf(path, sizeof path, "%s/clock_menu.ppm", dir);
 	write_ppm(path);
 
 	// SAVE INTERVAL on MANUAL with its row selected -- the one row that
@@ -337,9 +342,8 @@ int main(int argc, char **argv) {
 	write_ppm(path);
 	apply_mode(1); // DARK
 
-	// The clock: the settings screen with an RTC row selected, which lights
-	// up the big segmented display at the bottom.
-	draw_settings_menu(SET_ROW_HOUR, 82);
+	// The clock editor, the screen A opens from the list's CLOCK row.
+	draw_clock_menu(CLK_ROW_HOUR, 82);
 	snprintf(path, sizeof path, "%s/clock.ppm", dir);
 	write_ppm(path);
 
