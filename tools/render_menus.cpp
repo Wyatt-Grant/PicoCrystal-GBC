@@ -125,6 +125,80 @@ static const rom_entry_t rom_catalog[ROM_COUNT] = {
 
 #include "menu_draw.inc"
 
+// ---------------------------------------------------------------------
+// Game canvas: a 160x144 GBC frame (tools/grab_frame.c dumps one as a PPM)
+// blitted into the framebuffer through the same 1.5x scaler the device uses,
+// so the in-game screenshot shows the real thing -- blended columns, blended
+// rows, header band and all -- rather than a bare nearest-neighbour upscale.
+// The scaler mirrors core1's scanline writer in main.cpp (blend_avg + the
+// 3:2 even/odd/mid row split); it lives outside the fenced ranges because on
+// the device it is fused into the line-render hot path.
+
+constexpr int32_t GB_W = 160, GB_H = 144;
+constexpr int32_t SCALED_W = 240, SCALED_H = 216;
+
+static inline color_t blend_avg(color_t a, color_t b) {
+	return (color_t)((a & b) + (((a ^ b) & 0xEEEE) >> 1));
+}
+
+// Reads a P6 PPM with the trivial header grab_frame.c/headless_test.c write
+// ("P6\n<w> <h>\n255\n"); anything else is a caller error, not user input.
+static bool read_gb_ppm(const char *path, color_t out[GB_H][GB_W]) {
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		perror(path);
+		return false;
+	}
+	int w = 0, h = 0, maxval = 0;
+	if (fscanf(f, "P6 %d %d %d", &w, &h, &maxval) != 3 || w != GB_W ||
+	    h != GB_H || maxval != 255) {
+		fprintf(stderr, "%s: not a %dx%d 8-bit P6 PPM\n", path, GB_W, GB_H);
+		fclose(f);
+		return false;
+	}
+	fgetc(f); // the single whitespace byte after maxval
+	for (int32_t y = 0; y < GB_H; y++) {
+		for (int32_t x = 0; x < GB_W; x++) {
+			int r = fgetc(f), g = fgetc(f), b = fgetc(f);
+			if (b == EOF) {
+				fprintf(stderr, "%s: truncated\n", path);
+				fclose(f);
+				return false;
+			}
+			// 8-bit -> the top 4 bits of each channel, the same
+			// truncation rgb565_to_color() does on the device.
+			out[y][x] = (color_t)((r >> 4) | (0xF << 4) |
+					      ((b >> 4) << 8) | ((g >> 4) << 12));
+		}
+	}
+	fclose(f);
+	return true;
+}
+
+// 1.5x (3:2): source columns pair up into (s0, avg, s1) and source rows into
+// (row 3k, the average of the pair, row 3k+2), landing at y = offset_y.
+static void blit_game(const color_t src[GB_H][GB_W], int32_t offset_y) {
+	static color_t prev_row[SCALED_W];
+	for (int32_t ly = 0; ly < GB_H; ly++) {
+		const int32_t k = ly >> 1;
+		const bool odd = ly & 1;
+		color_t *dst = _screen_storage.p(0, offset_y + 3 * k + (odd ? 2 : 0));
+		for (int32_t s = 0, d = 0; s < GB_W; s += 2, d += 3) {
+			color_t c0 = src[ly][s], c1 = src[ly][s + 1];
+			dst[d]     = c0;
+			dst[d + 1] = blend_avg(c0, c1);
+			dst[d + 2] = c1;
+		}
+		if (odd) {
+			color_t *mid = _screen_storage.p(0, offset_y + 3 * k + 1);
+			for (int32_t x = 0; x < SCALED_W; x++)
+				mid[x] = blend_avg(prev_row[x], dst[x]);
+		} else {
+			memcpy(prev_row, dst, sizeof prev_row);
+		}
+	}
+}
+
 // RGBA4444 layout per main.cpp's rgb565_to_color: R 0-3, A 4-7, B 8-11, G 12-15.
 static void write_ppm(const char *path) {
 	FILE *f = fopen(path, "wb");
@@ -146,8 +220,19 @@ static void write_ppm(const char *path) {
 	printf("wrote %s\n", path);
 }
 
+// Lowercased theme name, for the per-theme output filenames.
+static void theme_slug(const char *name, char *out, size_t n) {
+	size_t i = 0;
+	for (; name[i] && i + 1 < n; i++)
+		out[i] = (char)(name[i] >= 'A' && name[i] <= 'Z' ? name[i] + 32
+								: name[i]);
+	out[i] = '\0';
+}
+
 int main(int argc, char **argv) {
 	const char *dir = argc > 1 ? argv[1] : ".";
+	// Optional 160x144 GBC frame (tools/grab_frame.c) for the in-game shots.
+	const char *game_ppm = argc > 2 ? argv[2] : nullptr;
 	char path[512];
 
 	draw_boot_menu(1, 82);
@@ -222,6 +307,65 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/boot_light.ppm", dir);
 	write_ppm(path);
 	apply_mode(1); // restore DARK for any later frames
+
+	// ---- README screenshot set (make_screenshots.sh) --------------------
+	// Everything below is rendered for the repo's screenshots/ gallery: the
+	// full accent-theme sweep, the light/dark pair, and -- when a game frame
+	// is supplied -- the in-game canvas under the real device chrome.
+
+	// One settings screen per accent theme, THEME row selected so the name
+	// and every accent-tinted element are both visible in the same shot.
+	char slug[32];
+	for (uint32_t t = 0; t < THEME_OPTION_COUNT; t++) {
+		apply_theme(t);
+		draw_settings_menu(SET_ROW_THEME, 82);
+		theme_slug(t < THEME_COUNT ? UI_THEMES[t].name : "RGB", slug,
+			   sizeof slug);
+		snprintf(path, sizeof path, "%s/theme_%s.ppm", dir, slug);
+		write_ppm(path);
+	}
+	apply_theme(0); // back to MINT
+
+	// Light/dark pair, same theme and same selected row in both, so the two
+	// shots differ only in the neutral ramp.
+	apply_mode(0); // LIGHT
+	draw_boot_menu(1, 82);
+	snprintf(path, sizeof path, "%s/boot_light_mint.ppm", dir);
+	write_ppm(path);
+	draw_settings_menu(SET_ROW_BRIGHT, 82);
+	snprintf(path, sizeof path, "%s/settings_light_mint.ppm", dir);
+	write_ppm(path);
+	apply_mode(1); // DARK
+
+	// The clock: the settings screen with an RTC row selected, which lights
+	// up the big segmented display at the bottom.
+	draw_settings_menu(SET_ROW_HOUR, 82);
+	snprintf(path, sizeof path, "%s/clock.ppm", dir);
+	write_ppm(path);
+
+	if (game_ppm) {
+		static color_t frame[GB_H][GB_W];
+		if (!read_gb_ppm(game_ppm, frame))
+			return 1;
+
+		// Normal: 24px header band above the 240x216 game canvas.
+		g_status_bar = STATUS_FPS_PCT;
+		memset(_fb, 0, sizeof _fb);
+		blit_game(frame, OFFSET_Y);
+		draw_status_bar(60, 82);
+		snprintf(path, sizeof path, "%s/in_game.ppm", dir);
+		write_ppm(path);
+
+		// FULLSCREEN: no header at all, canvas centered in a 12px
+		// letterbox top and bottom.
+		g_status_bar = STATUS_FULLSCREEN;
+		memset(_fb, 0, sizeof _fb);
+		blit_game(frame, (240 - SCALED_H) / 2);
+		draw_status_bar(60, 82); // no-ops in FULLSCREEN, kept for parity
+		snprintf(path, sizeof path, "%s/in_game_fullscreen.ppm", dir);
+		write_ppm(path);
+		g_status_bar = STATUS_FPS_PCT;
+	}
 
 	return 0;
 }

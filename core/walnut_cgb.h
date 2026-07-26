@@ -83,25 +83,23 @@
  * mention is inside a parameter list), making it a distinct, incompatible
  * type from the real struct gb_s defined later in this file -- which then
  * fails to compile with "conflicting types" under strict C11 (gcc 13). */
-/* PicoCrystal fix: __gb_read/__gb_read16/__gb_read32/__gb_write/__gb_write16/
+/* PicoCrystal fix: the prototypes below --
+ * __gb_read/__gb_read16/__gb_read32/__gb_write/__gb_write16/
  * __gb_write32/__gb_execute_cb/__gb_draw_line/__gb_step_cpu/
  * gb_run_frame_dualfetch are each wrapped in __not_in_flash_func() at their
  * definitions further down (search for it) -- these are the memory-access
  * dispatch, PPU line-render, and opcode dispatch/loop functions called on
  * effectively every instruction/scanline, and the RP2040's Cortex-M0+ has no
  * hardware flash-execute-in-place cache large enough to keep them hot
- * without stalling. __gb_step_cpu (the ~25KB opcode dispatcher) initially
- * stayed in flash -- moving it wasn't affordable until save_storage.cpp's
- * 36KB save-staging buffer was eliminated (cart_ram is now flash-programmed
- * directly instead of copied into a combined buffer first), which freed
- * enough SRAM headroom to fit it. gb_run_frame_dualfetch matters despite
- * being "only" called once per GBC frame from main.cpp: its body is the
- * actual `while(!gb->gb_frame) { __gb_step_cpu(gb); }` per-instruction
- * dispatch loop (confirmed via nm -- it wasn't emitted as a standalone
- * symbol at all, meaning it had been inlined into main(), which was never
- * itself moved to RAM, so this loop's own control-flow instructions stayed
- * flash-resident on every iteration even after __gb_step_cpu itself moved).
- * Milestone 8 of the plan. */
+ * without stalling. __gb_step_cpu alone is a ~25KB opcode dispatcher, so
+ * keeping it in RAM is a real SRAM commitment (see the header_page comment
+ * in save_storage.cpp for what was given up to afford it).
+ * gb_run_frame_dualfetch matters despite being "only" called once per GBC
+ * frame from main.cpp: its body is the actual
+ * `while(!gb->gb_frame) { __gb_step_cpu(gb); }` per-instruction dispatch
+ * loop, and it gets inlined into its caller -- if that caller is not itself
+ * RAM-resident, the loop's own control-flow instructions stay flash-resident
+ * on every iteration even with __gb_step_cpu moved. */
 struct gb_s;
 uint8_t __gb_read(struct gb_s *gb, uint16_t addr);
 uint16_t __gb_read16(struct gb_s *gb, uint16_t addr); /* PicoCrystal fix: needed by wgb_fetch16 below */

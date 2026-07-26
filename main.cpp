@@ -1,12 +1,7 @@
 // PicoCrystal main.cpp -- NOT the stock PicoSystem init()/update()/draw()
 // model. This project runs a Game Boy Color emulator (Walnut-CGB) rather
 // than a native game, so it needs a custom main() driving its own loop and
-// direct low-level access to the display flip/vsync primitives -- the same
-// shape the sibling PicoSystem_InfoNes project uses for the same reason.
-// See /home/wyatt/.claude/plans/i-want-to-port-fluttering-meadow.md.
-//
-// Milestones 3-6 done: frame data, input, and audio work correctly on real
-// hardware. Milestone 7 (current): save persistence.
+// direct low-level access to the display flip/vsync primitives.
 
 #include <array>
 #include <cstdint>
@@ -18,18 +13,13 @@
 
 #include "picosystem.hpp"
 
-// Diagnostic step (Milestone 8 performance push): fully disabled, not just
-// muted. audio_output_mute()/volume=0 only skips the final PSG->PCM mix
-// (minigb_apu_audio_callback); Polished Crystal's sound engine still writes
-// individual APU registers (frequency, envelope, duty cycle, ...) many times
-// per frame regardless, and each of those writes still called into
-// minigb_apu_audio_write via __gb_write's `#if ENABLE_SOUND` branch even at
-// volume 0 -- which is almost certainly why muting alone barely moved the
-// needle. Setting ENABLE_SOUND to 0 compiles those calls out of __gb_read/
-// __gb_write entirely, removing that per-register-access traffic too, not
-// just the final mixdown. Expect this alone still isn't the whole story
-// (per the user: "we'll need more than that") -- it isolates how much the
-// APU subsystem as a whole (not just synthesis) is actually costing.
+// Compile-time switch for the whole APU subsystem, distinct from muting.
+// Volume 0 only skips the final PSG->PCM mix (minigb_apu_audio_callback);
+// a game's sound engine still writes APU registers (frequency, envelope,
+// duty cycle, ...) many times per frame, and each of those writes reaches
+// minigb_apu_audio_write through __gb_read/__gb_write's `#if ENABLE_SOUND`
+// branch. Setting this to 0 compiles that per-register traffic out too --
+// useful for isolating what the APU as a whole costs on a perf run.
 #define ENABLE_SOUND 1
 #include "core/minigb_apu/minigb_apu.h" // MINIGB_APU_AUDIO_FORMAT_S16SYS set via CMakeLists.txt
 
@@ -46,10 +36,10 @@ void audio_write(uint16_t addr, uint8_t val);
 
 // ---------------------------------------------------------------------
 // ROM / cart-RAM storage, plus the WGB_* direct-access overrides that
-// walnut_cgb.h's hot read/write paths expand to (Milestone 8 performance
-// push). Both live above the walnut_cgb.h include because the macros are
-// baked into __gb_read/__gb_read16/__gb_read32/__gb_write at their
-// definitions inside that header.
+// walnut_cgb.h's hot read/write paths expand to. Both live above the
+// walnut_cgb.h include because the macros are baked into
+// __gb_read/__gb_read16/__gb_read32/__gb_write at their definitions inside
+// that header.
 //
 // The stock route for every ROM byte is an indirect call through
 // gb->gb_rom_read* -- pointer load + blx + callee prologue/epilogue on every
@@ -122,11 +112,10 @@ static inline uint32_t wgb_rom_read32_direct(uint_fast32_t addr) {
 #define WGB_RAM_DATA __not_in_flash("wgb_hot_tables")
 
 // ---------------------------------------------------------------------
-// Core1 scanline-render offload, phase 2 (Milestone 9): the full PPU line
-// render (BG + window + sprites), not just the 1.5x scale/convert, now runs
-// on core1. __gb_draw_line's per-line work on core0 shrinks to snapshotting
-// the PPU registers + OAM into the line ring (WGB_LCD_LINE_OVERRIDE below;
-// the OAM copy is the same 160 bytes the old pixel copy was).
+// Core1 scanline-render offload: the full PPU line render (BG + window +
+// sprites), not just the 1.5x scale/convert, runs on core1. __gb_draw_line's
+// per-line work on core0 is just snapshotting the PPU registers + OAM into
+// the line ring (WGB_LCD_LINE_OVERRIDE below).
 //
 // This stays *exact*, not approximately-right: everything mutable the
 // renderer reads travels by value in the snapshot except VRAM, and VRAM is
@@ -286,8 +275,8 @@ static inline void adjust_brightness(int32_t dir) { // dir > 0: up, dir < 0: dow
 // but shear is visible on scrolls. The game runs at its authentic 59.73Hz off
 // the wall-clock pacer.
 //
-// ON: normally fully TE-LOCKED (g_te_pace; the panel runs at ~60Hz since the
-// hardware.cpp FRCTRL2 change, so this no longer costs game speed). Every
+// ON: normally fully TE-LOCKED (g_te_pace; the panel is driven at ~60Hz by
+// hardware.cpp's FRCTRL2 setting, so the lock costs no game speed). Every
 // frame arms _flip_armed and the pacer then WAITS for the ST7789 TE
 // interrupt to consume the arm and start the flip DMA (at STE tear scanline
 // 240, where the beam enters the off-glass dead zone -- the ~4.5ms head
@@ -300,11 +289,9 @@ static inline void adjust_brightness(int32_t dir) { // dir > 0: up, dir < 0: dow
 // Emulation runs at the panel's measured rate (audio pacing retunes to
 // match -- tempo, not pitch); the settings row shows the rate.
 //
-// History: the reverted 2026-07 "always-on" version armed every frame but
-// did NOT wait for the flip to start, so pending arms fired mid-write
-// (tears) and the chase throttled catch-up sprints through the VRAM fence
-// (perf); and at the then-40Hz panel a full lock would have meant 67% game
-// speed. The 60Hz panel is what made the lock viable.
+// Arming without waiting is not enough: a pending arm can fire mid-write and
+// stream a mixed buffer, which is what "still tears with vsync on" looks
+// like. The wait is the load-bearing part.
 //
 // volatile: written by core0 (settings menu), read by core1's store path.
 static volatile bool g_vsync = false;
@@ -375,8 +362,8 @@ static uint8_t g_last_slot = 0xFF;
 
 // NOSTALGIC BOOT (settings menu row, persisted): when on, launching a game
 // plays a Game Boy-style boot splash -- the PicoCrystal logo scrolls down to
-// center screen and the boot chime (assets/boot_tone.h, streamed into the PWM
-// DAC) rings out before emulation starts. See nostalgic_boot_splash().
+// center screen and the boot chime rings out before emulation starts. See
+// nostalgic_boot_splash().
 static bool g_nostalgic_boot = true;
 
 // SAVE INTERVAL (settings menu row, persisted): the minimum spacing between
@@ -405,13 +392,9 @@ static inline int led_brightness() {
 	return 45 * g_brightness / 100;
 }
 
-// The LED reports battery charge in the same green/amber/red steps the
-// on-screen battery icon fills with -- see battery_color()/led_show_battery()
-// down with the icon drawing code.
-
 // Poll PicoSystem's 8 buttons and pack them into the GBC joypad byte (active
 // low, per JOYPAD_* in walnut_cgb.h). PicoSystem has no Start/Select of its
-// own, so per the plan: X->Start, Y->Select. Holding Y and X together opens
+// own, so X->Start, Y->Select. Holding Y and X together opens
 // the settings menu -- detected in the run loop before this is called, so a
 // completed chord never reaches the game as Start+Select.
 static inline void update_joypad() {
@@ -495,14 +478,12 @@ static color_t _prev_row[SCALED_W];
 static color_t _pal_lut[0x40];
 
 // ---------------------------------------------------------------------
-// Core1 scanline-render offload (Milestones 8+9).
+// Core1 scanline-render offload: the line ring.
 //
-// Milestone 8 moved the 1.5x scale/convert to core1, with core0 still
-// rendering each line's pixels inline. Milestone 9 moves the render itself:
-// __gb_draw_line on core0 now only snapshots the PPU state (registers,
-// palettes, OAM -- see struct wgb_scanline_state in walnut_cgb.h) into this
-// ring via wgb_lcd_enqueue(), and core1 runs the full BG/window/sprite
-// render (__gb_render_scanline, reading VRAM live) followed by the scale.
+// __gb_draw_line on core0 only snapshots the PPU state (registers, palettes,
+// OAM -- see struct wgb_scanline_state in walnut_cgb.h) into this ring via
+// wgb_lcd_enqueue(); core1 runs the full BG/window/sprite render
+// (__gb_render_scanline, reading VRAM live) followed by the 1.5x scale.
 // Exactness is preserved by WGB_VRAM_WRITE_FENCE -- see the block comment
 // above the walnut_cgb.h include.
 //
@@ -520,7 +501,7 @@ static color_t _pal_lut[0x40];
 // compiler barrier stops the compiler itself from reordering.
 struct line_job {
 	wgb_scanline_state st;      // PPU register/palette snapshot; st.oam -> oam[]
-	uint8_t oam[0xA0];          // OAM snapshot (same 160 bytes the old pixel copy was)
+	uint8_t oam[0xA0];          // OAM snapshot; the render must not see live OAM
 	uint8_t pal_dirty;          // palette[] below is valid and must be applied
 	uint16_t palette[0x40];     // fixPalette snapshot, only when pal_dirty
 };
@@ -625,8 +606,8 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 			dst[d + 2] = c1;
 		}
 	} else {
-		// Shouldn't happen for this ROM (it's CGB-flagged), but keep a
-		// visibly-distinct fallback rather than silently rendering black.
+		// Non-CGB (DMG) title: the emulator emits 2-bit shades rather
+		// than fixPalette indices, so map them to a fixed grey ramp.
 		static const color_t grey[4] = {
 			rgb565_to_color(0xFFFF), rgb565_to_color(0xAD55),
 			rgb565_to_color(0x52AA), rgb565_to_color(0x0000)
@@ -1525,7 +1506,7 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// caption over each group and the clock icon in the left margin beside
 	// the digits; the selected group (the one < > adjusts) goes accent
 	// green. No label row -- the captions + icon carry the meaning, and the
-	// saved height (plus the 18px row pitch) is what keeps the toggle rows
+	// height that saves (together with ROW_H) is what keeps the toggle rows
 	// and this clock clear of draw_menu_hints()'s fixed y=226.
 	bool clk_sel = (sel >= SET_ROW_DOW);
 
@@ -1758,8 +1739,8 @@ static void settings_menu(bool in_game) {
 				sel = (sel + 1) % SET_ROW_COUNT;
 
 			// Left/Right adjust the selected row, with hold-to-repeat
-			// (initial delay, then fast) so ranges like DAY 0..511 aren't
-			// hundreds of individual taps.
+			// (initial delay, then fast) so the wider ranges (MIN
+			// 0..59, HR 0..23) aren't dozens of individual taps.
 			int32_t dir = 0;
 			uint64_t now = time_us_64();
 			if (pressed(picosystem::LEFT) || pressed(picosystem::RIGHT)) {
@@ -1794,23 +1775,23 @@ static void settings_menu(bool in_game) {
 		sleep(16); // no timing requirements -- just enough for ~60fps input polling
 	}
 
-	// Persist the settings (brightness/volume/clock) if anything was
-	// actually edited -- one synchronous ~50ms flash write, unnoticeable
-	// here where nothing is animating. Skipped entirely on a look-only
-	// visit so browsing the menu never wears flash.
 	// An in-game clock edit must reach flash even if the game never saves
 	// again this session -- otherwise the older RTC record wins on next
 	// boot and undoes the edit. One extra 32KB autosave cycle, only on an
-	// actual clock edit.
-	// The request forces the commit past the SAVE INTERVAL throttle -- with
-	// a long interval (or MANUAL) the edit would otherwise sit unwritten
-	// until the next scheduled save, which in MANUAL may never come.
+	// actual clock edit. The request forces the commit past the SAVE
+	// INTERVAL throttle -- with a long interval (or MANUAL) the edit would
+	// otherwise sit unwritten until the next scheduled save, which in
+	// MANUAL may never come.
 	if (in_game && g_rtc_edited) {
 		save_storage_mark_dirty();
 		save_storage_request_save();
 	}
 	g_rtc_edited = false;
 
+	// Persist the settings (brightness/volume/clock) if anything was
+	// actually edited -- one synchronous ~50ms flash write, unnoticeable
+	// here where nothing is animating. Skipped entirely on a look-only
+	// visit so browsing the menu never wears flash.
 	if (g_settings_edited) {
 		g_settings_edited = false;
 		store_device_settings();
@@ -1873,17 +1854,16 @@ static uint32_t rom_select() {
 // GBC "GAME BOY" lettering style -- scrolls down from off-screen to center,
 // lands, sweeps its GBC color blocks across the letters once before
 // settling, and the boot chime rings out through the PWM DAC -- the whole
-// sequence tuned to ~2.5s. The chime is synthesized (two decaying square
-// notes at 468Hz and 2088Hz, the pitches measured from the user's boot_tone
-// recording) rather than played back as sampled PCM. "By Wyatt" sits in
-// small print at the bottom, where the GBC put "Nintendo". Follows the
-// APPEARANCE setting: black-on-white in light mode, white-on-black in dark
-// (the letter colors read on either field).
+// sequence tuned to ~2.5s. The chime is synthesized rather than played back
+// as sampled PCM; see audio_output_play_boot_jingle() for the two notes and
+// where their parameters come from. "By Wyatt" sits in small print at the
+// bottom, where the GBC put "Nintendo". Follows the APPEARANCE setting:
+// black-on-white in light mode, white-on-black in dark (the letter colors
+// read on either field).
 //
-// Bitmaps are 1-bpp MSB-first, hand-drawn via the scratch logo_design.py
-// tool. The logo ships as one layer per color, so each layer is a plain
-// single-color blit and the color sweep is just a rotation of the palette
-// across the five layers.
+// Bitmaps are 1-bpp MSB-first. The logo is stored as one layer per color, so
+// each layer is a plain single-color blit and the color sweep is just a
+// rotation of the palette across the five layers.
 // ---------------------------------------------------------------------
 
 constexpr int32_t BOOT_LOGO_W = 81, BOOT_LOGO_H = 15;
@@ -2142,7 +2122,8 @@ static void __not_in_flash_func(core1_main)() {
 int main() {
 	_init_hardware(); // includes the 250MHz/1.20V overclock (see hardware.cpp)
 
-	// Measure the panel's true TE period (~270ms, backlight is still off) and
+	// Measure the panel's true TE period (averaged over 16 pulses, so ~270ms
+	// spent here with the backlight still off) and
 	// decide whether TE-locked vsync is usable -- see g_te_period_us /
 	// g_te_pace. Gate: 54-66Hz, generous enough for the ST7789 RC
 	// oscillator's unit-to-unit spread; outside it means the measurement
@@ -2239,13 +2220,13 @@ int main() {
 		store_device_settings();
 	}
 #else
-	// No display to pick from in this diagnostic build -- always boot the
-	// first catalog entry.
+	// No display to pick from with ENABLE_LCD off -- always boot the first
+	// catalog entry.
 	uint32_t rom_index = 0;
 #endif
 	const rom_entry_t &rom = rom_catalog[rom_index];
 	g_rom_data = rom.data;
-	// Fill the SRAM mirror of ROM 0x0000-0x0FFF (see rom_mirror up top) --
+	// Fill the SRAM mirror of the ROM's first 2KB (see rom_mirror up top) --
 	// must happen before gb_init(), whose header parse already reads ROM.
 	memcpy(rom_mirror, g_rom_data, sizeof(rom_mirror));
 
@@ -2287,9 +2268,8 @@ int main() {
 	gb_init_lcd(&gb, &lcd_callback_unused);
 	gb.cgb.fixPaletteDirty = 1; // force the first line job to carry a palette snapshot
 
-	// Frame-skip rendering (currently OFF -- rendering every frame to gauge the
-	// full-rate cost): when set, __gb_draw_line renders every scanline on
-	// alternate frames only (whole frames skipped, not individual lines),
+	// Frame-skip rendering, off: when set, __gb_draw_line renders every
+	// scanline on alternate frames only (whole frames skipped, not individual lines),
 	// halving the PPU + scale/convert cost without the per-scanline shimmer that
 	// interlacing produced, at the cost of a ~30fps visible refresh. Either way
 	// the emulated CPU steps every frame, so game timing/accuracy is unaffected.
@@ -2326,7 +2306,7 @@ int main() {
 	_io = _gpio_get();
 
 	// The LED reports battery charge: a green->red gradient (green ~= full,
-	// red ~= nearly empty) at ~15% brightness. Updated on a cadence rather than
+	// red ~= nearly empty), capped by led_brightness(). Updated on a cadence rather than
 	// every frame -- battery() reads the ADC and the charge level changes
 	// slowly, so per-frame polling would only waste cycles and jitter the LED.
 	// Starting the counter at the threshold makes the first loop iteration do

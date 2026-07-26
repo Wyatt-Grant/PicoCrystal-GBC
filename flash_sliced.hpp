@@ -5,8 +5,9 @@
 // Resume (0x7A) commands (W25Q family). A normal flash_range_erase() holds XIP
 // down for the WHOLE erase (~45ms typ on the W25Q128) -- both cores stall the
 // entire time because instruction fetch runs from flash, which is what causes
-// the audible/visible save stutter. Instead we run the erase in short ~500us
-// slices: issue/resume the erase, let it run for one slice, then SUSPEND it and
+// the audible/visible save stutter. Instead we run the erase in short slices
+// (ERASE_ON_US, ~1.5ms -- see flash_sliced.cpp): issue/resume the erase, let
+// it run for one slice, then SUSPEND it and
 // restore XIP so both cores run normally again until the next slice. Reads of
 // OTHER sectors (code, the game ROM) are legal while an erase is suspended, so
 // the emulator keeps going between slices.

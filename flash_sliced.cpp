@@ -183,10 +183,11 @@ bool __no_inline_not_in_flash_func(run_on_and_park)() {
 	return !(read_sr(CMD_RDSR2) & SR2_SUS);
 }
 
-// Pause core1 (only if it registered as a lockout victim -- with sound disabled
-// core1 is never launched, see save_storage.cpp's flash_locked_erase) and
-// disable our own interrupts for the duration of one on-time, so nothing fetches
-// from flash while XIP is exited. Same guarded pattern as flash_locked_erase.
+// Pause core1 (only if it registered as a lockout victim -- flash writes can
+// happen before main() launches it; see save_storage.cpp's flash_locked_erase)
+// and disable our own interrupts for the duration of one on-time, so nothing
+// fetches from flash while XIP is exited. Same guarded pattern as
+// flash_locked_erase.
 struct lockout_guard {
 	bool locked;
 	uint32_t ints;

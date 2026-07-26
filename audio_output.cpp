@@ -40,9 +40,8 @@ volatile uint8_t play_buf_idx = 0; // buffer the DMA is (or was last) playing
 volatile bool dma_idle = true;     // no transfer in flight; PWM holds its last duty
 volatile bool buf_pending = false; // a filled buffer is published but not yet started
 
-// Synthesis staging buffer (interleaved stereo from minigb_apu). Lived in
-// main()'s frame loop when synthesis ran on core0; now owned here since only
-// core1 touches it.
+// Synthesis staging buffer (interleaved stereo from minigb_apu). Owned here
+// rather than by the caller: only core1 ever touches it.
 audio_sample_t stage_buf[AUDIO_SAMPLES_TOTAL];
 
 // One-pole high-pass state (core1 only). See render_frame for why.
@@ -85,7 +84,8 @@ void retune_pace_timer() {
 // quieter comes up toward them, which is the only way to raise *average*
 // loudness once peaks already span the full 3.3V swing.
 constexpr uint16_t VOLUME_MAX_PERCENT = 800;
-volatile uint16_t volume_percent = 0; // muted by default -- hold Y + Up to raise it
+volatile uint16_t volume_percent = 0; // muted by default; raised from the
+                                      // settings menu's VOLUME row
 
 // DMA completion handler, on core1 (audio_output_core1_init installs it
 // there). RAM-resident: a flash-resident handler would stall on XIP misses

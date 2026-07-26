@@ -6,9 +6,9 @@ A Game Boy Color emulator for the [Pimoroni PicoSystem](https://shop.pimoroni.co
 run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
 
 <p align="center">
-  <img src="screenshots/boot-menu.png" alt="Boot menu" width="30%">
-  <img src="screenshots/in-game.png"  alt="A game running" width="30%">
-  <img src="screenshots/settings.png" alt="Settings menu" width="30%">
+  <img src="screenshots/boot-menu.png" alt="Boot menu" width="32%">
+  <img src="screenshots/in-game.png"   alt="A game running, with the FPS and battery status bar" width="32%">
+  <img src="screenshots/settings.png"  alt="Settings menu" width="32%">
 </p>
 
 - Full-speed CGB emulation on the RP2040's two Cortex-M0+ cores
@@ -65,6 +65,50 @@ boot menu.
 - **Y+X** (or the SETTINGS row) opens settings, both here and in-game
 - To switch games, power-cycle the console
 
+## Screenshots
+
+Nine accent themes, cycled with **&lt;**/**&gt;** on the settings THEME row. The
+accent drives everything tinted — row icons, meter fills, the header rule, the
+selection pill, the battery fill, and the power LED. `RGB` is not a fixed color
+but a slow walk around the hue wheel, taking the LED with it.
+
+<p align="center">
+  <img src="screenshots/theme-mint.png"      alt="MINT theme"      width="19%">
+  <img src="screenshots/theme-grape.png"     alt="GRAPE theme"     width="19%">
+  <img src="screenshots/theme-berry.png"     alt="BERRY theme"     width="19%">
+  <img src="screenshots/theme-peach.png"     alt="PEACH theme"     width="19%">
+  <img src="screenshots/theme-lemon.png"     alt="LEMON theme"     width="19%">
+  <br>
+  <img src="screenshots/theme-blueberry.png" alt="BLUEBERRY theme" width="19%">
+  <img src="screenshots/theme-bubblegum.png" alt="BUBBLEGUM theme" width="19%">
+  <img src="screenshots/theme-vanilla.png"   alt="VANILLA theme"   width="19%">
+  <img src="screenshots/theme-rgb.png"       alt="RGB theme"       width="19%">
+</p>
+
+APPEARANCE switches the neutral ramp between dark and light without touching
+the chosen accent, so any theme works either way:
+
+<p align="center">
+  <img src="screenshots/boot-menu.png"      alt="Boot menu, dark mode"     width="24%">
+  <img src="screenshots/boot-menu-light.png" alt="Boot menu, light mode"    width="24%">
+  <img src="screenshots/settings.png"        alt="Settings, dark mode"      width="24%">
+  <img src="screenshots/settings-light.png"  alt="Settings, light mode"     width="24%">
+</p>
+
+The MBC3 real-time clock has its own segmented display at the bottom of the
+settings screen, and the STATUS BAR setting can drop the header entirely for a
+letterboxed fullscreen canvas:
+
+<p align="center">
+  <img src="screenshots/clock.png"              alt="Setting the real-time clock" width="32%">
+  <img src="screenshots/in-game-fullscreen.png" alt="Fullscreen mode, no status bar" width="32%">
+</p>
+
+> Screenshots are generated on the host, not photographed off the panel:
+> `tools/make_screenshots.sh` compiles the real drawing code out of `main.cpp`
+> and runs the real emulator core, so what you see above is pixel-exact to the
+> device (see [Repo layout](#repo-layout)).
+
 ## Customizing names, order, and save slots (`assets/roms.json`)
 
 By default games appear in alphabetical filename order, named after the file
@@ -108,3 +152,6 @@ prints every game's current slot.
   `main()` and the framebuffer)
 - `tools/gen_rom_data.py` — build-time ROM catalog generator (run by CMake)
 - `tools/`, `host_test/` — host-side UI render harness and emulator tests
+  (`tools/make_screenshots.sh` regenerates `screenshots/`: `grab_frame.c` boots
+  a ROM in the core to capture a game frame, `render_menus.cpp` compiles the
+  UI code out of `main.cpp` and draws every menu screen around it)

@@ -81,7 +81,10 @@ static void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
 }
 #endif
 
-/* Dump the current framebuffer (RGB555) as an 8-bit PPM (P6). */
+/* Dump the current framebuffer (RGB565) as an 8-bit PPM (P6). fixPalette is
+ * RGB565, not RGB555: gb_write() feeds it through bgr555_to_rgb565_accurate()
+ * (the BE variant only when WALNUT_GB_RGB565_BIGENDIAN is set, which this host
+ * build does not set), matching main.cpp's rgb565_to_color() on the device. */
 static void dump_ppm(struct priv_t *priv, const char *out_dir, const char *name)
 {
 	char path[512];
@@ -92,10 +95,10 @@ static void dump_ppm(struct priv_t *priv, const char *out_dir, const char *name)
 	for (int y = 0; y < LCD_HEIGHT; y++) {
 		for (int x = 0; x < LCD_WIDTH; x++) {
 			uint16_t c = priv->fb[y][x];
-			uint8_t r5 = (c >> 10) & 0x1F, g5 = (c >> 5) & 0x1F, b5 = c & 0x1F;
+			uint8_t r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
 			uint8_t rgb[3] = {
 				(uint8_t)((r5 * 255 + 15) / 31),
-				(uint8_t)((g5 * 255 + 15) / 31),
+				(uint8_t)((g6 * 255 + 31) / 63),
 				(uint8_t)((b5 * 255 + 15) / 31)
 			};
 			fwrite(rgb, 1, 3, f);

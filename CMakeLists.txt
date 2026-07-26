@@ -4,11 +4,10 @@ set(PROJECT_NAME PicoCrystal)
 
 # pico-sdk already ships a board definition for this exact hardware
 # (boards/pimoroni_picosystem.h) -- correct PICO_FLASH_SIZE_BYTES (16MB) and
-# the right second-stage bootloader for its flash chip (W25Q080). The
-# original boilerplate never set this (defaulted to the generic "pico"
-# board's assumptions), which didn't matter until now: Milestone 7 does real
-# flash erase/program for save persistence, where the correct boot2/flash
-# timing config actually matters.
+# the matching second-stage bootloader for its Winbond flash. Leaving this
+# unset falls back to the generic "pico" board's assumptions, which this
+# project cannot live with: it does real flash erase/program for save
+# persistence, where the boot2/flash timing config has to be right.
 set(PICO_BOARD pimoroni_picosystem)
 
 # --- Pico SDK (external sibling checkout, same convention as before) ---

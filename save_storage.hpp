@@ -2,28 +2,22 @@
 #include <cstdint>
 #include <cstddef>
 
-// Flash-backed persistence for Polished Crystal's MBC3 cart RAM (the save
-// file). Real GBC carts have SRAM continuously backed by a coin cell, so
-// there's no discrete "save now" signal to hook -- this instead autosaves
-// periodically whenever the RAM has been written since the last save.
+// Flash-backed persistence for a game's cart RAM (the save file). Real
+// cartridges keep SRAM continuously backed by a coin cell, so there's no
+// discrete "save now" signal to hook -- this instead autosaves periodically
+// whenever the RAM has been written since the last save.
 //
-// Deliberate deviation from the plan's original InfoNES-derived design: that
-// called for a full device reboot after every flash write, following
-// InfoNES's own code comments about a second same-session write crashing.
-// pico-sdk's hardware_flash.h docs are explicit that the actual requirement
-// is just serialising against XIP flash reads on both cores during the
-// erase/program call (via multicore_lockout + disabling interrupts) --
-// execution can safely continue afterward, no reboot needed. Rebooting after
-// every autosave would reset the running game back to its title screen each
-// time, which is a bad tradeoff for a single continuously-played game with
-// no menu to return to. See save_storage.cpp for the guarded implementation.
+// No reboot is needed after a flash write, despite what some RP2040 ports do:
+// pico-sdk's hardware_flash.h docs are explicit that the requirement is just
+// serialising against XIP flash reads on both cores during the erase/program
+// call (via multicore_lockout + disabling interrupts) -- execution continues
+// safely afterward. Rebooting per autosave would drop the running game back
+// to its title screen. See save_storage.cpp for the guarded implementation.
 
 // Saves are double-buffered across two flash slots (A/B ping-pong): each
 // autosave writes the slot that is NOT currently newest, so a power-off during
 // the non-atomic erase+program can never destroy the last good save -- the
-// interrupted slot is simply rejected on load and the intact one is used. This
-// replaces an earlier single-slot design that could wipe the save if the device
-// was switched off mid-write.
+// interrupted slot is simply rejected on load and the intact one is used.
 
 // Each bootable ROM (see the generated rom_data.hpp's rom_catalog) gets its
 // own A/B slot pair, selected by `rom_save_slot` (that ROM's
@@ -110,10 +104,10 @@ bool save_storage_load_rtc(save_rtc_t &out);
 // it's dirty and the autosave interval has elapsed; otherwise returns
 // immediately or advances an in-progress save. The save is incremental --
 // at most ONE small flash op per call (a single 4KB sector erase, ~45ms, or a
-// 1KB page-program burst, ~3ms), each briefly pausing core1 (audio) and
-// interrupts. This replaced a synchronous whole-slot erase+program that froze
-// both cores for ~half a second, felt as a stutter a few seconds after
-// starting a game or saving in-game. The header (magic+CRC+seq) is written
+// page-program burst, ~1.4ms), each briefly pausing core1 (audio) and
+// interrupts -- doing the whole slot in one gulp instead freezes both cores
+// for ~half a second, felt as a stutter a few seconds after starting a game
+// or saving in-game. The header (magic+CRC+seq) is written
 // last as the commit record, so a power-off mid-save still falls back to the
 // previous good slot on load.
 void save_storage_poll(const uint8_t *cart_ram, size_t size);
@@ -132,7 +126,7 @@ bool save_storage_saving();
 // acceptable trade for a sector of flash.
 
 struct device_settings_t {
-	uint8_t brightness; // backlight percent, 10..100
+	uint8_t brightness; // backlight percent, BRIGHTNESS_MIN..100
 	uint8_t rtc_dow;    // staged RTC weekday, 0..6 (Sunday == 0)
 	uint8_t rtc_hour;   // 0..23
 	uint8_t rtc_min;    // 0..59

@@ -13,9 +13,8 @@ constexpr uint32_t AUTOSAVE_INTERVAL_MS = 3000; // default; see the SAVE
                                                 // INTERVAL setting
 
 // Each save slot reserves 9 flash sectors (36864 bytes): 1 sector for a small
-// header, 8 sectors (32768 bytes) for Polished Crystal's MBC3 save (4 banks x
-// 8KB, confirmed via constants/ram_constants.asm and the Milestone 2 host_test
-// harness).
+// header, 8 sectors (32768 bytes) for the cart RAM payload -- the 32KB
+// ceiling (4 banks x 8KB) that gen_rom_data.py enforces on every catalog ROM.
 constexpr uint32_t SLOT_SECTORS = 9;
 constexpr uint32_t SLOT_BYTES = SLOT_SECTORS * FLASH_SECTOR_SIZE;
 
@@ -84,12 +83,9 @@ constexpr uint32_t PROGRAM_CHUNK_BYTES = 2 * FLASH_PAGE_SIZE; // 512B, ~1.4ms ty
 constexpr uint32_t QUIET_POLLS_REQUIRED = 4;
 constexpr uint32_t QUIET_WAIT_MAX_MS = 2000;
 
-// This sits well past our own code+ROM (~2.17MB) and inside the linker script's
-// nominally-unused "FAT" region (see the plan's Open Risks) -- nothing else in
-// this build touches it. Note rom_save_slot 0's offset is unchanged from the
-// old single-ROM layout, so an existing Polished Crystal save written by a
-// previous build is still picked up on upgrade (its header reads back with
-// seq == 0, which load happily accepts as "the only valid slot").
+// Save regions live above the linker script's 15MB FLASH region (code +
+// ROMs), in the ~1MB at the top of the 16MB chip that nothing else in this
+// build touches.
 //
 // Each rom_save_slot (see the generated rom_data.hpp) gets its own RESERVED_BYTES_PER_ROM
 // region, stacked downward from the top of flash, so different ROMs' saves
@@ -102,8 +98,9 @@ uint32_t save_flash_offset() {
 
 // Sanity bound: MAX_ROM_SAVE_SLOTS worth of reservations must stay well clear
 // of the 15MB code+ROM region (memmap_picosystem.ld's FLASH). Comfortably
-// true today (288KB reserved vs. headroom below it) -- this just catches the
-// reservation ever being widened past what the chip has.
+// true today (14 slots x 72KB = ~1008KB, plus the settings sector, inside the
+// ~1MB above that region) -- this just catches the reservation ever being
+// widened past what the chip has.
 static_assert(MAX_ROM_SAVE_SLOTS * RESERVED_BYTES_PER_ROM < 4 * 1024 * 1024,
 	      "rom save reservation has grown into the FAT-region assumption above");
 
@@ -182,12 +179,11 @@ uint32_t prog_crc = 0;       // running CRC of the bytes actually programmed
 uint32_t pending_seq = 0;    // seq the in-flight save will commit with
 
 // Just the header page (256 bytes, flash_range_program()'s minimum
-// granularity) -- cart_ram is programmed directly from its own array below,
-// no staging copy needed. This used to be a combined 36KB
-// (header-sector + cart_ram-sectors) staging buffer; freeing that up is what
-// makes moving __gb_step_cpu (the ~25KB opcode dispatcher, see
-// core/walnut_cgb.h) into RAM affordable -- that's a much bigger win than
-// the copy this buffer used to avoid duplicating.
+// granularity) -- cart_ram is programmed directly from its own array, so no
+// staging copy is needed. Keeping this small is deliberate: a combined
+// header+payload staging buffer would cost 36KB of SRAM, and that budget is
+// spent instead on holding __gb_step_cpu (the ~25KB opcode dispatcher, see
+// core/walnut_cgb.h) in RAM, which is worth far more.
 uint8_t header_page[FLASH_PAGE_SIZE];
 
 uint32_t slot_offset(uint32_t slot) {
@@ -204,17 +200,17 @@ bool sector_is_blank(uint32_t off) {
 	return true;
 }
 
-// Pause core1 (if it's actually running -- it isn't while audio is
-// disabled, see main.cpp's ENABLE_SOUND) and disable our own interrupts
-// for the duration of the erase/program: required because flash is
-// unreadable (including for instruction fetch) on both cores while it's
-// being erased/programmed. multicore_lockout_start_blocking() blocks
-// forever waiting for an acknowledgement from core1 if core1 never
-// called multicore_lockout_victim_init() -- confirmed this exact hang:
-// core1 is only launched by audio_output_init(), which isn't called at
-// all with audio disabled, so an unconditional lockout call
-// froze the very first autosave. multicore_lockout_victim_is_initialized()
-// is pico-sdk's supported way to check before calling it.
+// Pause core1 (if it is actually running and registered as a lockout victim)
+// and disable our own interrupts for the duration of the erase/program:
+// required because flash is unreadable (including for instruction fetch) on
+// both cores while it's being erased/programmed.
+//
+// The guard is not optional. multicore_lockout_start_blocking() blocks
+// forever waiting for an acknowledgement from a core1 that never called
+// multicore_lockout_victim_init(), and flash writes really do happen before
+// main() launches core1 -- the boot menu's settings screen stores to flash
+// while core0 is still alone. multicore_lockout_victim_is_initialized() is
+// pico-sdk's supported way to check first.
 //
 // No reboot needed afterward: flash_range_erase/program restore XIP mode
 // themselves before returning (see hardware/flash.h's documented

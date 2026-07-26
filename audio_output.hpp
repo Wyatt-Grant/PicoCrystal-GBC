@@ -5,25 +5,21 @@
 // the SDK's voice()/play() single-tone ADSR synth entirely (it can't play
 // arbitrary PCM) and instead treating the AUDIO GPIO's PWM as a crude DAC:
 // a fixed-frequency PWM carrier has its duty cycle rewritten at the audio
-// sample rate from a double buffer. See the plan's Architecture > Audio
-// section for why.
+// sample rate from a double buffer.
 //
 // Playback is hardware-paced: a DMA channel, driven by a DMA DREQ timer at
 // the exact sample rate, streams duty-cycle words into the PWM compare
-// register. This replaced the original 30us repeating-alarm-per-sample
-// design, whose ~1.7% rate error (30us vs the true 30.52us period) drained
-// the buffer early every frame (a constant ~60Hz buzz as the output
-// flat-lined) and whose per-sample software IRQs both jittered audibly and
-// cost core1 ~549 interrupts per frame. See audio_output_core1_init() in
-// audio_output.cpp for the full rate-matching rationale.
+// register. Software pacing (a repeating per-sample alarm) is not good
+// enough here -- see audio_output_core1_init() in audio_output.cpp for the
+// rate-matching rationale and the two defects it avoids.
 //
 // Everything expensive runs on core1: PSG synthesis (minigb_apu's
 // audio_callback), the mono downmix + high-pass + soft-limit + duty
 // conversion (audio_output_render_frame), and the DMA completion IRQ.
 
 // Configures the AUDIO pin's PWM as a fixed-carrier DAC. Call once from
-// core0, after _init_hardware(). No longer launches core1 -- main.cpp owns
-// the core1 worker loop and calls audio_output_core1_init() from it.
+// core0, after _init_hardware(). Does not launch core1: main.cpp owns the
+// core1 worker loop and calls audio_output_core1_init() from it.
 void audio_output_init();
 
 // Claims the audio DMA channel + pacing timer and installs the completion
