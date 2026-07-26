@@ -50,6 +50,13 @@ static inline bool status_show_pct() {
 	return g_status_bar == STATUS_FPS_PCT || g_status_bar == STATUS_PCT;
 }
 static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREEN; }
+static inline bool menu_show_pct() {
+	return status_show_pct() || status_fullscreen();
+}
+// LED brightness cap (led_show_rgb()/led_show_battery() in the fenced range
+// call it); the value only reaches hardware, so any stub-consistent number
+// does here.
+static inline int led_brightness() { return 45 * g_brightness / 100; }
 
 // PicoSystem SDK color/hardware stubs for the RGB pseudo-theme path: hsv()
 // packs like the firmware's color_t (R 0-3, A 4-7, B 8-11, G 12-15, see
@@ -172,6 +179,13 @@ int main(int argc, char **argv) {
 	memset(_fb, 0, sizeof _fb);
 	draw_status_bar(60, 82);
 	snprintf(path, sizeof path, "%s/statusbar_icon.ppm", dir);
+	write_ppm(path);
+
+	// FULLSCREEN mode: no in-game header at all, but the menus keep their
+	// band *and* the "<n>%" (menu_show_pct()).
+	g_status_bar = STATUS_FULLSCREEN;
+	draw_boot_menu(1, 82);
+	snprintf(path, sizeof path, "%s/boot_fullscreen.ppm", dir);
 	write_ppm(path);
 
 	// A non-default theme with the THEME row selected -- every

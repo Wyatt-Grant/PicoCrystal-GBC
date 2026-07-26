@@ -358,6 +358,13 @@ static inline bool status_show_pct() {
 	return g_status_bar == STATUS_FPS_PCT || g_status_bar == STATUS_PCT;
 }
 static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREEN; }
+// Menu (boot picker / settings) header percentage. FULLSCREEN only drops the
+// *in-game* header, so it says nothing about what the menus should show -- the
+// menus keep their band and their "<n>%", same as the FPS-only default. ICON
+// is the one mode that deliberately hides the number everywhere.
+static inline bool menu_show_pct() {
+	return status_show_pct() || status_fullscreen();
+}
 
 // BOOT LAST GAME (settings menu row, persisted): when on, main() skips the
 // boot ROM picker and boots straight into the last-played game; holding B
@@ -379,20 +386,9 @@ static inline int led_brightness() {
 	return 45 * g_brightness / 100;
 }
 
-// The LED reports battery charge: a green->red gradient (green ~= full,
-// red ~= nearly empty) at the shared led_brightness() cap so it glows
-// rather than glares. The usable ~5..100 span maps to the gradient, blended
-// through yellow. Shared by the in-game run loop and the menus (boot ROM
-// picker, settings).
-static void led_show_battery(int level) {
-	if (level < 5)   level = 5;
-	if (level > 100) level = 100;
-	const int brightness = led_brightness();
-	int fill = (level - 5) * 100 / 95;   // 0 (empty) .. 100 (full)
-	led((100 - fill) * brightness / 100, // red rises as it drains
-	    fill * brightness / 100,         // green rises as it fills
-	    0);
-}
+// The LED reports battery charge in the same green/amber/red steps the
+// on-screen battery icon fills with -- see battery_color()/led_show_battery()
+// down with the icon drawing code.
 
 // Poll PicoSystem's 8 buttons and pack them into the GBC joypad byte (active
 // low, per JOYPAD_* in walnut_cgb.h). PicoSystem has no Start/Select of its
@@ -1048,12 +1044,56 @@ static void apply_mode(uint32_t dark) {
 	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
 }
 
-// Battery icon: a 17x13 rounded body outline plus a 3x5 terminal nub (20px
-// total), its interior filled proportionally to the charge level -- a fixed
-// green/yellow/red gradient, independent of the UI accent theme (including
+// Charge-state color, shared by the battery icon's fill and the power LED
+// (led_show_battery() below) so the two always agree at a glance -- a fixed
+// green -> amber -> red ramp, independent of the UI accent theme (including
 // the RGB pseudo-theme) so the charge state always reads the same way.
+//
+// The ramp is continuous in the charge level rather than a few coarse bands:
+// green at 100%, amber at the 50% pivot, red at empty, linearly interpolated
+// per channel in between. RGBA4444's 4-bit channels are what actually limit
+// the resolution -- the endpoints below are chosen so the moving channel
+// walks ~10 values per half (red 4->14 climbing 100..50%, green 11->2 falling
+// 50..0%), i.e. ~19 distinct colors across the range, well past the ~10 the
+// eye can tell apart on a 17x13 icon.
+constexpr color_t BATT_GREEN = status_rgb(4, 13, 8);  // 100%, the mint full-charge green
+constexpr color_t BATT_AMBER = status_rgb(14, 11, 1); // 50% pivot
+constexpr color_t BATT_RED   = status_rgb(14, 2, 1);  // empty
+
+// Per-channel lerp on the packed 4-bit channels: t/n of the way from a to b,
+// rounded. n is 50 (half the charge range) for both halves of the ramp.
+constexpr uint32_t batt_lerp4(uint32_t a, uint32_t b, uint32_t t, uint32_t n) {
+	return (a * (n - t) + b * t + n / 2) / n;
+}
+constexpr color_t batt_mix(color_t a, color_t b, uint32_t t, uint32_t n) {
+	return status_rgb(batt_lerp4(a & 0xF, b & 0xF, t, n),
+			  batt_lerp4((a >> 12) & 0xF, (b >> 12) & 0xF, t, n),
+			  batt_lerp4((a >> 8) & 0xF, (b >> 8) & 0xF, t, n));
+}
+constexpr color_t battery_color(uint32_t batt) {
+	return batt >= 100 ? BATT_GREEN
+	     : batt >= 50  ? batt_mix(BATT_AMBER, BATT_GREEN, batt - 50, 50)
+			   : batt_mix(BATT_RED, BATT_AMBER, batt, 50);
+}
+
+// The LED reports battery charge at the shared led_brightness() cap so it
+// glows rather than glares, unpacking battery_color()'s 4-bit channels the
+// same way led_show_rgb() unpacks the accent. Shared by the in-game run loop
+// and the menus (boot ROM picker, settings).
+static void led_show_battery(int level) {
+	if (level < 0)   level = 0;
+	if (level > 100) level = 100;
+	const color_t c = battery_color((uint32_t)level);
+	const int brightness = led_brightness();
+	led((c & 0xF) * brightness / 15,
+	    ((c >> 12) & 0xF) * brightness / 15,
+	    ((c >> 8) & 0xF) * brightness / 15);
+}
+
+// Battery icon: a 17x13 rounded body outline plus a 3x5 terminal nub (20px
+// total), its interior filled proportionally to the charge level in the
+// matching battery_color().
 constexpr int32_t BATT_ICON_W = 20;
-constexpr color_t BATT_GREEN = status_rgb(4, 13, 8); // >= 66%
 
 static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
 	for (int32_t i = 1; i < 16; i++) {
@@ -1069,9 +1109,7 @@ static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
 		*SCREEN->p(x + 18, y + i) = STATUS_GREY;
 		*SCREEN->p(x + 19, y + i) = STATUS_GREY;
 	}
-	color_t fill = batt >= 66 ? BATT_GREEN            // healthy
-		     : batt >= 11 ? status_rgb(13, 10, 2) // 11..65%
-				  : status_rgb(13, 3, 2);    // <= 10%
+	color_t fill = battery_color(batt);
 	int32_t fw = (int32_t)(batt * 13 + 50) / 100; // rounded, 0..13 -- leaves a
 							// 1px gap on both sides of
 							// the interior at full charge
@@ -1168,11 +1206,12 @@ static void draw_status_bar(uint32_t fps, uint32_t batt) {
 // Fills the whole screen with the panel color and draws the header band with
 // a green accent rule (the in-game FPS overlay draws its own grey-ruled band
 // directly via draw_header_band()). Menu headers follow the STATUS BAR mode's
-// percent choice just like the in-game header (and keep their band even in
-// FULLSCREEN mode -- only the in-game header disappears).
+// percent choice just like the in-game header, except in FULLSCREEN -- there
+// the menus keep both their band and the percentage (see menu_show_pct());
+// only the in-game header disappears.
 static void draw_menu_frame(const char *title, uint32_t batt) {
 	fill_rect(0, OFFSET_Y, SCREEN->w, SCREEN->h - OFFSET_Y, UI_CARD);
-	draw_header_band(title, batt, UI_ACCENT, status_show_pct());
+	draw_header_band(title, batt, UI_ACCENT, menu_show_pct());
 }
 
 // Dim, centered control hints along the bottom of the panel.
@@ -1502,7 +1541,7 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 	if (sel >= first + VISIBLE_ROWS)
 		first = sel - VISIBLE_ROWS + 1;
 
-	draw_menu_frame("BOOT", batt);
+	draw_menu_frame("SELECT A GAME", batt);
 
 	const uint32_t rows = total < VISIBLE_ROWS ? total : VISIBLE_ROWS;
 	for (uint32_t r = 0; r < rows; r++) {
