@@ -372,11 +372,11 @@ static uint8_t g_last_slot = 0xFF;
 // DAC) rings out before emulation starts. See nostalgic_boot_splash().
 static bool g_nostalgic_boot = true;
 
-// Shared LED brightness cap: ~20% at full backlight, scaled down with the
+// Shared LED brightness cap: ~45% at full backlight, scaled down with the
 // screen brightness setting so a dimmed screen gets a matching dim LED.
 // Used by every LED indicator (battery, RGB theme, flash-write blink).
 static inline int led_brightness() {
-	return 20 * g_brightness / 100;
+	return 45 * g_brightness / 100;
 }
 
 // The LED reports battery charge: a green->red gradient (green ~= full,
