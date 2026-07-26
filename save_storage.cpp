@@ -9,7 +9,8 @@
 namespace {
 
 constexpr uint32_t MAGIC = 0x50434352; // "PCCR"
-constexpr uint32_t AUTOSAVE_INTERVAL_MS = 3000;
+constexpr uint32_t AUTOSAVE_INTERVAL_MS = 3000; // default; see the SAVE
+                                                // INTERVAL setting
 
 // Each save slot reserves 9 flash sectors (36864 bytes): 1 sector for a small
 // header, 8 sectors (32768 bytes) for Polished Crystal's MBC3 save (4 banks x
@@ -57,7 +58,8 @@ constexpr uint32_t RESERVED_BYTES_PER_ROM = NUM_SLOTS * SLOT_BYTES;
 //                        pre-erased by the previous session) this phase is a
 //                        no-op.
 //   ERASING -> READY     slot fully blank, waiting for the autosave to be due.
-//   READY -> PROGRAMMING interval elapsed and the game has gone quiet (no
+//   READY -> PROGRAMMING the SAVE INTERVAL elapsed (or a manual save was
+//                        requested) and the game has gone quiet (no
 //                        cart-RAM writes for QUIET_POLLS_REQUIRED polls, so we
 //                        don't snapshot mid-save-burst; capped by
 //                        QUIET_WAIT_MAX_MS for titles that use SRAM as work
@@ -156,6 +158,13 @@ uint32_t crc32(const uint8_t *data, size_t len) {
 
 volatile bool dirty = false;       // unsaved cart-RAM changes exist
 volatile bool write_pulse = false; // any cart-RAM write since the last poll
+
+// Minimum spacing between commits (SAVE INTERVAL setting), or
+// SAVE_INTERVAL_MANUAL for "only when asked". The whole point is flash wear:
+// a title that writes cart RAM every frame would otherwise commit as fast as
+// the state machine can cycle.
+uint32_t interval_ms = AUTOSAVE_INTERVAL_MS;
+volatile bool save_requested = false; // manual/forced commit pending
 uint32_t last_save_ms = 0;
 uint32_t current_seq = 0; // seq of the newest valid save on flash (0 == none)
 uint32_t next_slot = 0;   // slot index the next autosave will erase+program
@@ -334,8 +343,20 @@ void __not_in_flash_func(save_storage_mark_dirty)() {
 	write_pulse = true;
 }
 
+void save_storage_set_interval_ms(uint32_t ms) {
+	interval_ms = ms;
+}
+
+void save_storage_request_save() {
+	save_requested = true;
+}
+
 bool save_storage_saving() {
 	return state == save_state_t::PROGRAMMING;
+}
+
+bool save_storage_pending() {
+	return save_requested && dirty;
 }
 
 void save_storage_poll(const uint8_t *cart_ram, size_t size) {
@@ -350,8 +371,12 @@ void save_storage_poll(const uint8_t *cart_ram, size_t size) {
 
 	switch (state) {
 	case save_state_t::IDLE:
-		if (!dirty)
+		if (!dirty) {
+			// Nothing to commit -- drop any manual request rather
+			// than letting it fire at the next unrelated write.
+			save_requested = false;
 			return;
+		}
 		// A save is coming: start pre-erasing the target slot now so the
 		// erase cost is spread out (and usually long done) before the
 		// autosave interval expires. Only reached once dirty is set, so a
@@ -401,8 +426,17 @@ void save_storage_poll(const uint8_t *cart_ram, size_t size) {
 		[[fallthrough]];
 
 	case save_state_t::READY:
-		if (!dirty || now - last_save_ms < AUTOSAVE_INTERVAL_MS)
+		if (!dirty)
 			return;
+		// The wear throttle. In MANUAL mode nothing but an explicit
+		// request gets past here, so the slot can sit pre-erased and
+		// ready indefinitely; otherwise the interval spaces commits
+		// out no matter how continuously the game writes cart RAM.
+		if (!save_requested) {
+			if (interval_ms == SAVE_INTERVAL_MANUAL ||
+			    now - last_save_ms < interval_ms)
+				return;
+		}
 		if (quiet_polls < QUIET_POLLS_REQUIRED) {
 			// The game is actively writing SRAM (likely mid save-burst);
 			// wait for it to finish so the snapshot is frame-consistent --
@@ -420,6 +454,7 @@ void save_storage_poll(const uint8_t *cart_ram, size_t size) {
 		// Cleared before programming: any write during the multi-frame
 		// program phase re-sets it, queueing a fresh save one interval later.
 		dirty = false;
+		save_requested = false;
 		prog_offset = 0;
 		prog_crc = 0xFFFFFFFFu;
 		state = save_state_t::PROGRAMMING;

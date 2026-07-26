@@ -16,10 +16,13 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
 - Boot menu for multiple ROMs; per-game flash save regions
 - Automatic battery-backed-save persistence: autosaves to flash a few
   seconds after the game writes cart RAM, double-buffered so a mid-save
-  power-off can never destroy the last good save
+  power-off can never destroy the last good save. The interval is
+  configurable (3s–120s, to limit flash wear on games that write cart RAM
+  constantly), or set it to MANUAL and save on demand with **X+B**
 - MBC3 real-time clock, persisted across power cycles (freeze-while-off,
   adjustable in the settings menu)
-- Settings menu (Y+X): brightness, volume, vsync, FPS/battery overlays, clock
+- Settings menu (Y+X): brightness, volume, vsync, FPS/battery overlays,
+  save interval, clock
 
 **No ROMs are included** and none can be distributed with this repository.
 Use your own cartridge dumps or freely licensed homebrew.

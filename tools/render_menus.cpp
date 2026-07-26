@@ -93,6 +93,11 @@ static uint8_t g_rtc_min = 32;
 static bool g_vsync = true; // render the settings screen with the toggle ON
 static bool g_boot_last = true; // BOOT LAST GAME row rendered ON
 static bool g_nostalgic_boot = true; // NOSTALGIC BOOT row rendered ON
+// SAVE INTERVAL row: rendered at the 10S option (a plain seconds value; index
+// 0 would render "MANUAL" instead).
+static const uint16_t SAVE_INTERVAL_SECS[] = { 0, 3, 5, 10, 30, 60, 120 };
+static uint8_t g_save_interval = 3;
+static inline bool save_interval_manual() { return g_save_interval == 0; }
 static bool g_te_pace = true;             // render the VSYNC row TE-locked...
 static uint32_t g_te_period_us = 16667;   // ...showing "60HZ"
 
@@ -156,6 +161,14 @@ int main(int argc, char **argv) {
 	draw_settings_menu(SET_ROW_HOUR, 82);
 	snprintf(path, sizeof path, "%s/settings_clock.ppm", dir);
 	write_ppm(path);
+
+	// SAVE INTERVAL on MANUAL with its row selected -- the one row that
+	// swaps the hint line (for the B+Y save chord).
+	g_save_interval = 0;
+	draw_settings_menu(SET_ROW_SAVE, 82);
+	snprintf(path, sizeof path, "%s/settings_manual.ppm", dir);
+	write_ppm(path);
+	g_save_interval = 3;
 
 	memset(_fb, 0, sizeof _fb);
 	draw_status_bar(60, 82);

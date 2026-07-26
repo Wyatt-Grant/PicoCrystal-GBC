@@ -379,6 +379,25 @@ static uint8_t g_last_slot = 0xFF;
 // DAC) rings out before emulation starts. See nostalgic_boot_splash().
 static bool g_nostalgic_boot = true;
 
+// SAVE INTERVAL (settings menu row, persisted): the minimum spacing between
+// flash commits of the save file -- the wear throttle described in
+// save_storage.hpp. Index 0 is MANUAL (commit only on the in-game X+B chord);
+// the rest are the seconds a commit is held off for, however continuously the
+// game writes cart RAM. 3s is the historical fixed behaviour and stays the
+// default.
+static const uint16_t SAVE_INTERVAL_SECS[] = { 0, 3, 5, 10, 30, 60, 120 };
+constexpr uint32_t SAVE_INTERVAL_COUNT =
+	sizeof(SAVE_INTERVAL_SECS) / sizeof(SAVE_INTERVAL_SECS[0]);
+constexpr uint8_t SAVE_INTERVAL_DEFAULT = 1; // 3 seconds
+static uint8_t g_save_interval = SAVE_INTERVAL_DEFAULT;
+static inline bool save_interval_manual() { return g_save_interval == 0; }
+
+// Push g_save_interval down into the save state machine. Called on boot (after
+// the stored settings load) and on every edit of the row.
+static void apply_save_interval() {
+	save_storage_set_interval_ms(SAVE_INTERVAL_SECS[g_save_interval] * 1000u);
+}
+
 // Shared LED brightness cap: ~45% at full backlight, scaled down with the
 // screen brightness setting so a dimmed screen gets a matching dim LED.
 // Used by every LED indicator (battery, RGB theme, flash-write blink).
@@ -816,7 +835,7 @@ static void menu_text(int32_t x, int32_t y, const char *s, color_t col,
 
 // 7x7 1-bit icons for the menu rows, drawn at 2x (14x14) by draw_icon().
 // MSB is the leftmost pixel.
-enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY, ICON_SWATCHES, ICON_CONTRAST };
+enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY, ICON_SWATCHES, ICON_CONTRAST, ICON_DISK };
 
 static const uint8_t _icons7[][7] = {
 	{ 0b1111110,  // ICON_CART -- GB cartridge, notched top-right corner
@@ -889,6 +908,13 @@ static const uint8_t _icons7[][7] = {
 	  0b1111001,
 	  0b0111010,
 	  0b0011100 },
+	{ 0b1111111,  // ICON_DISK -- floppy disk, shutter above, label below
+	  0b1001101,  // (SAVE INTERVAL row)
+	  0b1001101,
+	  0b1111111,
+	  0b1000001,
+	  0b1011101,
+	  0b1111111 },
 };
 
 static void draw_icon(int32_t x, int32_t y, icon_t icon, color_t col) {
@@ -1327,6 +1353,7 @@ enum settings_row_t : uint32_t {
 #endif
 	SET_ROW_VSYNC,
 	SET_ROW_STATUS,
+	SET_ROW_SAVE,
 	SET_ROW_BOOT_LAST,
 	SET_ROW_NOSTALGIC,
 	SET_ROW_THEME,
@@ -1347,10 +1374,14 @@ constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 
 // Every setting row is a single text line now -- BRIGHT/VOLUME carry a compact
 // inline meter bar on the same line rather than a full-width bar underneath --
-// so all rows share one height. Uniform 18px keeps the RTC clock section below
+// so all rows share one height. Uniform 16px keeps the RTC clock section below
 // clear of draw_menu_hints()'s fixed y=226 (with rows through APPEARANCE the
-// clock anchors at y=178 and the digits end at ~y=212).
-constexpr int32_t ROW_H = 18;
+// clock anchors at y=178 and the digits end at ~y=212). Was 18px until the
+// SAVE INTERVAL row was added: nine rows at 16px land the clock exactly where
+// eight at 18px did. The 10px glyphs leave a 6px gap, and the selection pill
+// (20px tall, drawn from y-4) fills its slot without touching the neighbouring
+// row's text.
+constexpr int32_t ROW_H = 16;
 
 static int32_t settings_row_y(uint32_t row) {
 	return OFFSET_Y + 10 + (int32_t)row * ROW_H;
@@ -1459,6 +1490,20 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	};
 	draw_value_row(SET_ROW_STATUS, sel, ICON_BATTERY, "STATUS BAR",
 		       STATUS_MODE_NAMES[g_status_bar]);
+	// SAVE INTERVAL: how often the save file may be committed to flash --
+	// the wear throttle (see save_storage.hpp). MANUAL commits nothing on
+	// its own; the X+B chord in-game does it instead.
+	{
+		char iv[6]; // "120S" + NUL
+		const char *value = "MANUAL";
+		if (!save_interval_manual()) {
+			int32_t n = status_fmt_uint(iv, SAVE_INTERVAL_SECS[g_save_interval]);
+			iv[n] = 'S';
+			iv[n + 1] = '\0';
+			value = iv;
+		}
+		draw_value_row(SET_ROW_SAVE, sel, ICON_DISK, "SAVE INTERVAL", value);
+	}
 	// BOOT LAST GAME: ON skips the boot ROM picker and auto-boots the
 	// last-played game (hold B during power-on to get the picker back).
 	draw_toggle_row(SET_ROW_BOOT_LAST, sel, ICON_CART, "BOOT LAST GAME",
@@ -1517,7 +1562,11 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 		}
 	}
 
-	draw_menu_hints("< > ADJUST   B BACK");
+	// MANUAL is the one setting whose meaning isn't obvious from the row --
+	// surface the chord that actually writes the save while it's selected.
+	draw_menu_hints(sel == SET_ROW_SAVE && save_interval_manual()
+			? "< > ADJUST   X+B SAVES"
+			: "< > ADJUST   B BACK");
 }
 
 // Small solid triangle, apex up or down -- the boot menu's scroll indicator.
@@ -1541,7 +1590,7 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 	if (sel >= first + VISIBLE_ROWS)
 		first = sel - VISIBLE_ROWS + 1;
 
-	draw_menu_frame("SELECT A GAME", batt);
+	draw_menu_frame("PICK A GAME", batt);
 
 	const uint32_t rows = total < VISIBLE_ROWS ? total : VISIBLE_ROWS;
 	for (uint32_t r = 0; r < rows; r++) {
@@ -1625,6 +1674,7 @@ static void store_device_settings() {
 		(uint8_t)(g_boot_last ? 1 : 0),
 		g_last_slot,
 		(uint8_t)(g_nostalgic_boot ? 1 : 0),
+		g_save_interval,
 	};
 	save_storage_settings_store(ds);
 }
@@ -1644,6 +1694,11 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		g_status_bar = (uint8_t)((g_status_bar + STATUS_MODE_COUNT +
 					  (uint32_t)dir) % STATUS_MODE_COUNT);
 		apply_game_offset();
+		return;
+	case SET_ROW_SAVE: // < > cycle MANUAL/3S/../120S, wrapping
+		g_save_interval = (uint8_t)((g_save_interval + SAVE_INTERVAL_COUNT +
+					     (uint32_t)dir) % SAVE_INTERVAL_COUNT);
+		apply_save_interval();
 		return;
 	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
 	case SET_ROW_NOSTALGIC: g_nostalgic_boot = !g_nostalgic_boot; return;
@@ -1747,8 +1802,13 @@ static void settings_menu(bool in_game) {
 	// again this session -- otherwise the older RTC record wins on next
 	// boot and undoes the edit. One extra 32KB autosave cycle, only on an
 	// actual clock edit.
-	if (in_game && g_rtc_edited)
+	// The request forces the commit past the SAVE INTERVAL throttle -- with
+	// a long interval (or MANUAL) the edit would otherwise sit unwritten
+	// until the next scheduled save, which in MANUAL may never come.
+	if (in_game && g_rtc_edited) {
 		save_storage_mark_dirty();
+		save_storage_request_save();
+	}
 	g_rtc_edited = false;
 
 	if (g_settings_edited) {
@@ -2125,10 +2185,15 @@ int main() {
 			g_boot_last = ds.boot_last != 0;
 			g_last_slot = ds.last_slot;
 			g_nostalgic_boot = ds.nostalgic_boot != 0;
+			g_save_interval = ds.save_interval < SAVE_INTERVAL_COUNT
+					? ds.save_interval : SAVE_INTERVAL_DEFAULT;
 #if ENABLE_SOUND
 			audio_output_set_volume(ds.volume); // clamps internally
 #endif
 		}
+		// Apply unconditionally -- the defaults matter just as much as a
+		// restored value, since the state machine starts at its own.
+		apply_save_interval();
 	}
 
 	// With the restored vsync setting and the TE measurement both in hand,
@@ -2270,8 +2335,8 @@ int main() {
 	int battery_count = BATTERY_UPDATE_FRAMES;
 
 	// Flash-commit LED blink state (see the blink block in the loop).
-	bool saving_shown = false;       // commit window seen last frame (edge)
-	uint64_t saving_hold_until = 0;  // keeps the blink up past a fast commit
+	constexpr uint64_t SAVING_HOLD_US = 2000000;
+	uint64_t saving_hold_until = 0;  // blink runs while now < this
 	bool saving_led = false;         // save blink owns the LED
 
 #if ENABLE_LCD
@@ -2361,6 +2426,25 @@ int main() {
 			fps_frames = 0;
 		}
 #endif
+		// X+B chord (either button completing it): commit the save to
+		// flash now. Only bound in MANUAL mode -- on every other setting
+		// the interval already writes on its own, and X+B is an ordinary
+		// in-game combination (Start + B) that shouldn't touch flash
+		// behind the player's back. Unlike the Y+X menu chord this one
+		// isn't swallowed: both buttons still reach the game below, so a
+		// save can be triggered without disturbing what's on screen. The
+		// LED's save blink is the acknowledgement -- armed here rather
+		// than left to the commit window alone, so a press lands visibly
+		// even when there is nothing dirty to write (the request is then a
+		// no-op, and a silent one would be indistinguishable from a chord
+		// that didn't register).
+		if (save_interval_manual() &&
+		    button(picosystem::X) && button(picosystem::B) &&
+		    (pressed(picosystem::X) || pressed(picosystem::B))) {
+			save_storage_request_save();
+			saving_hold_until = time_us_64() + SAVING_HOLD_US;
+		}
+
 		update_joypad();
 
 		gb_run_frame_dualfetch(&gb);
@@ -2384,15 +2468,18 @@ int main() {
 
 		save_storage_poll(cart_ram, sizeof(cart_ram));
 
-		// Track the autosave commit window for the LED blink below. The
-		// commit programs ~1s of 512B chunks; hold the window open a beat
-		// past the write so the blink is easy to notice.
-		constexpr uint64_t SAVING_HOLD_US = 2000000;
+		// Track the commit window for the LED blink below. The commit
+		// programs ~1s of 512B chunks; the hold slides along with it and
+		// keeps the window open a beat past the last one, so the blink is
+		// easy to notice however short the write was. A *requested* save
+		// counts as active before any flash op starts (see
+		// save_storage_pending) -- otherwise a manual X+B save waiting on
+		// the slot pre-erase or the quiet gate would sit dark for a second
+		// or two, reading as "the chord did nothing".
 		uint64_t saving_now = time_us_64();
-		if (save_storage_saving() && !saving_shown)
+		if (save_storage_saving() || save_storage_pending())
 			saving_hold_until = saving_now + SAVING_HOLD_US;
-		bool saving = save_storage_saving() || saving_now < saving_hold_until;
-		saving_shown = saving;
+		bool saving = saving_now < saving_hold_until;
 
 		if (++battery_count >= BATTERY_UPDATE_FRAMES) {
 			battery_count = 0;

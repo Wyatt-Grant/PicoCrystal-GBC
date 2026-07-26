@@ -50,6 +50,39 @@ void save_storage_load(uint8_t *cart_ram, size_t size, uint32_t rom_save_slot);
 // Call from gb_cart_ram_write() to mark the save data as changed.
 void save_storage_mark_dirty();
 
+// --- Autosave pacing ---------------------------------------------------------
+// Flash endurance is finite (~100k erase cycles per sector) and some titles
+// treat cart RAM as scratch work RAM, dirtying it continuously -- with a fixed
+// 3s interval that is a commit (one full slot erase + program) every 3 seconds
+// for as long as the game runs. This throttle is the "buffer": no matter how
+// often the game writes, at most one flash commit per `ms`. The A/B ping-pong
+// halves the per-sector rate again (each slot is erased every other commit).
+//
+// `ms` == SAVE_INTERVAL_MANUAL disables autosaving entirely: dirty data waits
+// (the target slot is still pre-erased, so the commit itself is quick) until
+// save_storage_request_save() is called -- main.cpp binds that to the in-game
+// X+B chord. Manual mode means an unsaved session is lost on power-off, and it
+// widens the window in which only one of the two slots holds a valid save; both
+// are the deliberate trade for touching flash only when asked.
+constexpr uint32_t SAVE_INTERVAL_MANUAL = 0;
+
+// Sets the minimum spacing between flash commits. Safe to call any time
+// (including mid-save -- it only gates the start of the next commit).
+void save_storage_set_interval_ms(uint32_t ms);
+
+// True from a save_storage_request_save() until that commit actually starts
+// programming -- the requested write is still waiting on the slot pre-erase or
+// on the game to go quiet. main.cpp keeps the LED's save blink up across this
+// window, so a manual save is signposted from the moment it's asked for rather
+// than only once the flash writes begin (which can be a second or two later).
+// False when there was nothing dirty to write, i.e. the request is a no-op.
+bool save_storage_pending();
+
+// Requests a commit at the next opportunity, bypassing the interval. Used by
+// the manual-save chord and by edits that must reach flash immediately (an
+// in-game RTC change). No-ops when there is nothing dirty to write.
+void save_storage_request_save();
+
 // --- MBC3 RTC persistence ------------------------------------------------
 // The MBC3 clock is snapshotted into each committed save (freeze-while-off:
 // the board has no battery-backed RTC, so on boot the clock resumes exactly
@@ -86,8 +119,9 @@ bool save_storage_load_rtc(save_rtc_t &out);
 void save_storage_poll(const uint8_t *cart_ram, size_t size);
 
 // True while save_storage_poll() is mid-commit (programming the new snapshot
-// to flash, before the header/commit record lands). The in-game status bar
-// shows a SAVING indicator for the duration.
+// to flash, before the header/commit record lands). main.cpp blinks the LED
+// blue/magenta for the duration, so a power-off during the write window is
+// always signposted.
 bool save_storage_saving();
 
 // --- Device settings ---------------------------------------------------------
@@ -122,6 +156,11 @@ struct device_settings_t {
 			      // 0xFF = no game booted yet (main.cpp g_last_slot)
 	uint8_t nostalgic_boot; // 0/1: Game Boy-style boot splash + chime when a
 			      // game launches (main.cpp g_nostalgic_boot)
+	uint8_t save_interval; // index into main.cpp's SAVE_INTERVAL_SECS
+			      // (g_save_interval): 0 = MANUAL, then 3/5/10/30/
+			      // 60/120 seconds. Stored as the index, not the
+			      // seconds, so the option list can be retuned
+			      // without reinterpreting stored records.
 };
 // Growing this struct invalidates the previously stored record (the CRC is
 // computed over the whole payload), so settings reset to defaults once on
