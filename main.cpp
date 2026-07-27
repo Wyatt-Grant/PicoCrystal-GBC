@@ -1102,7 +1102,15 @@ constexpr color_t battery_color(uint32_t batt) {
 // glows rather than glares, unpacking battery_color()'s 4-bit channels onto
 // the LED's 0-100 per-channel scale. Shared by the in-game run loop and the
 // menus (boot ROM picker, settings).
+//
+// FS BATTERY is the exception: that mode already shows the charge as the
+// on-screen meter, so the LED stays dark and is left free for the
+// flash-commit blink (which overrides this everywhere anyway).
 static void led_show_battery(int level) {
+	if (status_fs_battery()) {
+		led(0, 0, 0);
+		return;
+	}
 	if (level < 0)   level = 0;
 	if (level > 100) level = 100;
 	const color_t c = battery_color((uint32_t)level);
@@ -1975,6 +1983,11 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		g_status_bar = (uint8_t)((g_status_bar + STATUS_MODE_COUNT +
 					  (uint32_t)dir) % STATUS_MODE_COUNT);
 		apply_game_offset();
+		// Kill the battery LED the instant FS BATTERY is selected rather
+		// than waiting up to a battery-poll interval for it to go dark.
+		// (Switching back out restores the gradient on the next poll.)
+		if (status_fs_battery())
+			led(0, 0, 0);
 		return;
 	case SET_ROW_SAVE: // < > cycle MANUAL/3S/../120S, wrapping
 		g_save_interval = (uint8_t)((g_save_interval + SAVE_INTERVAL_COUNT +
