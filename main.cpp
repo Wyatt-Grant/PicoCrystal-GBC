@@ -2488,7 +2488,7 @@ static void nostalgic_boot_splash() {
 					     // crest rides through the top of the
 					     // screen before dropping back into place
 	constexpr int32_t WAVE_AMP = 30;     // px of ripple travel on top of that
-	constexpr int32_t WAVE_SQUASH = 140; // 8.8: vertical scale swing, the 3D turn
+	constexpr int32_t WAVE_SQUASH = 110; // 8.8: vertical scale swing, the 3D turn
 	constexpr int32_t WAVE_HZ_256 = 280; // ripple phase per second, 1/256 turns
 	constexpr int32_t WAVE_K = 3;        // ...and per source column
 
@@ -2510,15 +2510,30 @@ static void nostalgic_boot_splash() {
 		return UI_THEMES[(g_theme + k) % THEME_COUNT].accent;
 	};
 
-	// Where source column `rx` sits horizontally for a given wavefront --
-	// its own x plus the leftward lead-in it has yet to give back. Called
-	// for rx and rx+1 so a column can be stretched to meet its neighbor.
-	auto col_x = [&](int32_t rx, int32_t front) {
-		int32_t a = ((front - rx) * 256) / SPREAD; // arrival, 8.8
+	// Perspective: a column enters ZOOM_IN times life size -- as if it were
+	// nearer the camera -- and shrinks to 1x as the wave passes it. 8.8,
+	// eased on the same (1-a)^2 as the rest of the arrival.
+	constexpr int32_t ZOOM_IN = 600; // ~2.3x
+	auto col_zoom = [](int32_t ease) { return 256 + ((ZOOM_IN - 256) * ease >> 8); };
+
+	// Where source column `rx` sits horizontally for a wavefront at `frontq`
+	// (8.8 columns). The zoom has to show up here too or the letters shear:
+	// magnifying a column vertically without widening its spacing to match
+	// shreds it. Spacing is col_zoom() per column, so x is that integrated
+	// from the right -- which works out to a lead that decays as (1-a)^3 and
+	// is gone by the time a column lands. ZOOM_LEAD is the integral's
+	// constant: how far right the newest column rides. Then the leftward
+	// lead-in it has yet to give back. Called for rx and rx+1 so a column
+	// can be stretched to meet its neighbor.
+	constexpr int32_t ZOOM_LEAD = SCALE * (ZOOM_IN - 256) * SPREAD / (3 * 256);
+	auto col_x = [&](int32_t rx, int32_t frontq) {
+		int32_t a = (frontq - (rx << 8)) / SPREAD; // arrival, 8.8
 		a = a < 0 ? 0 : (a > 256 ? 256 : a);
 		int32_t inv = 256 - a;
-		int32_t ease = inv * inv >> 8; // (1-a)^2, 8.8
-		return logo_x + rx * SCALE - (ease * FLY_DX >> 8);
+		int32_t ease = inv * inv >> 8;        // (1-a)^2, 8.8
+		int32_t lead = ease * inv >> 8;       // (1-a)^3, 8.8
+		return logo_x + rx * SCALE + (ZOOM_LEAD * lead >> 8)
+		     - (ease * FLY_DX >> 8);
 	};
 
 	// One splash frame at elapsed time `el`: field, byline, then the logo
@@ -2529,7 +2544,9 @@ static void nostalgic_boot_splash() {
 		draw_bitmap_1bpp((240 - BOOT_BYLINE_W) / 2, 214,
 				 BOOT_BYLINE_W, BOOT_BYLINE_H, 1, boot_byline_bits, ink);
 
-		int32_t front = (int32_t)((uint64_t)(BOOT_LOGO_W + SPREAD) * el / FLY_MS);
+		// Wavefront in 8.8 columns: the zoom is anchored to it, so a
+		// whole-column step would visibly jerk the magnified letters.
+		int32_t frontq = (int32_t)((uint64_t)(BOOT_LOGO_W + SPREAD) * 256 * el / FLY_MS);
 		int32_t wave_t = (int32_t)((uint64_t)el * WAVE_HZ_256 / 1000);
 		// Global fade-out of the ripple, finishing before the band does
 		// so the gradient comes to rest on an already still logo.
@@ -2539,7 +2556,8 @@ static void nostalgic_boot_splash() {
 			     : (int32_t)((uint64_t)BAND_TRAVEL * (el - FLY_MS) / BAND_MS);
 
 		for (int32_t rx = 0; rx < BOOT_LOGO_W; rx++) {
-			int32_t a = ((front - rx) * 256) / SPREAD;
+			int32_t d = frontq - (rx << 8); // 8.8 columns behind the front
+			int32_t a = d / SPREAD;
 			a = a < 0 ? 0 : (a > 256 ? 256 : a);
 			if (a == 0)
 				continue; // the wave has not reached this column yet
@@ -2548,7 +2566,7 @@ static void nostalgic_boot_splash() {
 
 			// Ripple envelope: decays over a window ~2.4x the arrival
 			// stagger, so a column keeps swaying briefly after it lands.
-			int32_t env = 256 - ((front - rx) * 256) / (SPREAD * 12 / 5);
+			int32_t env = 256 - d / (SPREAD * 12 / 5);
 			env = env < 0 ? 0 : (env > 256 ? 256 : env);
 			env = env * fade >> 8;
 			int32_t ph = wave_t - rx * WAVE_K;
@@ -2558,17 +2576,23 @@ static void nostalgic_boot_splash() {
 			int32_t cy = logo_mid_y + (ease * FLY_DY >> 8)
 				   - (WAVE_OVER * boot_sin(a >> 1) >> 8)
 				   + ((WAVE_AMP * boot_sin(ph) >> 8) * env >> 8);
+			// Vertical scale: the ripple's squash times the perspective
+			// zoom, so a column that is still oversized is oversized in
+			// both axes -- the horizontal half falls out of col_x.
 			int32_t vs = 256 + ((WAVE_SQUASH * boot_cos(ph) >> 8) * env >> 8);
+			vs = vs * col_zoom(ease) >> 8;
+			if (vs > 660) // the two stack; past ~2.6x the crest
+				vs = 660; // stops reading as letters at all
 
 			// Stretch each column to meet its neighbor: mid-flight the
 			// per-column x offsets pull apart, and the smear that fills
 			// the gap is what sells the depth.
-			int32_t cx = col_x(rx, front);
-			int32_t cw = col_x(rx + 1, front) - cx;
+			int32_t cx = col_x(rx, frontq);
+			int32_t cw = col_x(rx + 1, frontq) - cx;
 			if (cw < SCALE)
 				cw = SCALE;
-			else if (cw > 8)
-				cw = 8;
+			else if (cw > 16)
+				cw = 16;
 
 			// Where this column is on the band's run: ink until the band
 			// reaches it, then one stop per accent, ending on the
