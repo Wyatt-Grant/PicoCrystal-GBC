@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
 	// A non-default theme with the THEME row selected -- every
 	// accent-tinted element should recolor.
 	g_status_bar = STATUS_FPS_PCT;
-	apply_theme(9); // GRAPE
+	apply_theme(13); // GRAPE
 	draw_settings_menu(SET_ROW_THEME, 82);
 	snprintf(path, sizeof path, "%s/settings_grape.ppm", dir);
 	write_ppm(path);

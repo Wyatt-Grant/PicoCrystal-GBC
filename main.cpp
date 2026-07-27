@@ -962,24 +962,34 @@ struct ui_theme_t {
 
 // Ordered by hue so < > walks the wheel rather than jumping around it: greens
 // -> yellows -> oranges/browns -> reds/pinks -> purples -> blues -> cyans, with
-// the two cream neutrals last. Every accent has to stay legible as *text* on
-// both the dark and the light card, so nothing here goes very dark -- the
-// low-value flavors (cocoa, taro) are pitched as milky tints instead.
+// the low-saturation neutrals last. Every accent has to stay legible as *text*
+// on both the dark and the light card, so nothing here goes very dark -- the
+// low-value flavors (cocoa, taro) are pitched as milky tints instead -- and
+// nothing goes near-white either, or it vanishes on the light card (vanilla is
+// already at that edge, so frost is pitched a few steps below it).
 constexpr ui_theme_t UI_THEMES[] = {
 	{ "MINT",      status_rgb( 4, 13,  8) }, // the classic green
+	{ "KIWI",      status_rgb( 6, 13,  4) }, // true green, between mint and matcha
 	{ "MATCHA",    status_rgb( 9, 13,  4) }, // yellow-green
 	{ "LEMON",     status_rgb(14, 13,  3) },
+	{ "HONEY",     status_rgb(15, 11,  3) }, // amber, the gap between lemon and peach
 	{ "PEACH",     status_rgb(15,  9,  4) },
 	{ "COCOA",     status_rgb(12,  8,  6) }, // desaturated orange = milk chocolate
+	{ "CHERRY",    status_rgb(15,  4,  5) }, // true red; berry sits on its pink side
 	{ "BERRY",     status_rgb(15,  4,  7) },
 	{ "BUBBLEGUM", status_rgb(15,  7, 11) },
 	{ "COTTON",    status_rgb(15, 10, 13) }, // candy floss: bubblegum, milkier
+	{ "PLUM",      status_rgb(13,  5, 14) }, // magenta, between cotton and taro
 	{ "TARO",      status_rgb(12,  9, 15) }, // pale violet
 	{ "GRAPE",     status_rgb( 9,  5, 15) },
+	{ "SLUSHIE",   status_rgb( 5,  7, 15) }, // indigo, between grape and blueberry
 	{ "BLUEBERRY", status_rgb( 4, 10, 15) },
 	{ "ICING",     status_rgb( 9, 13, 15) }, // pale sky blue
+	{ "LAGOON",    status_rgb( 4, 13, 15) }, // bright cyan, between icing and soda
 	{ "SODA",      status_rgb( 4, 14, 13) }, // teal, the one hue nothing else covered
 	{ "VANILLA",   status_rgb(14, 13, 10) },
+	{ "FROST",     status_rgb(10, 12, 14) }, // cool neutral to vanilla's warm one
+
 };
 constexpr uint32_t THEME_COUNT = sizeof(UI_THEMES) / sizeof(UI_THEMES[0]);
 
@@ -2219,21 +2229,27 @@ static uint32_t rom_select() {
 
 // ---------------------------------------------------------------------
 // NOSTALGIC BOOT splash (settings toggle g_nostalgic_boot): a Game Boy
-// Color-style boot screen played after a ROM is picked and before
+// Advance-style boot screen played after a ROM is picked and before
 // core1/emulation starts. The PicoCrystal logo -- bold italic sans in the
-// GBC "GAME BOY" lettering style -- scrolls down from off-screen to center,
-// lands, sweeps its GBC color blocks across the letters once before
-// settling, and the boot chime rings out through the PWM DAC -- the whole
-// sequence tuned to ~2.5s. The chime is synthesized rather than played back
-// as sampled PCM; see audio_output_play_boot_jingle() for the two notes and
-// where their parameters come from. "By Wyatt" sits in small print at the
-// bottom, where the GBC put "Nintendo". Follows the APPEARANCE setting:
-// black-on-white in light mode, white-on-black in dark (the letter colors
-// read on either field).
+// GBC "GAME BOY" lettering style -- flies in on a wave that runs from the
+// bottom left to the right: each column of the logo swoops up from below,
+// staggered so the arrival reads as a wavefront, and rides a travelling
+// ripple that stretches and squashes it vertically, so the flat bitmap reads
+// as a ribbon turning in 3D. Once it has landed a band of every UI accent
+// (settings THEME row) sweeps left to right through the letters, each column
+// running the whole wheel before settling on its own color, and the boot
+// chime rings out through the PWM DAC -- the whole sequence tuned to ~2.5s,
+// the same length as the descent-and-sweep it replaced. The chime is
+// synthesized rather than played back as sampled PCM; see
+// audio_output_play_boot_jingle() for the two notes and where their
+// parameters come from. "By Wyatt" sits in small print at the bottom, where
+// the GBC put "Nintendo". Follows the APPEARANCE setting: black-on-white in
+// light mode, white-on-black in dark (the letter colors read on either
+// field).
 //
 // Bitmaps are 1-bpp MSB-first. The logo is stored as one layer per color, so
-// each layer is a plain single-color blit and the color sweep is just a
-// rotation of the palette across the five layers.
+// each layer is a plain single-color pass and the per-column wave geometry is
+// recomputed (cheaply, from an integer sine table) rather than buffered.
 // ---------------------------------------------------------------------
 
 constexpr int32_t BOOT_LOGO_W = 81, BOOT_LOGO_H = 15;
@@ -2318,7 +2334,7 @@ static const uint8_t boot_logo_y_bits[165] = { // "l" -- yellow, the Y-tail nod
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-// The five color layers in sweep order, and their settled GBC-style colors.
+// The five color layers, left to right, and their settled GBC-style colors.
 constexpr int32_t BOOT_LOGO_LAYERS = 5;
 static const uint8_t *const boot_logo_layer_bits[BOOT_LOGO_LAYERS] = {
 	boot_logo_b_bits, boot_logo_g_bits, boot_logo_m_bits,
@@ -2364,40 +2380,225 @@ static void draw_bitmap_1bpp(int32_t x, int32_t y, int32_t w, int32_t h,
 	}
 }
 
+// Clipped fill for the flying logo: columns swing off the left edge and below
+// the bottom one on their way in, and fill_rect's raw SCREEN->p() writes would
+// land out of bounds there.
+static void fill_rect_clipped(int32_t x, int32_t y, int32_t w, int32_t h,
+			      color_t c) {
+	if (x < 0) {
+		w += x;
+		x = 0;
+	}
+	if (y < 0) {
+		h += y;
+		y = 0;
+	}
+	if (x + w > SCREEN->w)
+		w = SCREEN->w - x;
+	if (y + h > SCREEN->h)
+		h = SCREEN->h - y;
+	if (w > 0 && h > 0)
+		fill_rect(x, y, w, h, c);
+}
+
+// Integer sine for the boot wave: `a` is the angle in 1/256ths of a turn,
+// result is sin * 256. A quarter-turn table folded four ways -- no FPU here,
+// and the splash asks for a few hundred of these per frame.
+static int32_t boot_sin(int32_t a) {
+	static const int16_t q[65] = {
+		0, 6, 13, 19, 25, 31, 38, 44, 50, 56, 62, 68,
+		74, 80, 86, 92, 98, 104, 109, 115, 121, 126, 132, 137,
+		142, 147, 152, 157, 162, 167, 172, 177, 181, 185, 190, 194,
+		198, 202, 206, 209, 213, 216, 220, 223, 226, 229, 231, 234,
+		237, 239, 241, 243, 245, 247, 248, 250, 251, 252, 253, 254,
+		255, 255, 256, 256, 256,
+	};
+	a &= 255;
+	if (a < 64)
+		return q[a];
+	if (a < 128)
+		return q[128 - a];
+	if (a < 192)
+		return -q[a - 128];
+	return -q[256 - a];
+}
+static int32_t boot_cos(int32_t a) { return boot_sin(a + 64); }
+
+// Per-channel mix of two RGBA4444 colors, `t` 0-256 from `a` to `b`. The
+// splash gradient is the only place that needs it; the UI palette elsewhere is
+// all fixed swatches.
+static color_t boot_mix(color_t a, color_t b, int32_t t) {
+	auto ch = [&](int32_t sh) {
+		int32_t x = (a >> sh) & 0xF, y = (b >> sh) & 0xF;
+		return (uint32_t)(x + ((y - x) * t >> 8)) & 0xF;
+	};
+	return status_rgb(ch(0), ch(12), ch(8));
+}
+
 static void nostalgic_boot_splash() {
 	// Field and small print follow the APPEARANCE setting: black-on-white in
 	// light mode (the GBC's own look), white-on-black in dark.
 	const bool dark = g_dark_mode != 0;
 	const color_t bg = dark ? status_rgb(0, 0, 0) : status_rgb(15, 15, 15);
 	const color_t ink = dark ? status_rgb(15, 15, 15) : status_rgb(1, 1, 1);
-	// The settled letter colors, one per layer: cyan "Pic", mint "oC",
-	// purple "ry", pink "sta", pale-yellow "l" -- the vaporwave palette
-	// (#01cdfe #05ffa1 #b967ff #ff71ce #fffb96), quantized to 4-bit
-	// channels. All bright enough to read on either field.
-	const color_t layer_colors[BOOT_LOGO_LAYERS] = {
+	// The settled coloring: the vaporwave palette (#01cdfe #05ffa1 #b967ff
+	// #ff71ce #fffb96, quantized to 4-bit channels) as evenly spaced stops
+	// of a left-to-right gradient rather than one flat color per layer --
+	// the letters ramp through it instead of changing color in five hard
+	// steps. All five stops are bright enough to read on either field.
+	constexpr int32_t GRAD_STOPS = 5;
+	const color_t grad_stops[GRAD_STOPS] = {
 		status_rgb(0, 12, 15), // cyan   #01cdfe
 		status_rgb(0, 15, 9),  // mint   #05ffa1
 		status_rgb(11, 6, 15), // purple #b967ff
 		status_rgb(15, 7, 12), // pink   #ff71ce
 		status_rgb(15, 15, 9), // yellow #fffb96
 	};
+	// Gradient color for source column `rx`: the stop pair it falls between,
+	// mixed per 4-bit channel.
+	auto grad_at = [&](int32_t rx) {
+		int32_t s = rx * (GRAD_STOPS - 1) * 256 / (BOOT_LOGO_W - 1);
+		int32_t i = s >> 8, f = s & 255;
+		if (i >= GRAD_STOPS - 1)
+			return grad_stops[GRAD_STOPS - 1];
+		return boot_mix(grad_stops[i], grad_stops[i + 1], f);
+	};
 	constexpr int32_t SCALE = 2;
 	constexpr int32_t logo_x = (240 - BOOT_LOGO_W * SCALE) / 2;
 	constexpr int32_t logo_land_y = (240 - BOOT_LOGO_H * SCALE) / 2;
-	constexpr int32_t logo_start_y = -BOOT_LOGO_H * SCALE;
-	constexpr uint32_t SCROLL_MS = 900; // brisker than the original's descent
-					    // to land the whole sequence at ~2.5s
+	constexpr int32_t logo_mid_y = logo_land_y + BOOT_LOGO_H * SCALE / 2;
 
-	// One splash frame: field, byline, logo at `y` -- every layer in `ink`
-	// while `cols` is null (the scroll phase runs monochrome, as the original
-	// did), each layer in its own color otherwise -- then present it.
-	auto draw_frame = [&](int32_t y, const color_t *cols) {
+	// Two phases, adding up to the ~1.3s the descent-and-sweep used to take
+	// before the chime: the wave carries the logo in, then the accent band
+	// runs through it.
+	constexpr uint32_t FLY_MS = 760, BAND_MS = 540;
+
+	// Wavefront: a source-column index that travels left to right, reaching
+	// the right edge as FLY_MS ends and continuing past it (which damps the
+	// residual ripple in the same left-to-right order). SPREAD columns are
+	// mid-flight at any moment -- wide enough that the diagonal reads.
+	constexpr int32_t SPREAD = 50;
+	constexpr int32_t FLY_DY = 64; // px below its landing spot a column starts
+	constexpr int32_t FLY_DX = 26; // ...and px to the left, so it arrives from
+				       // the bottom *left*. Both stay modest: a
+				       // long drop fans the in-flight columns so
+				       // far apart that the letters stop reading.
+	constexpr int32_t WAVE_OVER = 42;    // px a column overshoots *above* its
+					     // landing line mid-flight, so the wave
+					     // crest rides through the top of the
+					     // screen before dropping back into place
+	constexpr int32_t WAVE_AMP = 30;     // px of ripple travel on top of that
+	constexpr int32_t WAVE_SQUASH = 140; // 8.8: vertical scale swing, the 3D turn
+	constexpr int32_t WAVE_HZ_256 = 280; // ripple phase per second, 1/256 turns
+	constexpr int32_t WAVE_K = 3;        // ...and per source column
+
+	// Accent band: each column runs the whole THEME wheel, starting from the
+	// user's own theme, before coming to rest on the gradient. The band is
+	// BAND_W source columns per accent and sweeps far enough (one extra stop
+	// for the lead-in out of ink) that the last column reaches the gradient
+	// exactly as BAND_MS ends.
+	constexpr int32_t BAND_W = 10;
+	constexpr int32_t BAND_TRAVEL = ((int32_t)THEME_COUNT + 1) * BAND_W + BOOT_LOGO_W;
+
+	// Stop `k` of that run for column `rx`: ink before the band, then the
+	// accents from the user's theme onward, then the settled gradient.
+	auto band_stop = [&](int32_t k, int32_t rx) -> color_t {
+		if (k < 0)
+			return ink;
+		if (k >= (int32_t)THEME_COUNT)
+			return grad_at(rx);
+		return UI_THEMES[(g_theme + k) % THEME_COUNT].accent;
+	};
+
+	// Where source column `rx` sits horizontally for a given wavefront --
+	// its own x plus the leftward lead-in it has yet to give back. Called
+	// for rx and rx+1 so a column can be stretched to meet its neighbor.
+	auto col_x = [&](int32_t rx, int32_t front) {
+		int32_t a = ((front - rx) * 256) / SPREAD; // arrival, 8.8
+		a = a < 0 ? 0 : (a > 256 ? 256 : a);
+		int32_t inv = 256 - a;
+		int32_t ease = inv * inv >> 8; // (1-a)^2, 8.8
+		return logo_x + rx * SCALE - (ease * FLY_DX >> 8);
+	};
+
+	// One splash frame at elapsed time `el`: field, byline, then the logo
+	// column by column -- each with its own position, vertical scale and
+	// color, all derived from where the wave and the accent band have got to.
+	auto draw_frame = [&](uint32_t el) {
 		fill_rect(0, 0, SCREEN->w, SCREEN->h, bg);
 		draw_bitmap_1bpp((240 - BOOT_BYLINE_W) / 2, 214,
 				 BOOT_BYLINE_W, BOOT_BYLINE_H, 1, boot_byline_bits, ink);
-		for (int32_t i = 0; i < BOOT_LOGO_LAYERS; i++)
-			draw_bitmap_1bpp(logo_x, y, BOOT_LOGO_W, BOOT_LOGO_H, SCALE,
-					 boot_logo_layer_bits[i], cols ? cols[i] : ink);
+
+		int32_t front = (int32_t)((uint64_t)(BOOT_LOGO_W + SPREAD) * el / FLY_MS);
+		int32_t wave_t = (int32_t)((uint64_t)el * WAVE_HZ_256 / 1000);
+		// Global fade-out of the ripple, finishing before the band does
+		// so the gradient comes to rest on an already still logo.
+		int32_t tail = (int32_t)(FLY_MS + BAND_MS) - 120 - (int32_t)el;
+		int32_t fade = tail >= 400 ? 256 : (tail <= 0 ? 0 : tail * 256 / 400);
+		int32_t band = el < FLY_MS ? -1
+			     : (int32_t)((uint64_t)BAND_TRAVEL * (el - FLY_MS) / BAND_MS);
+
+		for (int32_t rx = 0; rx < BOOT_LOGO_W; rx++) {
+			int32_t a = ((front - rx) * 256) / SPREAD;
+			a = a < 0 ? 0 : (a > 256 ? 256 : a);
+			if (a == 0)
+				continue; // the wave has not reached this column yet
+			int32_t inv = 256 - a;
+			int32_t ease = inv * inv >> 8;
+
+			// Ripple envelope: decays over a window ~2.4x the arrival
+			// stagger, so a column keeps swaying briefly after it lands.
+			int32_t env = 256 - ((front - rx) * 256) / (SPREAD * 12 / 5);
+			env = env < 0 ? 0 : (env > 256 ? 256 : env);
+			env = env * fade >> 8;
+			int32_t ph = wave_t - rx * WAVE_K;
+			// Flight path: up from below (ease), arcing past the
+			// landing line and back down (a half sine over the
+			// column's own arrival), plus the travelling ripple.
+			int32_t cy = logo_mid_y + (ease * FLY_DY >> 8)
+				   - (WAVE_OVER * boot_sin(a >> 1) >> 8)
+				   + ((WAVE_AMP * boot_sin(ph) >> 8) * env >> 8);
+			int32_t vs = 256 + ((WAVE_SQUASH * boot_cos(ph) >> 8) * env >> 8);
+
+			// Stretch each column to meet its neighbor: mid-flight the
+			// per-column x offsets pull apart, and the smear that fills
+			// the gap is what sells the depth.
+			int32_t cx = col_x(rx, front);
+			int32_t cw = col_x(rx + 1, front) - cx;
+			if (cw < SCALE)
+				cw = SCALE;
+			else if (cw > 8)
+				cw = 8;
+
+			// Where this column is on the band's run: ink until the band
+			// reaches it, then one stop per accent, ending on the
+			// gradient. Adjacent stops are mixed rather than swapped, so
+			// what travels through the letters is a continuous ribbon of
+			// hue that comes to rest on the gradient.
+			color_t c = ink;
+			if (band >= 0) {
+				int32_t d = band - rx + BAND_W; // -1 stop of ink lead-in
+				if (d >= 0) {
+					int32_t k = d / BAND_W - 1;
+					c = boot_mix(band_stop(k, rx), band_stop(k + 1, rx),
+						     (d % BAND_W) * 256 / BAND_W);
+				}
+			}
+
+			for (int32_t i = 0; i < BOOT_LOGO_LAYERS; i++) {
+				const uint8_t *bits = boot_logo_layer_bits[i];
+				int32_t stride = (BOOT_LOGO_W + 7) / 8;
+				for (int32_t ry = 0; ry < BOOT_LOGO_H; ry++) {
+					if (!(bits[ry * stride + rx / 8] & (0x80 >> (rx & 7))))
+						continue;
+					// Row span under the column's vertical scale,
+					// measured out from the logo's midline.
+					int32_t y0 = cy + (((2 * ry - BOOT_LOGO_H) * SCALE * vs) >> 9);
+					int32_t y1 = cy + (((2 * (ry + 1) - BOOT_LOGO_H) * SCALE * vs) >> 9);
+					fill_rect_clipped(cx, y0, cw, y1 > y0 ? y1 - y0 : 1, c);
+				}
+			}
+		}
 		_flip();
 		while (_in_flip)
 			tight_loop_contents();
@@ -2406,24 +2607,12 @@ static void nostalgic_boot_splash() {
 	uint32_t t0 = time();
 	for (;;) {
 		uint32_t el = time() - t0;
-		int32_t y = el >= SCROLL_MS ? logo_land_y
-			  : logo_start_y + (int32_t)((uint64_t)(logo_land_y - logo_start_y) * el / SCROLL_MS);
-		draw_frame(y, nullptr);
-		if (el >= SCROLL_MS)
+		if (el >= FLY_MS + BAND_MS)
 			break;
-		sleep(8);
+		draw_frame(el);
+		sleep(4);
 	}
-
-	// Landing flourish: sweep the color blocks across the letters -- each
-	// step hands every layer its neighbor's color -- for one full turn,
-	// ending on the canonical assignment (k == 0).
-	for (int32_t k = BOOT_LOGO_LAYERS; k >= 0; k--) {
-		color_t cols[BOOT_LOGO_LAYERS];
-		for (int32_t i = 0; i < BOOT_LOGO_LAYERS; i++)
-			cols[i] = layer_colors[(i + k) % BOOT_LOGO_LAYERS];
-		draw_frame(logo_land_y, cols);
-		sleep(65);
-	}
+	draw_frame(FLY_MS + BAND_MS); // settled: the gradient, held for the chime
 
 	// Colors settled -- ring the chime: the boot ROM's own "ba-ding",
 	// emulated from the APU register writes in gbc_bios.bin (see
