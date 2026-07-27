@@ -102,13 +102,16 @@ the chosen accent, so any theme works either way:
 </p>
 
 The MBC3 real-time clock gets its own screen off the settings list: an analog
-face over a segmented DAY/HR/MIN readout, `<` `>` to pick a field and up/down
+face over a segmented DAY/HR/MIN readout with small seconds beside it, `<` `>`
+to pick a field and up/down
 to spin it. The STATUS BAR setting can drop the header entirely for a
-letterboxed fullscreen canvas:
+letterboxed fullscreen canvas -- or, in FS BATTERY, trade it for a 2px battery
+meter running the full width of the screen's top edge:
 
 <p align="center">
   <img src="screenshots/clock.png"              alt="Setting the real-time clock" width="32%">
   <img src="screenshots/in-game-fullscreen.png" alt="Fullscreen mode, no status bar" width="32%">
+  <img src="screenshots/in-game-fs-battery.png" alt="FS battery mode, a 2px battery meter across the top of the screen" width="32%">
 </p>
 
 > Screenshots are generated on the host, not photographed off the panel:

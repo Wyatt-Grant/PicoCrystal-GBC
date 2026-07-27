@@ -331,12 +331,15 @@ static void apply_audio_pacing() {
 // conveying the level. The percent choice also applies to the boot/settings
 // menu headers. FULLSCREEN drops the in-game header entirely and centers the
 // scaled GBC frame vertically (see g_game_offset_y); menus keep their band.
+// FS BATTERY is FULLSCREEN plus a 2px-tall battery meter spanning the whole
+// width of the top letterbox band (see draw_fs_battery_bar).
 enum status_bar_mode_t : uint8_t {
 	STATUS_FPS_PCT,
 	STATUS_FPS,
 	STATUS_PCT,
 	STATUS_ICON,
 	STATUS_FULLSCREEN,
+	STATUS_FS_BATTERY,
 	STATUS_MODE_COUNT,
 };
 static uint8_t g_status_bar = STATUS_FPS_PCT;
@@ -344,7 +347,11 @@ static inline bool status_show_fps() { return g_status_bar <= STATUS_FPS; }
 static inline bool status_show_pct() {
 	return g_status_bar == STATUS_FPS_PCT || g_status_bar == STATUS_PCT;
 }
-static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREEN; }
+// True for every mode that drops the in-game header band and centers the game
+// frame -- FULLSCREEN and FS BATTERY alike (the latter's 2px meter lives inside
+// the letterbox the centering creates, not in a band of its own).
+static inline bool status_fullscreen() { return g_status_bar >= STATUS_FULLSCREEN; }
+static inline bool status_fs_battery() { return g_status_bar == STATUS_FS_BATTERY; }
 // Menu (boot picker / settings) header percentage. FULLSCREEN only drops the
 // *in-game* header, so it says nothing about what the menus should show -- the
 // menus keep their band and their "<n>%", same as the FPS-only default. ICON
@@ -1186,6 +1193,23 @@ static void draw_status_bar(uint32_t fps, uint32_t batt) {
 	}
 }
 
+// FS BATTERY's meter: the top 2 rows of the screen become one screen-wide
+// battery gauge, filled from the left in the same battery_color() ramp the
+// icon uses. It sits in the 12px letterbox FULLSCREEN centering leaves above
+// the game frame, so like the header band it can't collide with core1's
+// scanline writes. The unfilled remainder uses the fixed dark STATUS_RULE
+// rather than the theme's UI_TRACK -- the backdrop here is the black
+// letterbox, and light mode's near-white track would read as a stray bright
+// bar across the top of the screen.
+constexpr int32_t FS_BATT_BAR_H = 2;
+static void draw_fs_battery_bar(uint32_t batt) {
+	if (batt > 100)
+		batt = 100;
+	int32_t fw = (int32_t)(batt * SCREEN->w + 50) / 100;
+	fill_rect(0, 0, fw, FS_BATT_BAR_H, battery_color(batt));
+	fill_rect(fw, 0, SCREEN->w - fw, FS_BATT_BAR_H, STATUS_RULE);
+}
+
 // ---------------------------------------------------------------------
 // Menus: boot-time ROM picker + settings screen -- full-screen dark panels
 // under the shared header band, with dim control hints along the bottom.
@@ -1260,10 +1284,17 @@ struct menu_battery_poll {
 static uint8_t g_rtc_dow = 0;  // 0..6, Sunday == 0
 static uint8_t g_rtc_hour = 0; // 0..23
 static uint8_t g_rtc_min = 0;  // 0..59
+// Seconds are staged like the rest but deliberately NOT persisted with them:
+// adding a field to device_settings_t invalidates every stored record (CRC
+// over the whole payload), which is a poor trade for second-precision on a
+// seed that only ever applies to a save with no RTC record of its own.
+// A boot with no persisted RTC record therefore starts at :00.
+static uint8_t g_rtc_sec = 0;  // 0..59
 
 static uint64_t g_rtc_last_us = 0; // wall-clock baseline for rtc_host_tick()
 
 static void rtc_apply_to_gb() {
+	gb.rtc_real.reg.sec = g_rtc_sec;
 	gb.rtc_real.reg.min = g_rtc_min;
 	gb.rtc_real.reg.hour = g_rtc_hour;
 	gb.rtc_real.reg.yday = g_rtc_dow;
@@ -1294,6 +1325,41 @@ static void rtc_host_tick() {
 		gb.counter.rtc_count -= 1000000;
 		gb_rtc_tick_second(&gb);
 	}
+}
+
+// Before a game boots there is no MBC3 clock to tick (gb_init() hasn't run),
+// so the staged g_rtc_* would sit frozen at whatever flash restored for as
+// long as the boot menu's settings/clock screens are open. Advance them off
+// the same wall clock rtc_host_tick() uses, so the readout ticks there too --
+// and so a clock set at the boot menu is still right when a game finally
+// starts. Whole seconds only; the remainder stays in the baseline.
+static uint64_t g_rtc_stage_last_us = 0;
+
+// Restart the staged second: once at boot to anchor the baseline, and on a
+// pre-boot edit, mirroring rtc_apply_to_gb()'s reset of the sub-second
+// remainder. Deliberately NOT called when a menu opens -- the baseline runs
+// free from boot, so time that passes with no menu on screen is caught up the
+// next time one is.
+static void rtc_stage_tick_reset() { g_rtc_stage_last_us = time_us_64(); }
+
+static void rtc_stage_tick() {
+	uint64_t now = time_us_64();
+	uint64_t elapsed = now - g_rtc_stage_last_us;
+	if (elapsed < 1000000)
+		return;
+	uint32_t secs = (uint32_t)(elapsed / 1000000);
+	g_rtc_stage_last_us += (uint64_t)secs * 1000000;
+	// Roll the whole staged value as one second-of-week counter rather than
+	// carrying field by field -- the weekday is the day counter's only
+	// meaning here, so wrapping at 7 days is the correct wrap.
+	constexpr uint32_t WEEK = 7 * 24 * 60 * 60;
+	uint32_t t = (((uint32_t)g_rtc_dow * 24 + g_rtc_hour) * 60 + g_rtc_min) * 60 +
+		     g_rtc_sec;
+	t = (t + secs) % WEEK;
+	g_rtc_sec = (uint8_t)(t % 60);
+	g_rtc_min = (uint8_t)((t / 60) % 60);
+	g_rtc_hour = (uint8_t)((t / 3600) % 24);
+	g_rtc_dow = (uint8_t)(t / 86400);
 }
 
 // Snapshot source for the RTC record committed with each autosave (see
@@ -1331,6 +1397,7 @@ enum clock_field_t : uint32_t {
 	CLK_ROW_DOW,
 	CLK_ROW_HOUR,
 	CLK_ROW_MIN,
+	CLK_ROW_SEC,
 	CLK_ROW_COUNT,
 };
 
@@ -1452,10 +1519,11 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 		draw_toggle_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", g_vsync);
 	}
 	// STATUS BAR: what the in-game header shows -- FPS and/or battery % text
-	// (the icon always shows), just the icon, or FULLSCREEN (no header, game
-	// frame centered). The percent choice also drives the menu headers.
+	// (the icon always shows), just the icon, FULLSCREEN (no header, game
+	// frame centered) or FS BATTERY (fullscreen plus a 2px screen-wide
+	// battery meter). The percent choice also drives the menu headers.
 	static const char *const STATUS_MODE_NAMES[STATUS_MODE_COUNT] = {
-		"FPS+PCT", "FPS", "PERCENT", "ICON", "FULLSCREEN",
+		"FPS+PCT", "FPS", "PERCENT", "ICON", "FULLSCREEN", "FS BATTERY",
 	};
 	draw_value_row(SET_ROW_STATUS, sel, ICON_STATUSBAR, "STATUS BAR",
 		       STATUS_MODE_NAMES[g_status_bar]);
@@ -1630,6 +1698,10 @@ static void draw_clock_face(int32_t cx, int32_t cy, int32_t r, uint32_t field) {
 
 	// Hands last, over the windows. The hour hand carries the minutes as a
 	// fifth of an hour, so it sits between the ticks instead of snapping.
+	// The seconds hand is thin and dim under the other two (a sweep hand,
+	// not a reading), reaching nearly to the ticks.
+	draw_hand(cx, cy, g_rtc_sec, r - 8, 1,
+		  field == CLK_ROW_SEC ? UI_ACCENT : STATUS_GREY);
 	draw_hand(cx, cy, (g_rtc_hour % 12) * 5 + g_rtc_min / 12, r - 26, 3,
 		  field == CLK_ROW_HOUR ? UI_ACCENT : UI_BRIGHT);
 	draw_hand(cx, cy, g_rtc_min, r - 12, 2,
@@ -1646,29 +1718,22 @@ static void draw_group_pill(int32_t x, int32_t y, int32_t w, int32_t h) {
 }
 
 // The clock editor: an analog face over DOW : HH : MM as a big segmented
-// display, a small caption above each group and up/down arrows flanking the
-// selected one. < > walk the groups, UP/DOWN adjust the selected value -- the
-// arrows are drawn where the D-pad presses them, and the dial's matching hand
-// (or its weekday window) goes accent as it moves. Its own screen since the
-// settings list outgrew hosting it inline.
+// display, with seconds trailing it at half size the way a watch puts small
+// seconds off to the side -- four groups at CLK_SCALE would need 15 cells
+// (240px, the whole screen edge to edge), and seconds are the field you read
+// rather than the one you read at a glance. A small caption sits above each
+// group and up/down arrows flank the selected one. < > walk the groups,
+// UP/DOWN adjust the selected value -- the arrows are drawn where the D-pad
+// presses them, and the dial's matching hand (or its weekday window) goes
+// accent as it moves. Its own screen since the settings list outgrew hosting
+// it inline.
 static void draw_clock_menu(uint32_t field, uint32_t batt) {
 	draw_menu_frame("CLOCK", batt);
 
-	char buf[8];
+	char buf[12];
 	status_fmt_uint_pad(buf, g_rtc_hour, 2);
 	status_fmt_uint_pad(buf + 4, g_rtc_min, 2);
-
-	struct {
-		const char *text; // pre-rendered group text (weekday name / digits)
-		const char *label;
-		int32_t label_len;
-		int32_t glyphs;
-		uint32_t field;
-	} grp[3] = {
-		{ RTC_DOW_NAMES[g_rtc_dow], "DAY", 3, 3, CLK_ROW_DOW  },
-		{ buf,                      "HR",  2, 2, CLK_ROW_HOUR },
-		{ buf + 4,                  "MIN", 3, 2, CLK_ROW_MIN  },
-	};
+	status_fmt_uint_pad(buf + 8, g_rtc_sec, 2);
 
 	// Face on top, readout under it. The stack below the dial is fixed:
 	// captions at 146, up arrows at 162, the 20px digits at 175 (their pill
@@ -1679,26 +1744,63 @@ static void draw_clock_menu(uint32_t field, uint32_t batt) {
 	constexpr int32_t gy = 146;      // group captions
 	constexpr int32_t dy = 175;      // big glyphs
 	constexpr int32_t ARROW_UP = 162, ARROW_DN = 207;
+	// Seconds: half scale, sitting on the big digits' baseline (dy + 20).
+	constexpr int32_t SEC_SCALE = CLK_SCALE / 2;
+	constexpr int32_t SEC_ADV = CLK_ADV / 2;
+	constexpr int32_t SEC_Y = dy + 5 * (CLK_SCALE - SEC_SCALE);
+	constexpr int32_t SEC_GAP = 6; // breathing room after the big MM
+
 	draw_clock_face(SCREEN->w / 2, 84, 52, field);
 
-	int32_t x = (SCREEN->w - text_w(9, CLK_SCALE, CLK_ADV)) / 2;
-	for (int32_t i = 0; i < 3; i++) {
+	struct group_t {
+		const char *text; // pre-rendered group text (weekday name / digits)
+		const char *label;
+		int32_t label_len;
+		int32_t glyphs;
+		int32_t scale;
+		int32_t adv;
+		int32_t y;
+		uint32_t field;
+	};
+	const group_t grp[4] = {
+		{ RTC_DOW_NAMES[g_rtc_dow], "DAY", 3, 3, CLK_SCALE, CLK_ADV, dy,
+		  CLK_ROW_DOW },
+		{ buf,     "HR",  2, 2, CLK_SCALE, CLK_ADV, dy,     CLK_ROW_HOUR },
+		{ buf + 4, "MIN", 3, 2, CLK_SCALE, CLK_ADV, dy,     CLK_ROW_MIN  },
+		{ buf + 8, "SEC", 3, 2, SEC_SCALE, SEC_ADV, SEC_Y,  CLK_ROW_SEC  },
+	};
+
+	// Total run: the 9 big cells (DOW : HH : MM), then the gap and the
+	// seconds' 3 small cells (: SS), centred as one block.
+	int32_t x = (SCREEN->w - (text_w(9, CLK_SCALE, CLK_ADV) + SEC_GAP +
+				  text_w(3, SEC_SCALE, SEC_ADV))) / 2;
+	for (int32_t i = 0; i < 4; i++) {
 		bool is_sel = (grp[i].field == field);
-		int32_t gw = text_w(grp[i].glyphs, CLK_SCALE, CLK_ADV);
+		int32_t gw = text_w(grp[i].glyphs, grp[i].scale, grp[i].adv);
+		int32_t gh = 5 * grp[i].scale;
+		int32_t pad = grp[i].scale + 2; // pill inset, to scale
 		if (is_sel) {
-			draw_group_pill(x - 6, dy - 5, gw + 12, 30);
+			draw_group_pill(x - pad, grp[i].y - 5, gw + 2 * pad,
+					gh + 10);
 			int32_t ax = x + gw / 2;
 			draw_scroll_arrow(ax, ARROW_UP, false, UI_ACCENT, 4);
 			draw_scroll_arrow(ax, ARROW_DN, true, UI_ACCENT, 4);
 		}
 		menu_text(x + (gw - text_w(grp[i].label_len)) / 2, gy, grp[i].label,
 			  is_sel ? UI_ACCENT : STATUS_DIM, 2, STATUS_GLYPH_ADV);
-		menu_text(x, dy, grp[i].text, is_sel ? UI_ACCENT : UI_BRIGHT,
-			  CLK_SCALE, CLK_ADV);
-		x += grp[i].glyphs * CLK_ADV;
-		if (i < 2) {
-			menu_text(x, dy, ":", STATUS_DIM, CLK_SCALE, CLK_ADV);
-			x += CLK_ADV;
+		menu_text(x, grp[i].y, grp[i].text, is_sel ? UI_ACCENT : UI_BRIGHT,
+			  grp[i].scale, grp[i].adv);
+		x += grp[i].glyphs * grp[i].adv;
+		if (i < 3) {
+			// The separator before SEC is drawn at the smaller
+			// scale, on the small group's baseline.
+			int32_t ss = (i == 2) ? SEC_SCALE : CLK_SCALE;
+			int32_t sa = (i == 2) ? SEC_ADV : CLK_ADV;
+			if (i == 2)
+				x += SEC_GAP;
+			menu_text(x, (i == 2) ? SEC_Y : dy, ":", STATUS_DIM,
+				  ss, sa);
+			x += sa;
 		}
 	}
 
@@ -1855,11 +1957,14 @@ static void clock_step(uint32_t field, int32_t dir, bool in_game) {
 	case CLK_ROW_DOW:  g_rtc_dow  = (uint8_t)((g_rtc_dow + 7 + dir) % 7);    break;
 	case CLK_ROW_HOUR: g_rtc_hour = (uint8_t)((g_rtc_hour + 24 + dir) % 24); break;
 	case CLK_ROW_MIN:  g_rtc_min  = (uint8_t)((g_rtc_min + 60 + dir) % 60);  break;
+	case CLK_ROW_SEC:  g_rtc_sec  = (uint8_t)((g_rtc_sec + 60 + dir) % 60);  break;
 	}
 	g_settings_edited = true;
 	g_rtc_edited = true;
 	if (in_game)
 		rtc_apply_to_gb();
+	else
+		rtc_stage_tick_reset(); // a set restarts the second here too
 }
 
 // Stage the live MBC3 clock into the g_rtc_* globals the menus display and
@@ -1872,6 +1977,7 @@ static void rtc_stage_from_gb() {
 				((uint16_t)(gb.rtc_real.reg.high & 1) << 8))) % 7);
 	g_rtc_hour = gb.rtc_real.reg.hour;
 	g_rtc_min = gb.rtc_real.reg.min;
+	g_rtc_sec = gb.rtc_real.reg.sec;
 }
 
 // One input sample, shared by both modal menu loops.
@@ -1967,6 +2073,8 @@ static void clock_menu(bool in_game) {
 
 		if (in_game)
 			menu_pause_tick();
+		else
+			rtc_stage_tick(); // no MBC3 clock yet -- tick the staging
 
 		draw_clock_menu(field, batt.poll());
 		_flip();
@@ -2023,6 +2131,8 @@ static void settings_menu(bool in_game) {
 
 		if (in_game)
 			menu_pause_tick();
+		else
+			rtc_stage_tick();
 
 		draw_settings_menu(sel, batt.poll());
 		_flip();
@@ -2398,6 +2508,9 @@ int main() {
 	// the user's values. Defaults (g_brightness = 75, volume muted, clock
 	// Sunday midnight) stand when nothing was ever stored.
 	{
+		// Anchor the staged clock's wall-clock baseline before any menu
+		// can display it (rtc_stage_tick()).
+		rtc_stage_tick_reset();
 		device_settings_t ds;
 		if (save_storage_settings_load(ds)) {
 			g_brightness = ds.brightness < BRIGHTNESS_MIN ? BRIGHTNESS_MIN
@@ -2767,17 +2880,23 @@ int main() {
 				status_dirty = true;
 			}
 		}
-		if (status_dirty && !status_fullscreen()) {
-			// The header band is rows 0..OFFSET_Y-1 -- the very rows an
-			// in-flight vsync flip streams first. Same chase as core1's;
-			// ~1x/sec and worst-case ~1ms, so off the frame budget.
+		if (status_dirty && (!status_fullscreen() || status_fs_battery())) {
+			// The header band is rows 0..OFFSET_Y-1 (FS BATTERY's meter
+			// is the first 2 of them) -- the very rows an in-flight
+			// vsync flip streams first. Same chase as core1's; ~1x/sec
+			// and worst-case ~1ms, so off the frame budget.
 			if (g_vsync) {
+				const int32_t rows = status_fs_battery()
+						   ? FS_BATT_BAR_H : OFFSET_Y;
 				const uintptr_t hdr_end = (uintptr_t)SCREEN->data +
-					(uintptr_t)OFFSET_Y * SCREEN->w * sizeof(color_t);
+					(uintptr_t)rows * SCREEN->w * sizeof(color_t);
 				while (_in_flip && dma_hw->ch[dma_channel].read_addr < hdr_end)
 					tight_loop_contents();
 			}
-			draw_status_bar(fps_shown, batt_shown < 0 ? 0 : (uint32_t)batt_shown);
+			if (status_fs_battery())
+				draw_fs_battery_bar(batt_shown < 0 ? 0 : (uint32_t)batt_shown);
+			else
+				draw_status_bar(fps_shown, batt_shown < 0 ? 0 : (uint32_t)batt_shown);
 		}
 
 		// Let core1 finish this frame's queued scanlines before flipping,

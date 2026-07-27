@@ -56,6 +56,7 @@ publish settings            settings
 publish clock               clock
 publish in_game             in-game
 publish in_game_fullscreen  in-game-fullscreen
+publish in_game_fs_battery  in-game-fs-battery
 publish boot_light_mint     boot-menu-light
 publish settings_light_mint settings-light
 

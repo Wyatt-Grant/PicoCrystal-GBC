@@ -42,6 +42,7 @@ enum status_bar_mode_t : uint8_t {
 	STATUS_PCT,
 	STATUS_ICON,
 	STATUS_FULLSCREEN,
+	STATUS_FS_BATTERY,
 	STATUS_MODE_COUNT,
 };
 static uint8_t g_status_bar = STATUS_FPS_PCT; // both header pieces render
@@ -49,7 +50,8 @@ static inline bool status_show_fps() { return g_status_bar <= STATUS_FPS; }
 static inline bool status_show_pct() {
 	return g_status_bar == STATUS_FPS_PCT || g_status_bar == STATUS_PCT;
 }
-static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREEN; }
+static inline bool status_fullscreen() { return g_status_bar >= STATUS_FULLSCREEN; }
+static inline bool status_fs_battery() { return g_status_bar == STATUS_FS_BATTERY; }
 static inline bool menu_show_pct() {
 	return status_show_pct() || status_fullscreen();
 }
@@ -65,6 +67,7 @@ static void led(int, int, int) {}
 static uint8_t g_rtc_dow = 2; // TUE
 static uint8_t g_rtc_hour = 14;
 static uint8_t g_rtc_min = 32;
+static uint8_t g_rtc_sec = 7;
 static bool g_vsync = true; // render the settings screen with the toggle ON
 static bool g_boot_last = true; // BOOT LAST GAME row rendered ON
 static bool g_nostalgic_boot = true; // NOSTALGIC BOOT row rendered ON
@@ -328,6 +331,12 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/clock.ppm", dir);
 	write_ppm(path);
 
+	// SEC selected: the half-scale seconds group is the one whose pill and
+	// arrows aren't sized off CLK_SCALE, so it gets a shot of its own.
+	draw_clock_menu(CLK_ROW_SEC, 82);
+	snprintf(path, sizeof path, "%s/clock_sec.ppm", dir);
+	write_ppm(path);
+
 	if (game_ppm) {
 		static color_t frame[GB_H][GB_W];
 		if (!read_gb_ppm(game_ppm, frame))
@@ -348,6 +357,15 @@ int main(int argc, char **argv) {
 		blit_game(frame, (240 - SCALED_H) / 2);
 		draw_status_bar(60, 82); // no-ops in FULLSCREEN, kept for parity
 		snprintf(path, sizeof path, "%s/in_game_fullscreen.ppm", dir);
+		write_ppm(path);
+
+		// FS BATTERY: same centered canvas, with the 2px screen-wide
+		// battery meter along the top of the letterbox.
+		g_status_bar = STATUS_FS_BATTERY;
+		memset(_fb, 0, sizeof _fb);
+		blit_game(frame, (240 - SCALED_H) / 2);
+		draw_fs_battery_bar(82);
+		snprintf(path, sizeof path, "%s/in_game_fs_battery.ppm", dir);
 		write_ppm(path);
 		g_status_bar = STATUS_FPS_PCT;
 	}
