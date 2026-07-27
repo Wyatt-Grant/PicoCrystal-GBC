@@ -822,7 +822,7 @@ static void menu_text(int32_t x, int32_t y, const char *s, color_t col,
 
 // 7x7 1-bit icons for the menu rows, drawn at 2x (14x14) by draw_icon().
 // MSB is the leftmost pixel.
-enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_BOLT, ICON_BATTERY, ICON_SWATCHES, ICON_CONTRAST, ICON_DISK };
+enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_NOTE, ICON_STATUSBAR, ICON_SWATCHES, ICON_CONTRAST, ICON_DISK };
 
 static const uint8_t _icons7[][7] = {
 	{ 0b1111110,  // ICON_CART -- GB cartridge, notched top-right corner
@@ -867,20 +867,20 @@ static const uint8_t _icons7[][7] = {
 	  0b1111111,
 	  0b0001000,
 	  0b0111110 },
-	{ 0b0001100,  // ICON_BOLT -- lightning bolt (NOSTALGIC BOOT row)
-	  0b0011000,
-	  0b0110000,
-	  0b1111100,
-	  0b0011000,
-	  0b0110000,
-	  0b1100000 },
-	{ 0b0011100,  // ICON_BATTERY -- vertical battery, nub on top (BATTERY row)
-	  0b0111110,
-	  0b1000001,
-	  0b1000001,
-	  0b1000001,
-	  0b1000001,
-	  0b0111110 },
+	{ 0b0001111,  // ICON_NOTE -- eighth note: the boot chime (NOSTALGIC BOOT
+	  0b0001111,  // row). The bolt it replaces read as "fast/power", which is
+	  0b0001100,  // the opposite of what the setting does -- it *adds* the
+	  0b0001000,  // Game Boy logo scroll and jingle before a game starts.
+	  0b1111000,
+	  0b1111000,
+	  0b1110000 },
+	{ 0b1111111,  // ICON_STATUSBAR -- screen with a solid band across the top
+	  0b1111111,  // (STATUS BAR row). Was a vertical battery, which named only
+	  0b1111111,  // one of the five modes; the band is the row's actual subject.
+	  0b0000000,  // The band is 3 rows (6px at 2x) against the hollow body
+	  0b1000001,  // below, so it reads as a filled header rather than as the
+	  0b1000001,  // thick top edge of a plain rectangle.
+	  0b1111111 },
 	{ 0b1110111,  // ICON_SWATCHES -- 2x2 grid of color swatches (THEME row)
 	  0b1110111,
 	  0b1110111,
@@ -895,12 +895,12 @@ static const uint8_t _icons7[][7] = {
 	  0b1111001,
 	  0b0111010,
 	  0b0011100 },
-	{ 0b1111111,  // ICON_DISK -- floppy disk, shutter above, label below
-	  0b1001101,  // (SAVE INTERVAL row)
-	  0b1001101,
-	  0b1111111,
+	{ 0b1111111,  // ICON_DISK -- floppy disk (SAVE INTERVAL row): solid body
+	  0b1100011,  // with the shutter cut out of the top and the label cut out
+	  0b1100011,  // of the bottom. The old version drew both as thin outlined
+	  0b1111111,  // slots, which at 2x muddled into a striped block.
 	  0b1000001,
-	  0b1011101,
+	  0b1000001,
 	  0b1111111 },
 };
 
@@ -941,21 +941,28 @@ struct ui_theme_t {
 	color_t accent;
 };
 
+// Ordered by hue so < > walks the wheel rather than jumping around it: greens
+// -> yellows -> oranges/browns -> reds/pinks -> purples -> blues -> cyans, with
+// the two cream neutrals last. Every accent has to stay legible as *text* on
+// both the dark and the light card, so nothing here goes very dark -- the
+// low-value flavors (cocoa, taro) are pitched as milky tints instead.
 constexpr ui_theme_t UI_THEMES[] = {
 	{ "MINT",      status_rgb( 4, 13,  8) }, // the classic green
-	{ "GRAPE",     status_rgb( 9,  5, 15) },
-	{ "BERRY",     status_rgb(15,  4,  7) },
-	{ "PEACH",     status_rgb(15,  9,  4) },
+	{ "MATCHA",    status_rgb( 9, 13,  4) }, // yellow-green
 	{ "LEMON",     status_rgb(14, 13,  3) },
-	{ "BLUEBERRY", status_rgb( 4, 10, 15) },
+	{ "PEACH",     status_rgb(15,  9,  4) },
+	{ "COCOA",     status_rgb(12,  8,  6) }, // desaturated orange = milk chocolate
+	{ "BERRY",     status_rgb(15,  4,  7) },
 	{ "BUBBLEGUM", status_rgb(15,  7, 11) },
+	{ "COTTON",    status_rgb(15, 10, 13) }, // candy floss: bubblegum, milkier
+	{ "TARO",      status_rgb(12,  9, 15) }, // pale violet
+	{ "GRAPE",     status_rgb( 9,  5, 15) },
+	{ "BLUEBERRY", status_rgb( 4, 10, 15) },
+	{ "ICING",     status_rgb( 9, 13, 15) }, // pale sky blue
+	{ "SODA",      status_rgb( 4, 14, 13) }, // teal, the one hue nothing else covered
 	{ "VANILLA",   status_rgb(14, 13, 10) },
 };
 constexpr uint32_t THEME_COUNT = sizeof(UI_THEMES) / sizeof(UI_THEMES[0]);
-// Pseudo-theme past the last fixed entry: cycles UI_ACCENT through the hue
-// wheel instead of a static color, so it can't live in UI_THEMES[] above.
-constexpr uint32_t THEME_RGB = THEME_COUNT;
-constexpr uint32_t THEME_OPTION_COUNT = THEME_COUNT + 1;
 
 // Selected-row pill (boot menu highlight). Dark mode: the accent knocked down
 // to a dark tint (each channel /4 -- MINT's (4,13,8) gives the (1,3,2) pill the
@@ -977,36 +984,9 @@ static color_t UI_ACCENT  = UI_THEMES[0].accent;
 static color_t UI_ROW_SEL = theme_pill(UI_THEMES[0].accent);
 
 static void apply_theme(uint32_t idx) {
-	g_theme = (uint8_t)(idx < THEME_OPTION_COUNT ? idx : 0);
-	// RGB pseudo-theme: seed a starting hue here; update_rgb_theme() takes
-	// over recomputing UI_ACCENT every LED-update tick while it's selected.
-	UI_ACCENT = g_theme < THEME_COUNT ? UI_THEMES[g_theme].accent
-					   : hsv(0.0f, 1.0f, 1.0f);
+	g_theme = (uint8_t)(idx < THEME_COUNT ? idx : 0);
+	UI_ACCENT = UI_THEMES[g_theme].accent;
 	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
-}
-
-// RGB pseudo-theme: cycles UI_ACCENT (and, via led_show_rgb(), the power LED)
-// through the hue wheel over time. Called from the same throttled ~0.75s
-// cadence as the battery-LED update (menu_battery_poll::poll(), the run
-// loop's BATTERY_UPDATE_FRAMES block) rather than every frame -- a step per
-// tick still reads as a smooth cycle without adding a per-frame cost.
-static void update_rgb_theme() {
-	if (g_theme != THEME_RGB)
-		return;
-	static uint32_t step = 0;
-	step = (step + 1) % 32; // 32 hue steps per revolution
-	UI_ACCENT = hsv((float)step / 32.0f, 1.0f, 1.0f);
-	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
-}
-
-// Drives the power LED from the current (just-updated) UI_ACCENT, mirroring
-// the RGB pseudo-theme on screen. Same brightness cap as led_show_battery()
-// so it glows rather than glares.
-static void led_show_rgb() {
-	const int brightness = led_brightness();
-	led((uint8_t)((UI_ACCENT & 0xF) * brightness / 15),
-	    (uint8_t)(((UI_ACCENT >> 12) & 0xF) * brightness / 15),
-	    (uint8_t)(((UI_ACCENT >> 8) & 0xF) * brightness / 15));
 }
 
 // Neutral background/text ramp, swapped as a set by apply_mode() (see below).
@@ -1059,8 +1039,8 @@ static void apply_mode(uint32_t dark) {
 
 // Charge-state color, shared by the battery icon's fill and the power LED
 // (led_show_battery() below) so the two always agree at a glance -- a fixed
-// green -> amber -> red ramp, independent of the UI accent theme (including
-// the RGB pseudo-theme) so the charge state always reads the same way.
+// green -> amber -> red ramp, independent of the UI accent theme so the charge
+// state always reads the same way.
 //
 // The ramp is continuous in the charge level rather than a few coarse bands:
 // green at 100%, amber at the 50% pivot, red at empty, linearly interpolated
@@ -1090,9 +1070,9 @@ constexpr color_t battery_color(uint32_t batt) {
 }
 
 // The LED reports battery charge at the shared led_brightness() cap so it
-// glows rather than glares, unpacking battery_color()'s 4-bit channels the
-// same way led_show_rgb() unpacks the accent. Shared by the in-game run loop
-// and the menus (boot ROM picker, settings).
+// glows rather than glares, unpacking battery_color()'s 4-bit channels onto
+// the LED's 0-100 per-channel scale. Shared by the in-game run loop and the
+// menus (boot ROM picker, settings).
 static void led_show_battery(int level) {
 	if (level < 0)   level = 0;
 	if (level > 100) level = 100;
@@ -1253,12 +1233,7 @@ struct menu_battery_poll {
 			if (b < 0)   b = 0;
 			if (b > 100) b = 100;
 			level = (uint32_t)b;
-			if (g_theme == THEME_RGB) {
-				update_rgb_theme();
-				led_show_rgb();
-			} else {
-				led_show_battery(b);
-			}
+			led_show_battery(b);
 		}
 		return level;
 	}
@@ -1482,7 +1457,7 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	static const char *const STATUS_MODE_NAMES[STATUS_MODE_COUNT] = {
 		"FPS+PCT", "FPS", "PERCENT", "ICON", "FULLSCREEN",
 	};
-	draw_value_row(SET_ROW_STATUS, sel, ICON_BATTERY, "STATUS BAR",
+	draw_value_row(SET_ROW_STATUS, sel, ICON_STATUSBAR, "STATUS BAR",
 		       STATUS_MODE_NAMES[g_status_bar]);
 	// SAVE INTERVAL: how often the save file may be committed to flash --
 	// the wear throttle (see save_storage.hpp). MANUAL commits nothing on
@@ -1503,13 +1478,12 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	draw_toggle_row(SET_ROW_BOOT_LAST, sel, ICON_CART, "BOOT LAST GAME",
 			g_boot_last);
 	// NOSTALGIC BOOT: Game Boy-style logo-scroll + chime when a game launches.
-	draw_toggle_row(SET_ROW_NOSTALGIC, sel, ICON_BOLT, "NOSTALGIC BOOT",
+	draw_toggle_row(SET_ROW_NOSTALGIC, sel, ICON_NOTE, "NOSTALGIC BOOT",
 			g_nostalgic_boot);
-	// THEME: the value is the theme's name (or "RGB" for the cycling
-	// pseudo-theme); every accent-tinted element on screen (including this
-	// value) recolors live as < > cycles it.
+	// THEME: the value is the accent's name; every accent-tinted element on
+	// screen (including this value) recolors live as < > cycles it.
 	draw_value_row(SET_ROW_THEME, sel, ICON_SWATCHES, "THEME",
-		       g_theme < THEME_COUNT ? UI_THEMES[g_theme].name : "RGB");
+		       UI_THEMES[g_theme].name);
 	// APPEARANCE: dark/light -- swaps the neutral ramp live, so the whole
 	// panel (and this row) recolors as < > toggles it.
 	draw_value_row(SET_ROW_MODE, sel, ICON_CONTRAST, "APPEARANCE",
@@ -1864,7 +1838,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
 	case SET_ROW_NOSTALGIC: g_nostalgic_boot = !g_nostalgic_boot; return;
 	case SET_ROW_THEME:
-		apply_theme((g_theme + THEME_OPTION_COUNT + (uint32_t)dir) % THEME_OPTION_COUNT);
+		apply_theme((g_theme + THEME_COUNT + (uint32_t)dir) % THEME_COUNT);
 		return;
 	case SET_ROW_MODE: apply_mode(!g_dark_mode); return; // either direction toggles
 	}
@@ -2752,19 +2726,10 @@ int main() {
 				status_dirty = true;
 			}
 #endif
-			if (g_theme == THEME_RGB) {
-				// The battery icon's fill is fixed (not accent-tied), and
-				// nothing else in the in-game header reads UI_ACCENT, so
-				// the new hue needs no forced repaint here -- only the LED
-				// changes on this tick. While the save blink owns the LED,
-				// skip the write so no battery/theme color sneaks into the
-				// blue/magenta blink.
-				update_rgb_theme();
-				if (!saving)
-					led_show_rgb();
-			} else if (!saving) {
+			// While the save blink owns the LED, skip the write so no
+			// battery color sneaks into the blue/magenta blink.
+			if (!saving)
 				led_show_battery(level);
-			}
 		}
 
 		// The LED signposts the flash-commit window: a fast blue/magenta

@@ -53,36 +53,11 @@ static inline bool status_fullscreen() { return g_status_bar == STATUS_FULLSCREE
 static inline bool menu_show_pct() {
 	return status_show_pct() || status_fullscreen();
 }
-// LED brightness cap (led_show_rgb()/led_show_battery() in the fenced range
-// call it); the value only reaches hardware, so any stub-consistent number
-// does here.
+// LED brightness cap (led_show_battery() in the fenced range calls it); the
+// value only reaches hardware, so any stub-consistent number does here.
 static inline int led_brightness() { return 45 * g_brightness / 100; }
 
-// PicoSystem SDK color/hardware stubs for the RGB pseudo-theme path: hsv()
-// packs like the firmware's color_t (R 0-3, A 4-7, B 8-11, G 12-15, see
-// write_ppm below); led() only drives hardware, a no-op here.
-static color_t hsv(float h, float s, float v) {
-	float r = v, g = v, b = v;
-	if (s > 0.0f) {
-		h = (h - (int)h) * 6.0f;
-		int i = (int)h;
-		float f = h - (float)i;
-		float p = v * (1.0f - s);
-		float q = v * (1.0f - s * f);
-		float t = v * (1.0f - s * (1.0f - f));
-		switch (i) {
-		case 0:  r = v; g = t; b = p; break;
-		case 1:  r = q; g = v; b = p; break;
-		case 2:  r = p; g = v; b = t; break;
-		case 3:  r = p; g = q; b = v; break;
-		case 4:  r = t; g = p; b = v; break;
-		default: r = v; g = p; b = q; break;
-		}
-	}
-	uint16_t R = (uint16_t)(r * 15.0f), G = (uint16_t)(g * 15.0f),
-		 B = (uint16_t)(b * 15.0f);
-	return (color_t)((R & 0xF) | (0xF << 4) | ((B & 0xF) << 8) | ((G & 0xF) << 12));
-}
+// led() only drives hardware, so it's a no-op here.
 static void led(int, int, int) {}
 
 #include "ui_draw.inc"
@@ -296,7 +271,7 @@ int main(int argc, char **argv) {
 	// A non-default theme with the THEME row selected -- every
 	// accent-tinted element should recolor.
 	g_status_bar = STATUS_FPS_PCT;
-	apply_theme(1); // GRAPE
+	apply_theme(9); // GRAPE
 	draw_settings_menu(SET_ROW_THEME, 82);
 	snprintf(path, sizeof path, "%s/settings_grape.ppm", dir);
 	write_ppm(path);
@@ -323,11 +298,10 @@ int main(int argc, char **argv) {
 	// One settings screen per accent theme, THEME row selected so the name
 	// and every accent-tinted element are both visible in the same shot.
 	char slug[32];
-	for (uint32_t t = 0; t < THEME_OPTION_COUNT; t++) {
+	for (uint32_t t = 0; t < THEME_COUNT; t++) {
 		apply_theme(t);
 		draw_settings_menu(SET_ROW_THEME, 82);
-		theme_slug(t < THEME_COUNT ? UI_THEMES[t].name : "RGB", slug,
-			   sizeof slug);
+		theme_slug(UI_THEMES[t].name, slug, sizeof slug);
 		snprintf(path, sizeof path, "%s/theme_%s.ppm", dir, slug);
 		write_ppm(path);
 	}

@@ -135,9 +135,9 @@ struct device_settings_t {
 	uint8_t status_bar;   // status_bar_mode_t (main.cpp g_status_bar): 0 FPS+PCT,
 			      // 1 FPS, 2 PERCENT, 3 ICON, 4 FULLSCREEN (no in-game
 			      // header, game frame centered)
-	uint8_t theme;        // UI accent theme: a UI_THEMES index, or THEME_RGB
-			      // (== THEME_COUNT) for the cycling pseudo-theme
-			      // (main.cpp g_theme). Was reserved0, always stored
+	uint8_t theme;        // UI accent theme: a UI_THEMES index (main.cpp
+			      // g_theme); apply_theme() falls back to 0 == MINT
+			      // if it's out of range. Was reserved0, always stored
 			      // 0 == MINT, so old records decode unchanged.
 	uint8_t dark_mode;    // 1 = dark, 0 = light appearance (main.cpp g_dark_mode).
 			      // New field: grows the struct, so old records fail

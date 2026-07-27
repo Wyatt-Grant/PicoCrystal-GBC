@@ -67,22 +67,28 @@ boot menu.
 
 ## Screenshots
 
-Nine accent themes, cycled with **&lt;**/**&gt;** on the settings THEME row. The
+Fourteen accent themes, cycled with **&lt;**/**&gt;** on the settings THEME row
+and ordered around the hue wheel so the list walks from green to cream. The
 accent drives everything tinted — row icons, meter fills, the header rule, the
-selection pill, the battery fill, and the power LED. `RGB` is not a fixed color
-but a slow walk around the hue wheel, taking the LED with it.
+selection pill, and the battery fill.
 
 <p align="center">
   <img src="screenshots/theme-mint.png"      alt="MINT theme"      width="19%">
-  <img src="screenshots/theme-grape.png"     alt="GRAPE theme"     width="19%">
-  <img src="screenshots/theme-berry.png"     alt="BERRY theme"     width="19%">
-  <img src="screenshots/theme-peach.png"     alt="PEACH theme"     width="19%">
+  <img src="screenshots/theme-matcha.png"    alt="MATCHA theme"    width="19%">
   <img src="screenshots/theme-lemon.png"     alt="LEMON theme"     width="19%">
+  <img src="screenshots/theme-peach.png"     alt="PEACH theme"     width="19%">
+  <img src="screenshots/theme-cocoa.png"     alt="COCOA theme"     width="19%">
+  <br>
+  <img src="screenshots/theme-berry.png"     alt="BERRY theme"     width="19%">
+  <img src="screenshots/theme-bubblegum.png" alt="BUBBLEGUM theme" width="19%">
+  <img src="screenshots/theme-cotton.png"    alt="COTTON theme"    width="19%">
+  <img src="screenshots/theme-taro.png"      alt="TARO theme"      width="19%">
+  <img src="screenshots/theme-grape.png"     alt="GRAPE theme"     width="19%">
   <br>
   <img src="screenshots/theme-blueberry.png" alt="BLUEBERRY theme" width="19%">
-  <img src="screenshots/theme-bubblegum.png" alt="BUBBLEGUM theme" width="19%">
+  <img src="screenshots/theme-icing.png"     alt="ICING theme"     width="19%">
+  <img src="screenshots/theme-soda.png"      alt="SODA theme"      width="19%">
   <img src="screenshots/theme-vanilla.png"   alt="VANILLA theme"   width="19%">
-  <img src="screenshots/theme-rgb.png"       alt="RGB theme"       width="19%">
 </p>
 
 APPEARANCE switches the neutral ramp between dark and light without touching
