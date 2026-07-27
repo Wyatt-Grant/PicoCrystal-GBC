@@ -352,6 +352,10 @@ static inline bool status_show_pct() {
 // the letterbox the centering creates, not in a band of its own).
 static inline bool status_fullscreen() { return g_status_bar >= STATUS_FULLSCREEN; }
 static inline bool status_fs_battery() { return g_status_bar == STATUS_FS_BATTERY; }
+// Height of that meter, in rows. The game frame is pushed down by the same
+// amount in FS BATTERY (see apply_game_offset) so the bar sits above the
+// canvas rather than over the top of it.
+constexpr int32_t FS_BATT_BAR_H = 2;
 // Menu (boot picker / settings) header percentage. FULLSCREEN only drops the
 // *in-game* header, so it says nothing about what the menus should show -- the
 // menus keep their band and their "<n>%", same as the FPS-only default. ICON
@@ -441,12 +445,20 @@ constexpr int32_t OFFSET_Y = 240 - SCALED_H;
 
 // Where the game frame actually lands: OFFSET_Y (under the header band)
 // normally, or centered (12px letterbox top and bottom) in the FULLSCREEN
-// status-bar mode. Read by core1's scanline writer; only changed while
-// emulation is paused (settings menu open / before the run loop starts), when
-// core1's line callback can't be running and the line ring is drained.
+// status-bar mode. FS BATTERY shifts that down by the meter's height so the
+// bar gets clear rows of its own (14px above, 10px below) instead of the
+// canvas's first rows sitting directly under it. Read by core1's scanline
+// writer; only changed while emulation is paused (settings menu open / before
+// the run loop starts), when core1's line callback can't be running and the
+// line ring is drained.
 static volatile int32_t g_game_offset_y = OFFSET_Y;
 static void apply_game_offset() {
-	g_game_offset_y = status_fullscreen() ? (240 - SCALED_H) / 2 : OFFSET_Y;
+	if (!status_fullscreen()) {
+		g_game_offset_y = OFFSET_Y;
+		return;
+	}
+	g_game_offset_y = (240 - SCALED_H) / 2 +
+			  (status_fs_battery() ? FS_BATT_BAR_H : 0);
 }
 
 // 1.5x is a clean 3:2 ratio, so no per-pixel division or index table is needed
@@ -1195,13 +1207,13 @@ static void draw_status_bar(uint32_t fps, uint32_t batt) {
 
 // FS BATTERY's meter: the top 2 rows of the screen become one screen-wide
 // battery gauge, filled from the left in the same battery_color() ramp the
-// icon uses. It sits in the 12px letterbox FULLSCREEN centering leaves above
-// the game frame, so like the header band it can't collide with core1's
+// icon uses. It sits in the 14px letterbox above the game frame (the 12px
+// FULLSCREEN centering leaves, plus the 2 rows apply_game_offset() adds back
+// for the bar), so like the header band it can't collide with core1's
 // scanline writes. The unfilled remainder uses the fixed dark STATUS_RULE
 // rather than the theme's UI_TRACK -- the backdrop here is the black
 // letterbox, and light mode's near-white track would read as a stray bright
 // bar across the top of the screen.
-constexpr int32_t FS_BATT_BAR_H = 2;
 static void draw_fs_battery_bar(uint32_t batt) {
 	if (batt > 100)
 		batt = 100;

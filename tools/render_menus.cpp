@@ -52,6 +52,7 @@ static inline bool status_show_pct() {
 }
 static inline bool status_fullscreen() { return g_status_bar >= STATUS_FULLSCREEN; }
 static inline bool status_fs_battery() { return g_status_bar == STATUS_FS_BATTERY; }
+constexpr int32_t FS_BATT_BAR_H = 2;
 static inline bool menu_show_pct() {
 	return status_show_pct() || status_fullscreen();
 }
@@ -359,11 +360,12 @@ int main(int argc, char **argv) {
 		snprintf(path, sizeof path, "%s/in_game_fullscreen.ppm", dir);
 		write_ppm(path);
 
-		// FS BATTERY: same centered canvas, with the 2px screen-wide
-		// battery meter along the top of the letterbox.
+		// FS BATTERY: the centered canvas pushed down by the meter's
+		// height (apply_game_offset()), with the 2px screen-wide
+		// battery meter in the letterbox above it.
 		g_status_bar = STATUS_FS_BATTERY;
 		memset(_fb, 0, sizeof _fb);
-		blit_game(frame, (240 - SCALED_H) / 2);
+		blit_game(frame, (240 - SCALED_H) / 2 + FS_BATT_BAR_H);
 		draw_fs_battery_bar(82);
 		snprintf(path, sizeof path, "%s/in_game_fs_battery.ppm", dir);
 		write_ppm(path);
