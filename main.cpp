@@ -373,7 +373,8 @@ static uint8_t g_last_slot = 0xFF;
 
 // NOSTALGIC BOOT (settings menu row, persisted): when on, launching a game
 // plays a Game Boy-style boot splash -- the PicoCrystal logo scrolls down to
-// center screen and the boot chime rings out before emulation starts. See
+// center screen and two chimes ring out before emulation starts: our own
+// arpeggio under the animation, then the GB "ba-ding" once it settles. See
 // nostalgic_boot_splash().
 static bool g_nostalgic_boot = true;
 
@@ -426,11 +427,93 @@ static inline void update_joypad() {
 // packed RGBA4444 color_t. Plain per-pixel bit math, no LUT needed: Walnut
 // already maintains fixPalette incrementally as the game writes palette RAM,
 // so there's nothing left to precompute per frame.
-static inline color_t rgb565_to_color(uint16_t c) {
+static inline constexpr color_t rgb565_to_color(uint16_t c) {
 	uint8_t r4 = (c >> 12) & 0xF; // top 4 of 5 red bits
 	uint8_t g4 = (c >> 7) & 0xF;  // top 4 of 6 green bits
 	uint8_t b4 = (c >> 1) & 0xF;  // top 4 of 5 blue bits
 	return r4 | (0xF << 4) | (b4 << 8) | (g4 << 12);
+}
+
+// COLOR FILTER (settings row): approximate a real GBC panel's response instead
+// of showing raw palette values. A game's palette writes were authored for a
+// reflective STN screen whose primaries bleed heavily into each other; feeding
+// those same values straight to this device's LCD gives colors that are far
+// more saturated (and greens far purer) than the artists ever saw. Read by
+// core1's LUT rebuild; only changed from the settings menu while emulation is
+// paused, so no synchronisation beyond the volatile is needed.
+static volatile bool g_color_filter = false;
+
+// The cross-channel bleed, in 1/256ths. Each output channel is mostly its own
+// input plus a slice of the other two -- which is what desaturates the picture
+// the way the panel did. Every row sums to exactly 256, so greys stay
+// perfectly neutral (a matrix whose rows sum differently tints the greyscale,
+// which is the usual failure mode of the hand-rolled GBC matrices floating
+// around). Blue keeps the least of itself and picks up the most green: the
+// GBC's blue was the weakest, most cyan-shifted primary.
+constexpr int32_t CF_RR = 200, CF_RG =  40, CF_RB =  16;
+constexpr int32_t CF_GR =  32, CF_GG = 184, CF_GB =  40;
+constexpr int32_t CF_BR =  32, CF_BG =  48, CF_BB = 176;
+
+// Wash-out, applied after the bleed. An accurate GBC emulation is also
+// noticeably *darker* than raw output, and this device's panel is already dim
+// -- stacking the two would bury the shadows. So instead of the usual darkening
+// gamma we lift: blend each channel CF_LIFT/256 of the way toward its
+// mirrored-square curve (v -> 255 - (255-v)^2/255), which leaves black at black
+// and white at white but pulls the midtones up, for the slightly faded,
+// sun-bleached look of a real screen rather than a dim one. Bumped past what a
+// straight "authentic" filter would do, per how dark this panel reads.
+constexpr int32_t CF_LIFT = 128;
+
+// RGB565 -> RGBA4444 with the filter applied. Not marked inline: it is called
+// once per palette entry on a rebuild (64 entries, only when the game actually
+// wrote palette RAM), never per pixel, so the hot path is untouched -- but it
+// is called from core1, hence RAM-resident to keep it off the QSPI bus.
+static color_t __not_in_flash_func(rgb565_to_color_filtered)(uint16_t c) {
+	// Take all three channels at 5 bits (green's 6th bit is below the 4-bit
+	// output's precision anyway) and work in 0..255.
+	int32_t r = (int32_t)((c >> 11) & 0x1F) * 255 / 31;
+	int32_t g = (int32_t)((c >> 6)  & 0x1F) * 255 / 31;
+	int32_t b = (int32_t)(c         & 0x1F) * 255 / 31;
+
+	int32_t nr = (r * CF_RR + g * CF_RG + b * CF_RB) >> 8;
+	int32_t ng = (r * CF_GR + g * CF_GG + b * CF_GB) >> 8;
+	int32_t nb = (r * CF_BR + g * CF_BG + b * CF_BB) >> 8;
+
+	// v + (lift(v) - v) * CF_LIFT/256, with lift(v) = 255 - (255-v)^2/255
+	// approximated as 255 - ((255-v)^2 >> 8) (the 1/255-vs-1/256 error is
+	// under one part in 256, well inside the 4-bit output).
+	int32_t iv = 255 - nr; nr += (((255 - (iv * iv >> 8)) - nr) * CF_LIFT) >> 8;
+	iv = 255 - ng;         ng += (((255 - (iv * iv >> 8)) - ng) * CF_LIFT) >> 8;
+	iv = 255 - nb;         nb += (((255 - (iv * iv >> 8)) - nb) * CF_LIFT) >> 8;
+
+	// The matrix rows sum to 256 and the lift is monotonic into 0..255, so
+	// no clamp is needed -- the >>4 below can only see 0..255.
+	return (color_t)((nr >> 4) | (0xF << 4) | ((nb >> 4) << 8) |
+			 ((ng >> 4) << 12));
+}
+
+static inline color_t rgb565_to_color_maybe_filtered(uint16_t c) {
+	return g_color_filter ? rgb565_to_color_filtered(c) : rgb565_to_color(c);
+}
+
+// Non-CGB (DMG) titles get a fixed four-shade grey ramp rather than palette
+// indices, so it needs the same treatment -- rebuilt by apply_color_filter()
+// instead of per palette write, since nothing else ever changes it.
+static const uint16_t DMG_GREY565[4] = { 0xFFFF, 0xAD55, 0x52AA, 0x0000 };
+static color_t _grey_lut[4] = {
+	rgb565_to_color(0xFFFF), rgb565_to_color(0xAD55),
+	rgb565_to_color(0x52AA), rgb565_to_color(0x0000)
+};
+
+// Switch the filter on/off. The DMG ramp is rebuilt here; the CGB palette LUT
+// is rebuilt by core1 the usual way, by marking the emulator's palette dirty so
+// the next line job carries a snapshot. Call only with emulation paused (the
+// settings menu, or before the run loop starts) -- core1 must not be mid-job.
+static void apply_color_filter(bool on) {
+	g_color_filter = on;
+	for (int32_t i = 0; i < 4; i++)
+		_grey_lut[i] = rgb565_to_color_maybe_filtered(DMG_GREY565[i]);
+	gb.cgb.fixPaletteDirty = 1;
 }
 
 // GBC's 160x144 frame scaled 1.5x to 240x216 -- an exact clean multiple of
@@ -571,8 +654,15 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 	__gb_render_scanline(&gb, &job->st, _c1_pixels, _c1_prio);
 
 	if (job->pal_dirty) {
-		for (int32_t i = 0; i < 0x40; i++)
-			_pal_lut[i] = rgb565_to_color(job->palette[i]);
+		// Branch hoisted out of the loop: the filter can't change
+		// mid-rebuild (it only moves with emulation paused).
+		if (g_color_filter) {
+			for (int32_t i = 0; i < 0x40; i++)
+				_pal_lut[i] = rgb565_to_color_filtered(job->palette[i]);
+		} else {
+			for (int32_t i = 0; i < 0x40; i++)
+				_pal_lut[i] = rgb565_to_color(job->palette[i]);
+		}
 	}
 
 	// Everything that reads VRAM or the job slot is done -- retire the job
@@ -626,14 +716,11 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 		}
 	} else {
 		// Non-CGB (DMG) title: the emulator emits 2-bit shades rather
-		// than fixPalette indices, so map them to a fixed grey ramp.
-		static const color_t grey[4] = {
-			rgb565_to_color(0xFFFF), rgb565_to_color(0xAD55),
-			rgb565_to_color(0x52AA), rgb565_to_color(0x0000)
-		};
+		// than fixPalette indices, so map them to a fixed grey ramp
+		// (_grey_lut, which apply_color_filter() keeps in step).
 		for (int32_t s = 0, d = 0; s < LCD_WIDTH; s += 2, d += 3) {
-			color_t c0 = grey[_c1_pixels[s] & 3];
-			color_t c1 = grey[_c1_pixels[s + 1] & 3];
+			color_t c0 = _grey_lut[_c1_pixels[s] & 3];
+			color_t c1 = _grey_lut[_c1_pixels[s + 1] & 3];
 			dst[d]     = c0;
 			dst[d + 1] = blend_avg(c0, c1);
 			dst[d + 2] = c1;
@@ -841,7 +928,7 @@ static void menu_text(int32_t x, int32_t y, const char *s, color_t col,
 
 // 7x7 1-bit icons for the menu rows, drawn at 2x (14x14) by draw_icon().
 // MSB is the leftmost pixel.
-enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_NOTE, ICON_STATUSBAR, ICON_SWATCHES, ICON_CONTRAST, ICON_DISK };
+enum icon_t : uint32_t { ICON_CART, ICON_SLIDERS, ICON_SUN, ICON_SPEAKER, ICON_CLOCK, ICON_SCREEN, ICON_NOTE, ICON_STATUSBAR, ICON_SWATCHES, ICON_CONTRAST, ICON_DISK, ICON_DROPLET };
 
 static const uint8_t _icons7[][7] = {
 	{ 0b1111110,  // ICON_CART -- GB cartridge, notched top-right corner
@@ -921,6 +1008,13 @@ static const uint8_t _icons7[][7] = {
 	  0b1000001,
 	  0b1000001,
 	  0b1111111 },
+	{ 0b0001000,  // ICON_DROPLET -- ink drop (COLOR FILTER row): a tint being
+	  0b0011100,  // applied. Solid rather than outlined, like ICON_DISK -- a
+	  0b0011100,  // 7x7 outline shrinks to a couple of lit pixels per row and
+	  0b0111110,  // muddles at 2x.
+	  0b1111111,
+	  0b1111111,
+	  0b0111110 },
 };
 
 static void draw_icon(int32_t x, int32_t y, icon_t icon, color_t col) {
@@ -1410,6 +1504,7 @@ enum settings_row_t : uint32_t {
 	SET_ROW_VOLUME,
 #endif
 	SET_ROW_VSYNC,
+	SET_ROW_COLOR, // COLOR FILTER: GBC-panel color emulation
 	SET_ROW_STATUS,
 	SET_ROW_SAVE,
 	SET_ROW_BOOT_LAST,
@@ -1441,13 +1536,13 @@ constexpr int32_t CLK_ADV = 4 * CLK_SCALE;
 
 // Every setting row is a single text line -- BRIGHT/VOLUME carry a compact
 // inline meter bar on the same line rather than a full-width bar underneath --
-// so all rows share one height. Back to 18px now that the big segmented clock
-// moved to its own screen (draw_clock_menu) and CLOCK is one ordinary row:
-// ten rows at 18px put the last one at y=196, its glyphs ending at y=208 and
-// its selection pill at y=212, still clear of draw_menu_hints()'s fixed y=226.
-// The 10px glyphs leave an 8px gap, and the pill (20px tall, drawn from y-4)
-// fills its slot without touching the neighbouring row's text.
-constexpr int32_t ROW_H = 18;
+// so all rows share one height. 17px is what the eleventh row (COLOR FILTER)
+// cost: at 18px it would have landed at y=214 with its selection pill running
+// to y=230, into draw_menu_hints()'s fixed y=226. At 17px the last row sits at
+// y=204, glyphs ending at y=216 and the pill at y=220, still clear. The 10px
+// glyphs leave a 7px gap, and the pill (20px tall, drawn from y-4) overlaps
+// only the neighbouring pill's slot, never its text (which starts at y+19).
+constexpr int32_t ROW_H = 17;
 
 static int32_t settings_row_y(uint32_t row) {
 	return OFFSET_Y + 10 + (int32_t)row * ROW_H;
@@ -1548,6 +1643,12 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	} else {
 		draw_toggle_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", g_vsync);
 	}
+	// COLOR FILTER: ON runs the CGB palette through the panel-response
+	// approximation (see g_color_filter) instead of showing raw palette
+	// values -- softer, less saturated, and lifted a little to suit this
+	// screen. Costs nothing per frame: it's baked into the palette LUT.
+	draw_toggle_row(SET_ROW_COLOR, sel, ICON_DROPLET, "COLOR FILTER",
+			g_color_filter);
 	// STATUS BAR: what the in-game header shows -- FPS and/or battery % text
 	// (the icon always shows), just the icon, FULLSCREEN (no header, game
 	// frame centered) or FS BATTERY (fullscreen plus a 2px screen-wide
@@ -1575,7 +1676,7 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// last-played game (hold B during power-on to get the picker back).
 	draw_toggle_row(SET_ROW_BOOT_LAST, sel, ICON_CART, "BOOT LAST GAME",
 			g_boot_last);
-	// NOSTALGIC BOOT: Game Boy-style logo-scroll + chime when a game launches.
+	// NOSTALGIC BOOT: Game Boy-style logo-scroll + chimes when a game launches.
 	draw_toggle_row(SET_ROW_NOSTALGIC, sel, ICON_NOTE, "NOSTALGIC BOOT",
 			g_nostalgic_boot);
 	// THEME: the value is the accent's name; every accent-tinted element on
@@ -1959,6 +2060,7 @@ static void store_device_settings() {
 		g_last_slot,
 		(uint8_t)(g_nostalgic_boot ? 1 : 0),
 		g_save_interval,
+		(uint8_t)(g_color_filter ? 1 : 0),
 	};
 	save_storage_settings_store(ds);
 }
@@ -1979,6 +2081,11 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		g_vsync = !g_vsync;
 		apply_audio_pacing(); // TE-paced vsync shifts the production rate
 		return;
+	case SET_ROW_COLOR: // either direction toggles
+		// Safe to rebuild the palette LUTs from here: the settings menu
+		// only runs with emulation (and so core1's renderer) paused.
+		apply_color_filter(!g_color_filter);
+		return;
 	case SET_ROW_STATUS: // < > cycle the five modes, wrapping
 		g_status_bar = (uint8_t)((g_status_bar + STATUS_MODE_COUNT +
 					  (uint32_t)dir) % STATUS_MODE_COUNT);
@@ -1995,7 +2102,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		apply_save_interval();
 		return;
 	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
-	case SET_ROW_NOSTALGIC: g_nostalgic_boot = !g_nostalgic_boot; return;
+	case SET_ROW_NOSTALGIC: g_nostalgic_boot = !g_nostalgic_boot; return; // either direction toggles
 	case SET_ROW_THEME:
 		apply_theme((g_theme + THEME_COUNT + (uint32_t)dir) % THEME_COUNT);
 		return;
@@ -2272,13 +2379,16 @@ static uint32_t rom_select() {
 // ripple that stretches and squashes it vertically, so the flat bitmap reads
 // as a ribbon turning in 3D. Once it has landed a band of every UI accent
 // (settings THEME row) sweeps left to right through the letters, each column
-// running the whole wheel before settling on its own color, and the boot
-// chime rings out through the PWM DAC -- the whole sequence tuned to ~2.5s,
-// the same length as the descent-and-sweep it replaced. The chime is
-// synthesized rather than played back as sampled PCM; see
-// audio_output_play_boot_jingle() for the two notes and where their
-// parameters come from. "By Wyatt" sits in small print at the bottom, where
-// the GBC put "Nintendo". Follows the APPEARANCE setting: black-on-white in
+// running the whole wheel before settling on its own color -- the whole
+// sequence tuned to ~2.5s, the same length as the descent-and-sweep it
+// replaced. Two chimes ring out through the PWM DAC across it, both
+// synthesized rather than played back as sampled PCM: our own arpeggio
+// (audio_output_start_startup_chime) rings under the fly-in from the first
+// frame, then the "ba-ding" based on GBC boot
+// (audio_output_play_boot_jingle) once the colors settle.
+//
+// "By Wyatt" sits in small print at the bottom, in the spot the GBC boot
+// screen gives its byline. Follows the APPEARANCE setting: black-on-white in
 // light mode, white-on-black in dark (the letter colors read on either
 // field).
 //
@@ -2663,6 +2773,15 @@ static void nostalgic_boot_splash() {
 			tight_loop_contents();
 	};
 
+	// Our own chime rings out under the fly-in. It is alarm-driven rather
+	// than blocking precisely so it can overlap the animation -- the
+	// drawing below keeps running between its per-sample interrupts -- and
+	// it has rung down long before the loop ends. The matching stop() is
+	// below, before anything else drives the DAC.
+#if ENABLE_SOUND
+	audio_output_start_startup_chime();
+#endif
+
 	uint32_t t0 = time();
 	for (;;) {
 		uint32_t el = time() - t0;
@@ -2673,12 +2792,15 @@ static void nostalgic_boot_splash() {
 	}
 	draw_frame(FLY_MS + BAND_MS); // settled: the gradient, held for the chime
 
-	// Colors settled -- ring the chime: the boot ROM's own "ba-ding",
-	// emulated from the APU register writes in gbc_bios.bin (see
-	// audio_output_play_boot_jingle), and its ring-down doubles as the
-	// hold before the cut. Muted (or soundless build): hold the same beat
-	// silently so the splash still reads.
+	// Colors settled -- hand the DAC over to the second chime: the "ba-ding"
+	// based on GBC boot (audio_output_play_boot_jingle), whose ring-down
+	// doubles as the hold before the cut. Release our chime's alarm first; it
+	// finished ~1.7s ago, but the jingle drives the same PWM register from
+	// a blocking loop, so ownership is ended explicitly rather than left to
+	// timing. Muted (or soundless build): hold the same beat silently so
+	// the splash still reads.
 #if ENABLE_SOUND
+	audio_output_stop_startup_chime();
 	if (audio_output_get_volume() > 0)
 		audio_output_play_boot_jingle();
 	else
@@ -2789,6 +2911,9 @@ int main() {
 			g_nostalgic_boot = ds.nostalgic_boot != 0;
 			g_save_interval = ds.save_interval < SAVE_INTERVAL_COUNT
 					? ds.save_interval : SAVE_INTERVAL_DEFAULT;
+			// Rebuilds the DMG ramp and marks the CGB palette dirty;
+			// both LUTs are rebuilt before the first frame renders.
+			apply_color_filter(ds.color_filter != 0);
 #if ENABLE_SOUND
 			audio_output_set_volume(ds.volume); // clamps internally
 #endif

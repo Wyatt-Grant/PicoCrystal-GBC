@@ -21,8 +21,11 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
   constantly), or set it to MANUAL and save on demand with **X+B**
 - MBC3 real-time clock, persisted across power cycles (freeze-while-off,
   adjustable in the settings menu)
-- Settings menu (Y+X): brightness, volume, vsync, FPS/battery overlays,
-  save interval, clock
+- Optional COLOR FILTER: approximates a real GBC screen's channel bleed
+  instead of showing raw palette values — softer, less saturated colors,
+  lifted a little to suit this panel
+- Settings menu (Y+X): brightness, volume, vsync, color filter,
+  FPS/battery overlays, save interval, clock
 
 **No ROMs are included** and none can be distributed with this repository.
 Use your own cartridge dumps or freely licensed homebrew.

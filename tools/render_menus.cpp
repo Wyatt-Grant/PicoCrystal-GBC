@@ -70,6 +70,7 @@ static uint8_t g_rtc_hour = 14;
 static uint8_t g_rtc_min = 32;
 static uint8_t g_rtc_sec = 7;
 static bool g_vsync = true; // render the settings screen with the toggle ON
+static bool g_color_filter = true; // COLOR FILTER row rendered ON
 static bool g_boot_last = true; // BOOT LAST GAME row rendered ON
 static bool g_nostalgic_boot = true; // NOSTALGIC BOOT row rendered ON
 // SAVE INTERVAL row: rendered at the 10S option (a plain seconds value; index

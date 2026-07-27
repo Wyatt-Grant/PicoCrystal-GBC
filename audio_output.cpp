@@ -6,6 +6,7 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
+#include "hardware/timer.h" // hardware_alarm_*, paces the startup chime
 #include "pico/platform.h" // __not_in_flash_func()
 #include "pico/time.h"     // time_us_64(), paces audio_output_play_pcm_blocking
 
@@ -282,16 +283,16 @@ void audio_output_play_boot_jingle() {
 	constexpr uint32_t RATE = 32768;
 	constexpr int32_t FULL = 2032; // full DAC swing around the center duty
 
-	// Straight from the boot ROM's register writes (see the header):
-	// NR12=$F3 steps the 4-bit envelope down every 3/64s -- exactly 1536
-	// samples at this rate -- and a full 15..0 ring-down takes ~703ms.
+	// Based on GBC boot (see the header): NR12=$F3 steps the 4-bit envelope
+	// down every 3/64s -- exactly 1536 samples at this rate -- and a full
+	// 15..0 ring-down takes ~703ms.
 	constexpr uint32_t ENV_STEP = RATE * 3 / 64;
 	// Q16 phase increments for the two notes: 131072/125 Hz ($783) and
 	// 131072/63 Hz ($7C1); inc = freq * 65536 / RATE = 2^18 / divider.
 	constexpr uint32_t NOTE1_INC = (1u << 18) / 125;
 	constexpr uint32_t NOTE2_INC = (1u << 18) / 63;
-	// The BIOS triggers note 2 two scroll-counter ticks (4 GB frames,
-	// ~67ms) after note 1, restarting the envelope at 15.
+	// Note 2 triggers two scroll-counter ticks (4 GB frames, ~67ms) after
+	// note 1, restarting the envelope at 15.
 	constexpr uint32_t NOTE2_AT = RATE * 67 / 1000;
 	constexpr uint32_t LEN = NOTE2_AT + 15 * ENV_STEP; // note 2 rings to 0
 
@@ -321,6 +322,198 @@ void audio_output_play_boot_jingle() {
 		pwm_set_gpio_level(AUDIO_PIN, (uint16_t)(PWM_WRAP / 2 + 1 + s));
 		phase += inc;
 	}
+	pwm_set_gpio_level(AUDIO_PIN, PWM_WRAP / 2);
+}
+
+namespace {
+
+// --- PicoCrystal startup chime ------------------------------------------
+//
+// Unlike the GB jingle this one plays *underneath* the boot animation, so it
+// cannot busy-wait: a splash frame takes far longer than one sample period,
+// and pumping the synth from the animation loop would drop out on every
+// frame. It runs from a hardware-alarm IRQ instead, one sample per firing,
+// leaving core0 free to keep drawing between them.
+//
+// 16384Hz rather than the APU path's 32768: the highest partner here is
+// ~2.1kHz, so Nyquist is met with room to spare, and halving the rate halves
+// an interrupt that now competes with the splash's rendering. A raw
+// hardware alarm, not an alarm pool -- pool callbacks fire on the core that
+// *created* the pool rather than the one that armed them, which has bitten
+// this project before; hardware_alarm_set_callback binds to the caller.
+constexpr uint32_t CHIME_RATE = 16384;
+constexpr uint32_t CHIME_LEN = CHIME_RATE * 800 / 1000;
+constexpr int32_t CHIME_FULL = 2032; // full DAC swing around the center duty
+
+// Rising C6-G6-C7 arpeggio. Phase is Q32, so a Hz-to-increment conversion is
+// just freq * (2^32 / CHIME_RATE) == freq << 18.
+constexpr uint32_t CHIME_VOICES = 3;
+const uint32_t CHIME_FREQ_HZ[CHIME_VOICES] = { 1046, 1568, 2093 };
+const uint32_t CHIME_ONSET[CHIME_VOICES] = {
+	0, CHIME_RATE * 60 / 1000, CHIME_RATE * 120 / 1000,
+};
+
+// Per-voice envelope: a short linear attack (a hard start on a bell tone
+// clicks through the piezo) into an exponential decay applied as
+// amp -= amp >> CHIME_DECAY_SHIFT, i.e. a time constant of 2^12 samples
+// (~250ms). The last voice in still gets ~2.7 time constants before the end,
+// which is quiet but not silent -- hence CHIME_FADE.
+constexpr int32_t CHIME_AMP_ONE = 1 << 15; // envelope is Q15
+constexpr uint32_t CHIME_ATTACK = CHIME_RATE * 5 / 1000;
+constexpr uint32_t CHIME_DECAY_SHIFT = 12;
+// Forced fade over the final stretch so the tail reaches true zero rather
+// than stepping there.
+constexpr uint32_t CHIME_FADE = CHIME_RATE * 100 / 1000;
+
+// Normalizing by CHIME_VOICES would assume all three peak in phase at once,
+// which this arpeggio never does -- it left 43% of the DAC swing unused on a
+// speaker with none to spare. CHIME_NORM is the actual worst-case |acc| over
+// the whole 800ms instead, measured by rendering this same integer loop on
+// the host, so the loudest sample lands just under full scale. Retune it if
+// the notes, onsets, envelope or sample rate change.
+constexpr int32_t CHIME_NORM = 54600;
+
+struct chime_voice_t {
+	uint32_t ph, det_ph, inc, det_inc;
+	int32_t amp;
+};
+
+// Chime state. Written by the start/stop calls and then owned by the alarm
+// IRQ; chime_active gates the handler so a cancel racing a firing is inert.
+chime_voice_t chime_v[CHIME_VOICES];
+uint32_t chime_pos = 0;
+uint32_t chime_vol = 0;
+uint64_t chime_t0 = 0;
+int chime_alarm = -1;
+volatile bool chime_active = false;
+
+// Parabolic sine: with x sweeping -2^15..2^15 across one cycle, 4x(1-|x|)
+// traces a full period peaking at +-2^15, within a few percent of a real
+// sine. Cheaper than a table lookup and, on a piezo driven through a 12-bit
+// PWM DAC, indistinguishable from one.
+int32_t __not_in_flash_func(chime_psin)(uint32_t phase) {
+	int32_t x = (int32_t)(phase >> 16) - 32768;
+	int32_t a = x < 0 ? -x : x;
+	return (4 * x * (32768 - a)) >> 15;
+}
+
+// Synthesize sample chime_pos, push it to the DAC, and advance.
+void __not_in_flash_func(chime_render_sample)() {
+	int32_t acc = 0;
+	for (uint32_t n = 0; n < CHIME_VOICES; n++) {
+		if (chime_pos < CHIME_ONSET[n])
+			continue;
+		chime_voice_t &v = chime_v[n];
+		uint32_t age = chime_pos - CHIME_ONSET[n];
+		if (age < CHIME_ATTACK)
+			v.amp = (int32_t)(CHIME_AMP_ONE * age / CHIME_ATTACK);
+		else
+			v.amp -= v.amp >> CHIME_DECAY_SHIFT;
+		// Voice and detuned partner, averaged so a voice at full
+		// envelope still spans only +-2^15.
+		int32_t osc = (chime_psin(v.ph) + chime_psin(v.det_ph)) / 2;
+		acc += (osc * v.amp) >> 15;
+		v.ph += v.inc;
+		v.det_ph += v.det_inc;
+	}
+
+	// CHIME_DRIVE over-drives the normalized signal into the soft knee
+	// below. Straight gain was not available: normalization already put
+	// peaks at ~98% of the rail, so the only way left to get louder is to
+	// raise the *average* level and let the knee round off the peaks. A
+	// decaying bell has a high crest factor, so there is a lot to reclaim
+	// -- the ring-down, well under the knee, gets the full 2x, while the
+	// attack transient compresses instead of clipping.
+	constexpr int32_t CHIME_DRIVE = 2;
+	int32_t s = acc * CHIME_FULL / CHIME_NORM * CHIME_DRIVE;
+	s = s * (int32_t)chime_vol / 100;
+	uint32_t left = CHIME_LEN - chime_pos;
+	if (left < CHIME_FADE)
+		s = s * (int32_t)left / (int32_t)CHIME_FADE;
+
+	// The APU mix's cascaded soft knee, with its thresholds scaled from
+	// int16 range to this signal's CHIME_FULL rail. Slopes of 1/2, 1/4,
+	// 1/8, 1/32 over successive overshoot bands: at CHIME_DRIVE 2 the
+	// worst-case peak lands just inside the rail, so the final clamp never
+	// actually fires and nothing flat-tops.
+	int32_t mag = s < 0 ? -s : s;
+	if (mag > 1240) mag = 1240 + ((mag - 1240) >> 1);
+	if (mag > 1610) mag = 1610 + ((mag - 1610) >> 1);
+	if (mag > 1860) mag = 1860 + ((mag - 1860) >> 1);
+	if (mag > 1985) mag = 1985 + ((mag - 1985) >> 2);
+	if (mag > CHIME_FULL) mag = CHIME_FULL;
+	s = s < 0 ? -mag : mag;
+
+	pwm_set_gpio_level(AUDIO_PIN, (uint16_t)(PWM_WRAP / 2 + 1 + s));
+	chime_pos++;
+}
+
+void __not_in_flash_func(chime_alarm_irq)(uint alarm_num) {
+	(void)alarm_num;
+	if (!chime_active)
+		return;
+	uint64_t due;
+	do {
+		chime_render_sample();
+		if (chime_pos >= CHIME_LEN) {
+			// Rung out. Leave the alarm claimed -- the stop call
+			// releases it, so ownership has exactly one owner.
+			chime_active = false;
+			pwm_set_gpio_level(AUDIO_PIN, PWM_WRAP / 2);
+			return;
+		}
+		due = chime_t0 + (uint64_t)chime_pos * 1000000u / CHIME_RATE;
+		// set_target returns true when the target is already in the
+		// past: a slot was missed (something held IRQs off, e.g. a
+		// screen flip). Render it immediately and try the next rather
+		// than rearming late, so the notes keep their pitch instead of
+		// stretching -- the overwritten DAC write is harmless.
+	} while (hardware_alarm_set_target((uint)chime_alarm, from_us_since_boot(due)));
+}
+
+} // namespace
+
+void audio_output_start_startup_chime() {
+	if (chime_alarm >= 0)
+		return; // already running
+	uint32_t vol = volume_percent;
+	if (vol == 0)
+		return;
+	// Same reasoning as the GB jingle: the >100% range compensates for the
+	// APU's deliberately quiet mix and has nothing to give a signal that is
+	// already mixed to full scale here.
+	if (vol > 100)
+		vol = 100;
+	chime_vol = vol;
+
+	for (uint32_t i = 0; i < CHIME_VOICES; i++) {
+		chime_v[i].ph = chime_v[i].det_ph = 0;
+		chime_v[i].inc = CHIME_FREQ_HZ[i] << 18;
+		// The detuned partner, ~0.6% sharp: 1046Hz beats against its
+		// twin at ~6Hz, the higher voices proportionally faster.
+		chime_v[i].det_inc = chime_v[i].inc + chime_v[i].inc / 170;
+		chime_v[i].amp = 0;
+	}
+	chime_pos = 0;
+	chime_t0 = time_us_64();
+
+	chime_alarm = (int)hardware_alarm_claim_unused(true);
+	hardware_alarm_set_callback((uint)chime_alarm, chime_alarm_irq);
+	chime_active = true;
+	hardware_alarm_set_target((uint)chime_alarm,
+				  from_us_since_boot(chime_t0 + 1000000u / CHIME_RATE));
+}
+
+void audio_output_stop_startup_chime() {
+	if (chime_alarm < 0)
+		return;
+	// Clear the gate before cancelling: a firing that slips through in
+	// between then returns without touching the DAC or rearming.
+	chime_active = false;
+	hardware_alarm_cancel((uint)chime_alarm);
+	hardware_alarm_set_callback((uint)chime_alarm, nullptr);
+	hardware_alarm_unclaim((uint)chime_alarm);
+	chime_alarm = -1;
 	pwm_set_gpio_level(AUDIO_PIN, PWM_WRAP / 2);
 }
 

@@ -148,13 +148,16 @@ struct device_settings_t {
 			      // per-game id, not the catalog index, which
 			      // reshuffles when the ROM list is regenerated.
 			      // 0xFF = no game booted yet (main.cpp g_last_slot)
-	uint8_t nostalgic_boot; // 0/1: Game Boy-style boot splash + chime when a
+	uint8_t nostalgic_boot; // 0/1: Game Boy-style boot splash + chimes when a
 			      // game launches (main.cpp g_nostalgic_boot)
 	uint8_t save_interval; // index into main.cpp's SAVE_INTERVAL_SECS
 			      // (g_save_interval): 0 = MANUAL, then 3/5/10/30/
 			      // 60/120 seconds. Stored as the index, not the
 			      // seconds, so the option list can be retuned
 			      // without reinterpreting stored records.
+	uint8_t color_filter; // 0/1: GBC panel color emulation -- softened,
+			      // desaturated, slightly lifted palettes
+			      // (main.cpp g_color_filter)
 };
 // Growing this struct invalidates the previously stored record (the CRC is
 // computed over the whole payload), so settings reset to defaults once on

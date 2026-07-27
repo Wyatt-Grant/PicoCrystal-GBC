@@ -60,15 +60,13 @@ void audio_output_set_frame_period(uint32_t frame_us);
 void audio_output_set_volume(uint16_t percent);
 uint16_t audio_output_get_volume();
 
-// Plays the Game Boy boot chime ("ba-ding") by emulating exactly what the
-// GBC BIOS programs into APU square channel 1, streamed straight through
-// the PWM DAC and busy-waiting on core0 until it finishes (~770ms). The
-// parameters were read out of the boot ROM's own register writes
-// (gbc_bios.bin): duty 50% (NR11=$80), envelope NR12=$F3 -- start at volume
-// 15, step down one level every 3/64s (exactly 1536 samples at 32768Hz) --
-// note 1 at freq $783 (131072/125 = ~1048.6Hz), then ~67ms later note 2 at
-// $7C1 (131072/63 = ~2080.5Hz) retriggers the envelope and rings down to
-// silence. Full-swing square at unity volume -- the loudest waveform the
+// Plays the "ba-ding" boot chime, based on GBC boot: a synthesis of what
+// gets programmed into APU square channel 1, streamed straight through the
+// PWM DAC and busy-waiting on core0 until it finishes (~770ms). Duty 50%
+// (NR11=$80), envelope NR12=$F3 -- start at volume 15, step down one level
+// every 3/64s (exactly 1536 samples at 32768Hz) -- note 1 at freq $783
+// (131072/125 = ~1048.6Hz), then ~67ms later note 2 at $7C1 (131072/63 =
+// ~2080.5Hz) retriggers the envelope and rings down to silence. Full-swing square at unity volume -- the loudest waveform the
 // piezo can produce, unlike the sine-bell attempt this replaces, which
 // barely moved it. Only valid between audio_output_init() (the carrier must
 // be configured) and audio_output_core1_init() (afterwards the DMA engine
@@ -78,6 +76,35 @@ uint16_t audio_output_get_volume();
 // sense against the APU's deliberately quiet mix, not a full-scale square)
 // and recenters the output to silence when done. No-op at volume 0.
 void audio_output_play_boot_jingle();
+
+// Starts PicoCrystal's own startup chime and returns immediately: an
+// original composition, not a reproduction of any console's boot sound.
+// Three bell voices in a rising C6-G6-C7 arpeggio, each entering 60ms after
+// the last and ringing down together over ~800ms. Each is doubled by a
+// partner detuned ~0.6% sharp, which beats against it a few times a second
+// and gives the tail a chorused shimmer a single oscillator can't. Unlike
+// the GB jingle's full-swing square this is a summed multi-voice mix, so it
+// uses the PWM DAC's amplitude resolution rather than just its two rails --
+// normalized to the rail and then driven into a soft knee, since a decaying
+// bell's crest factor otherwise leaves it much quieter than the square.
+//
+// Non-blocking, because it plays *under* the boot animation rather than in
+// a gap in it: synthesis runs one sample per hardware-alarm IRQ (see
+// audio_output.cpp) while core0 keeps drawing splash frames. That makes it
+// the caller's job to end it -- audio_output_stop_startup_chime() must be
+// called before anything else touches the DAC, including
+// audio_output_play_boot_jingle(), and before core1 claims the audio DMA.
+//
+// Same remaining constraints as the GB jingle: valid only between
+// audio_output_init() and audio_output_core1_init(), applies the master
+// volume clamped to unity, and no-ops at volume 0.
+void audio_output_start_startup_chime();
+
+// Stops the startup chime, releases its alarm, and recenters the DAC to
+// silence. Safe to call whether or not the chime is still ringing (it ends
+// itself after ~800ms but stays claimed until this runs) and safe to call
+// when it never started, e.g. at volume 0.
+void audio_output_stop_startup_chime();
 
 // Forces the PWM output to its centered (silent) level. Intended for
 // skipping synthesis entirely while volume is 0 (real per-sample PSG
