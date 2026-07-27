@@ -1890,11 +1890,33 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		status_text(name_x, y + 6, name, is_sel ? UI_ACCENT : STATUS_GREY);
 	}
 
-	// Scroll indicators when rows extend past the window.
-	if (first > 0)
-		draw_scroll_arrow(UI_RIGHT + 4, OFFSET_Y + 5, false, STATUS_DIM);
-	if (first + VISIBLE_ROWS < total)
-		draw_scroll_arrow(UI_RIGHT + 4, 221, true, STATUS_DIM);
+	// Scrollbar down the right edge, drawn only when the catalog is taller
+	// than the window. Track spans the row area; the thumb's height is the
+	// visible fraction and its offset the window position, so it doubles as
+	// the "how much more is there" cue the old up/down arrows gave.
+	if (total > VISIBLE_ROWS) {
+		constexpr int32_t BAR_X = 235;   // right of the selection pill (ends at 233)
+		constexpr int32_t BAR_W = 3;
+		constexpr int32_t BAR_Y = OFFSET_Y + 12;             // first row's top
+		constexpr int32_t BAR_H = VISIBLE_ROWS * ROW_H + 4;  // + the SETTINGS gap
+		constexpr int32_t THUMB_MIN = 10;
+
+		int32_t th = (int32_t)(BAR_H * VISIBLE_ROWS / total);
+		if (th < THUMB_MIN)
+			th = THUMB_MIN;
+		// first ranges 0..total-VISIBLE_ROWS over the track's spare
+		// travel. The ternary is only to keep the divisor non-zero for
+		// the constant-folder when a build's catalog fits the window --
+		// this branch doesn't run then.
+		const uint32_t travel = total > VISIBLE_ROWS ? total - VISIBLE_ROWS : 1;
+		int32_t ty = BAR_Y + (int32_t)((BAR_H - th) * first / travel);
+
+		// Same track/fill pair the settings meters use, so the bar reads
+		// as chrome rather than as a selected control -- and the fill
+		// stays dark on light mode's near-white track.
+		fill_rect(BAR_X, BAR_Y, BAR_W, BAR_H, UI_TRACK);
+		fill_rect(BAR_X, ty, BAR_W, th, UI_FILL);
+	}
 
 	draw_menu_hints("A SELECT   Y+X SETTINGS");
 }
