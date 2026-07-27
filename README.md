@@ -67,28 +67,36 @@ boot menu.
 
 ## Screenshots
 
-Fourteen accent themes, cycled with **&lt;**/**&gt;** on the settings THEME row
-and ordered around the hue wheel so the list walks from green to cream. The
+Twenty-one accent themes, cycled with **&lt;**/**&gt;** on the settings THEME row
+and ordered around the hue wheel so the list walks from green through the
+purples and blues and ends on the low-saturation neutrals. The
 accent drives everything tinted — row icons, meter fills, the header rule, the
 selection pill, and the battery fill.
 
 <p align="center">
-  <img src="screenshots/theme-mint.png"      alt="MINT theme"      width="19%">
-  <img src="screenshots/theme-matcha.png"    alt="MATCHA theme"    width="19%">
-  <img src="screenshots/theme-lemon.png"     alt="LEMON theme"     width="19%">
-  <img src="screenshots/theme-peach.png"     alt="PEACH theme"     width="19%">
-  <img src="screenshots/theme-cocoa.png"     alt="COCOA theme"     width="19%">
+  <img src="screenshots/theme-mint.png"      alt="MINT theme"      width="13%">
+  <img src="screenshots/theme-kiwi.png"      alt="KIWI theme"      width="13%">
+  <img src="screenshots/theme-matcha.png"    alt="MATCHA theme"    width="13%">
+  <img src="screenshots/theme-lemon.png"     alt="LEMON theme"     width="13%">
+  <img src="screenshots/theme-honey.png"     alt="HONEY theme"     width="13%">
+  <img src="screenshots/theme-peach.png"     alt="PEACH theme"     width="13%">
+  <img src="screenshots/theme-cocoa.png"     alt="COCOA theme"     width="13%">
   <br>
-  <img src="screenshots/theme-berry.png"     alt="BERRY theme"     width="19%">
-  <img src="screenshots/theme-bubblegum.png" alt="BUBBLEGUM theme" width="19%">
-  <img src="screenshots/theme-cotton.png"    alt="COTTON theme"    width="19%">
-  <img src="screenshots/theme-taro.png"      alt="TARO theme"      width="19%">
-  <img src="screenshots/theme-grape.png"     alt="GRAPE theme"     width="19%">
+  <img src="screenshots/theme-cherry.png"    alt="CHERRY theme"    width="13%">
+  <img src="screenshots/theme-berry.png"     alt="BERRY theme"     width="13%">
+  <img src="screenshots/theme-bubblegum.png" alt="BUBBLEGUM theme" width="13%">
+  <img src="screenshots/theme-cotton.png"    alt="COTTON theme"    width="13%">
+  <img src="screenshots/theme-plum.png"      alt="PLUM theme"      width="13%">
+  <img src="screenshots/theme-taro.png"      alt="TARO theme"      width="13%">
+  <img src="screenshots/theme-grape.png"     alt="GRAPE theme"     width="13%">
   <br>
-  <img src="screenshots/theme-blueberry.png" alt="BLUEBERRY theme" width="19%">
-  <img src="screenshots/theme-icing.png"     alt="ICING theme"     width="19%">
-  <img src="screenshots/theme-soda.png"      alt="SODA theme"      width="19%">
-  <img src="screenshots/theme-vanilla.png"   alt="VANILLA theme"   width="19%">
+  <img src="screenshots/theme-slushie.png"   alt="SLUSHIE theme"   width="13%">
+  <img src="screenshots/theme-blueberry.png" alt="BLUEBERRY theme" width="13%">
+  <img src="screenshots/theme-icing.png"     alt="ICING theme"     width="13%">
+  <img src="screenshots/theme-lagoon.png"    alt="LAGOON theme"    width="13%">
+  <img src="screenshots/theme-soda.png"      alt="SODA theme"      width="13%">
+  <img src="screenshots/theme-vanilla.png"   alt="VANILLA theme"   width="13%">
+  <img src="screenshots/theme-frost.png"     alt="FROST theme"     width="13%">
 </p>
 
 APPEARANCE switches the neutral ramp between dark and light without touching
