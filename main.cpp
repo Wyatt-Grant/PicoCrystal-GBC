@@ -464,32 +464,54 @@ constexpr int32_t CF_BR =  32, CF_BG =  48, CF_BB = 176;
 // straight "authentic" filter would do, per how dark this panel reads.
 constexpr int32_t CF_LIFT = 128;
 
+// The two tables the conversion below runs on, built once by cf_build_tables():
+//   _cf_x5    5-bit channel -> 0..255, i.e. what "v * 255 / 31" used to compute
+//             inline. The M0+ has no divide instruction and GCC can't magic-
+//             number its way around one without a long multiply, so each of
+//             those three divides compiled to an __aeabi_idiv call -- together
+//             they cost more than everything else in the function.
+//   _cf_lift4 post-bleed channel (0..255) -> the final 4-bit output nibble,
+//             with the wash-out curve already folded in.
+// Plain .bss, so they sit in SRAM where core1 reads them without touching the
+// QSPI bus. Values are computed with the same integer expressions the inline
+// arithmetic used, so the filtered output is bit-identical to before.
+static uint8_t _cf_x5[32];
+static uint8_t _cf_lift4[256];
+
+static void cf_build_tables() {
+	for (int32_t v = 0; v < 32; v++)
+		_cf_x5[v] = (uint8_t)(v * 255 / 31);
+	for (int32_t v = 0; v < 256; v++) {
+		// v + (lift(v) - v) * CF_LIFT/256, with lift(v) = 255 - (255-v)^2/255
+		// approximated as 255 - ((255-v)^2 >> 8) (the 1/255-vs-1/256 error is
+		// under one part in 256, well inside the 4-bit output). Then >>4 to
+		// output precision: the curve is monotonic into 0..255, so the nibble
+		// needs no clamp.
+		const int32_t iv = 255 - v;
+		const int32_t lifted = v + ((((255 - (iv * iv >> 8)) - v) * CF_LIFT) >> 8);
+		_cf_lift4[v] = (uint8_t)(lifted >> 4);
+	}
+}
+
 // RGB565 -> RGBA4444 with the filter applied. Not marked inline: it is called
-// once per palette entry on a rebuild (64 entries, only when the game actually
-// wrote palette RAM), never per pixel, so the hot path is untouched -- but it
-// is called from core1, hence RAM-resident to keep it off the QSPI bus.
+// once per *changed* palette entry on a rebuild (see the delta loop in
+// render_line_job), never per pixel, so the hot path is untouched -- but it is
+// called from core1, hence RAM-resident to keep it off the QSPI bus.
 static color_t __not_in_flash_func(rgb565_to_color_filtered)(uint16_t c) {
 	// Take all three channels at 5 bits (green's 6th bit is below the 4-bit
 	// output's precision anyway) and work in 0..255.
-	int32_t r = (int32_t)((c >> 11) & 0x1F) * 255 / 31;
-	int32_t g = (int32_t)((c >> 6)  & 0x1F) * 255 / 31;
-	int32_t b = (int32_t)(c         & 0x1F) * 255 / 31;
+	const int32_t r = _cf_x5[(c >> 11) & 0x1F];
+	const int32_t g = _cf_x5[(c >> 6)  & 0x1F];
+	const int32_t b = _cf_x5[c         & 0x1F];
 
-	int32_t nr = (r * CF_RR + g * CF_RG + b * CF_RB) >> 8;
-	int32_t ng = (r * CF_GR + g * CF_GG + b * CF_GB) >> 8;
-	int32_t nb = (r * CF_BR + g * CF_BG + b * CF_BB) >> 8;
+	// Bleed, then wash-out and the drop to 4 bits in a single lookup. The
+	// matrix rows sum to 256 and the inputs are 0..255, so every index is in
+	// range for _cf_lift4 with no clamp.
+	const uint32_t nr = _cf_lift4[(r * CF_RR + g * CF_RG + b * CF_RB) >> 8];
+	const uint32_t ng = _cf_lift4[(r * CF_GR + g * CF_GG + b * CF_GB) >> 8];
+	const uint32_t nb = _cf_lift4[(r * CF_BR + g * CF_BG + b * CF_BB) >> 8];
 
-	// v + (lift(v) - v) * CF_LIFT/256, with lift(v) = 255 - (255-v)^2/255
-	// approximated as 255 - ((255-v)^2 >> 8) (the 1/255-vs-1/256 error is
-	// under one part in 256, well inside the 4-bit output).
-	int32_t iv = 255 - nr; nr += (((255 - (iv * iv >> 8)) - nr) * CF_LIFT) >> 8;
-	iv = 255 - ng;         ng += (((255 - (iv * iv >> 8)) - ng) * CF_LIFT) >> 8;
-	iv = 255 - nb;         nb += (((255 - (iv * iv >> 8)) - nb) * CF_LIFT) >> 8;
-
-	// The matrix rows sum to 256 and the lift is monotonic into 0..255, so
-	// no clamp is needed -- the >>4 below can only see 0..255.
-	return (color_t)((nr >> 4) | (0xF << 4) | ((nb >> 4) << 8) |
-			 ((ng >> 4) << 12));
+	return (color_t)(nr | (0xF << 4) | (nb << 8) | (ng << 12));
 }
 
 static inline color_t rgb565_to_color_maybe_filtered(uint16_t c) {
@@ -505,14 +527,29 @@ static color_t _grey_lut[4] = {
 	rgb565_to_color(0x52AA), rgb565_to_color(0x0000)
 };
 
+// Forces the next CGB palette rebuild to convert all 64 entries instead of
+// just the ones whose RGB565 changed (see the delta loop in render_line_job).
+// Starts set so the first rebuild after boot is a full one -- the shadow it
+// diffs against is only meaningful once something has filled it -- and is set
+// again on a filter toggle, where every entry's *colour* changes although none
+// of the source values do. Written only with emulation paused, cleared by
+// core1 inside the rebuild.
+static volatile bool _pal_lut_stale = true;
+
 // Switch the filter on/off. The DMG ramp is rebuilt here; the CGB palette LUT
 // is rebuilt by core1 the usual way, by marking the emulator's palette dirty so
 // the next line job carries a snapshot. Call only with emulation paused (the
 // settings menu, or before the run loop starts) -- core1 must not be mid-job.
 static void apply_color_filter(bool on) {
+	// The only route to a filtered conversion runs through here, so this is
+	// the one place the tables have to be ready by. Rebuilding them on an
+	// off-toggle too is a few hundred cycles once, and saves having a second
+	// state to reason about.
+	cf_build_tables();
 	g_color_filter = on;
 	for (int32_t i = 0; i < 4; i++)
 		_grey_lut[i] = rgb565_to_color_maybe_filtered(DMG_GREY565[i]);
+	_pal_lut_stale = true;
 	gb.cgb.fixPaletteDirty = 1;
 }
 
@@ -578,6 +615,16 @@ static color_t _prev_row[SCALED_W];
 // Mid-frame palette swaps (LYC/HBlank effects) stay correct because the dirty
 // snapshot travels with each line job below.
 static color_t _pal_lut[0x40];
+
+// The RGB565 each _pal_lut entry was converted from, so a rebuild only has to
+// convert the entries that actually changed. Core1-private (only the rebuild
+// below touches it), and kept exactly in step with _pal_lut. The dirty flag
+// says *something* in the palette moved; in practice one or two entries did,
+// while a rebuild converted all 64. That gap is what made the COLOR FILTER
+// expensive: its conversion is several times the cost of the plain one, and a
+// scene doing per-scanline palette work paid for it 64 entries at a time,
+// stalling core0 on the VRAM fence behind core1's rebuild.
+static uint16_t _pal_src[0x40];
 
 // ---------------------------------------------------------------------
 // Core1 scanline-render offload: the line ring.
@@ -654,14 +701,33 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 	__gb_render_scanline(&gb, &job->st, _c1_pixels, _c1_prio);
 
 	if (job->pal_dirty) {
+		// Convert only what moved (see _pal_src) -- the compare is a
+		// couple of cycles per entry against a conversion that is an
+		// order of magnitude more, and it is rare for a palette write to
+		// touch more than one or two of the 64. `all` covers the cases
+		// where the shadow can't be trusted: the first rebuild after
+		// boot, and a filter toggle, which changes every output colour
+		// without changing a single input value.
+		const bool all = _pal_lut_stale;
+		_pal_lut_stale = false;
 		// Branch hoisted out of the loop: the filter can't change
 		// mid-rebuild (it only moves with emulation paused).
 		if (g_color_filter) {
-			for (int32_t i = 0; i < 0x40; i++)
-				_pal_lut[i] = rgb565_to_color_filtered(job->palette[i]);
+			for (int32_t i = 0; i < 0x40; i++) {
+				const uint16_t c = job->palette[i];
+				if (!all && c == _pal_src[i])
+					continue;
+				_pal_src[i] = c;
+				_pal_lut[i] = rgb565_to_color_filtered(c);
+			}
 		} else {
-			for (int32_t i = 0; i < 0x40; i++)
-				_pal_lut[i] = rgb565_to_color(job->palette[i]);
+			for (int32_t i = 0; i < 0x40; i++) {
+				const uint16_t c = job->palette[i];
+				if (!all && c == _pal_src[i])
+					continue;
+				_pal_src[i] = c;
+				_pal_lut[i] = rgb565_to_color(c);
+			}
 		}
 	}
 

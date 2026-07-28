@@ -2352,12 +2352,29 @@ void __not_in_flash_func(__gb_write)(struct gb_s *gb, uint_fast16_t addr, uint8_
 		case 0x69:
 			// native rgb565 version
 	    gb->cgb.BGPalette[gb->cgb.BGPaletteID & 0x3F] = val;
+		{
+			/* PicoCrystal: flag the front-end only when the packed
+			 * colour actually changes. Games re-push palettes that
+			 * are byte-identical to what is already there (fades that
+			 * have settled, a scene rewriting its full palette every
+			 * frame), and each of those writes used to cost the
+			 * front-end a 128-byte snapshot into the line ring plus a
+			 * full 64-entry LUT rebuild for no visible difference.
+			 * Auto-increment (BGPaletteInc) makes that the common
+			 * shape: a game re-pushes all 64 bytes in one burst and
+			 * only a couple of the colours in it have moved. */
+			const uint_fast8_t pi = gb->cgb.BGPaletteID & 0x3E;
+			const uint16_t raw = (gb->cgb.BGPalette[pi + 1] << 8) | (gb->cgb.BGPalette[pi]);
 #if WALNUT_GB_RGB565_BIGENDIAN
-			gb->cgb.fixPalette[(gb->cgb.BGPaletteID & 0x3E) >> 1] = bgr555_to_rgb565BE_accurate((gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) | (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)])); // convert native bgr 555 to rgb565 for native LCD panel rendering
+			const uint16_t packed = bgr555_to_rgb565BE_accurate(raw); // convert native bgr 555 to rgb565 for native LCD panel rendering
 #else
-  	  gb->cgb.fixPalette[(gb->cgb.BGPaletteID & 0x3E) >> 1] = bgr555_to_rgb565_accurate((gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E) + 1] << 8) | (gb->cgb.BGPalette[(gb->cgb.BGPaletteID & 0x3E)])); // convert native bgr 555 to rgb565 for native LCD panel rendering
+			const uint16_t packed = bgr555_to_rgb565_accurate(raw); // convert native bgr 555 to rgb565 for native LCD panel rendering
 #endif
-			gb->cgb.fixPaletteDirty = 1;
+			if(gb->cgb.fixPalette[pi >> 1] != packed) {
+				gb->cgb.fixPalette[pi >> 1] = packed;
+				gb->cgb.fixPaletteDirty = 1;
+			}
+		}
 			if(gb->cgb.BGPaletteInc) {
 				gb->cgb.BGPaletteID++;
 				gb->cgb.BGPaletteID = (gb->cgb.BGPaletteID) & 0x3F;
@@ -2373,12 +2390,20 @@ void __not_in_flash_func(__gb_write)(struct gb_s *gb, uint_fast16_t addr, uint8_
 		/* CGB OAM Palette*/
 		case 0x6B:
 			gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3F)] = val;
+		{
+			/* Same no-op filter as the BG palette write above. */
+			const uint_fast8_t pi = gb->cgb.OAMPaletteID & 0x3E;
+			const uint16_t raw = (gb->cgb.OAMPalette[pi + 1] << 8) + (gb->cgb.OAMPalette[pi]);
 #if WALNUT_GB_RGB565_BIGENDIAN
-			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = bgr555_to_rgb565BE_accurate((gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]));
+			const uint16_t packed = bgr555_to_rgb565BE_accurate(raw);
 #else
-			gb->cgb.fixPalette[0x20 + ((gb->cgb.OAMPaletteID & 0x3E) >> 1)] = bgr555_to_rgb565_accurate((gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E) + 1] << 8) + (gb->cgb.OAMPalette[(gb->cgb.OAMPaletteID & 0x3E)]));
+			const uint16_t packed = bgr555_to_rgb565_accurate(raw);
 #endif
-			gb->cgb.fixPaletteDirty = 1;
+			if(gb->cgb.fixPalette[0x20 + (pi >> 1)] != packed) {
+				gb->cgb.fixPalette[0x20 + (pi >> 1)] = packed;
+				gb->cgb.fixPaletteDirty = 1;
+			}
+		}
 			if(gb->cgb.OAMPaletteInc) {
 				gb->cgb.OAMPaletteID++;
 				gb->cgb.OAMPaletteID = (gb->cgb.OAMPaletteID) & 0x3F;
