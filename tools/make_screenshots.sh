@@ -10,7 +10,10 @@
 #                     dumps the 160x144 GBC frame it lands on;
 #   render_menus.cpp  compiles the *actual* UI drawing code out of main.cpp
 #                     and renders every menu screen -- plus that game frame
-#                     under the device's 1.5x scaler and status bar.
+#                     under the device's 1.5x scaler and status bar. The boot
+#                     menu uses the real catalog (your ROM names, cart tints
+#                     and assets/icons.png art) whenever the firmware has been
+#                     built; see build_render_menus.sh.
 #
 # The PPMs they emit are then upscaled 2x (nearest-neighbour, so the pixels
 # stay square) into screenshots/*.png.

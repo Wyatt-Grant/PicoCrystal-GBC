@@ -88,16 +88,22 @@ struct rom_entry_t {
 	uint32_t save_slot;
 	uint16_t label_color; // RGBA4444 cart-label tint, 0 = default accent
 	// 8x8 RGBA4444 tile from assets/icons.png, or nullptr for the drawn cart
-	// glyph. Left null for every entry here: the sheet is a per-user asset
-	// (like the ROMs), so the rendered boot.ppm shows the no-icons.png
-	// fallback that a fresh checkout gets. Paste a generated rom_N_icon[]
-	// array in here to eyeball real art.
+	// glyph (see the two catalogs below).
 	const uint16_t *icon;
 };
 
+#ifdef REAL_ROM_CATALOG
+// build_render_menus.sh found a built firmware's generated rom_data.cpp and
+// stripped its ROM payloads: real names, cart tints and icons.png tiles, so
+// the boot menu screenshot shows the menu as it looks on this device.
+#include "rom_catalog.inc"
+constexpr uint32_t ROM_COUNT = sizeof rom_catalog / sizeof rom_catalog[0];
+#else
+// No firmware build to borrow a catalog from, so this placeholder list stands
+// in -- what a fresh checkout renders. A couple of entries carry a
+// label_color to exercise the per-ROM cart tint; the rest fall back to the
+// accent (0), and every icon is null, i.e. the no-icons.png cart glyph.
 constexpr uint32_t ROM_COUNT = 8;
-// A couple of entries carry a label_color so the rendered boot.ppm exercises
-// the per-ROM cart tint; the rest fall back to the accent (0).
 static const rom_entry_t rom_catalog[ROM_COUNT] = {
 	{ "POKEMON CRYSTAL", nullptr, 8 * 1024 * 1024, 0, 0xF3F1 },  // yellow-ish
 	{ "CHROMATIC TETRIS", nullptr, 512 * 1024, 1, 0xFF04 },      // blue
@@ -108,6 +114,7 @@ static const rom_entry_t rom_catalog[ROM_COUNT] = {
 	{ "STAR OCEAN BLUE SPHERE", nullptr, 4 * 1024 * 1024, 5, 0 },
 	{ "POKEMON PINBALL", nullptr, 2 * 1024 * 1024, 6, 0 },
 };
+#endif
 
 #include "menu_draw.inc"
 
