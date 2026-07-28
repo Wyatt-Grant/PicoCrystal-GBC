@@ -3059,10 +3059,20 @@ int main() {
 	// an immediate update instead of sitting on the boot-success green for ~0.5s.
 	constexpr int BATTERY_UPDATE_FRAMES = 30;
 	int battery_count = BATTERY_UPDATE_FRAMES;
+	int batt_level = 0; // last polled level, so the save blink can hand the
+			    // LED straight back without waiting for the next poll
 
 	// Flash-commit LED blink state (see the blink block in the loop).
 	constexpr uint64_t SAVING_HOLD_US = 2000000;
+	// Cap on how long a *queued* save (requested, nothing written yet) may
+	// hold the blink up. The commit itself re-arms the hold for as long as it
+	// actually runs, but a request can sit behind a multi-second slot
+	// pre-erase, and re-arming across all of that -- then again on the next
+	// request -- is what let repeated X+B presses run the blink together into
+	// one that never visibly ended.
+	constexpr uint64_t SAVING_PENDING_MAX_US = 3000000;
 	uint64_t saving_hold_until = 0;  // blink runs while now < this
+	uint64_t pending_since = 0;      // when the queued save was first seen (0 = none)
 	bool saving_led = false;         // save blink owns the LED
 
 #if ENABLE_LCD
@@ -3163,8 +3173,12 @@ int main() {
 		// than left to the commit window alone, so a press lands visibly
 		// even when there is nothing dirty to write (the request is then a
 		// no-op, and a silent one would be indistinguishable from a chord
-		// that didn't register).
-		if (save_interval_manual() &&
+		// that didn't register). A press while a request is already
+		// queued is dropped rather than re-armed: the save it is asking
+		// for is already on its way, and re-arming from a combination the
+		// game itself uses is how a stray Start+B (or a run of them) used
+		// to chain 2s holds together into a blink that never let up.
+		if (save_interval_manual() && !save_storage_pending() &&
 		    button(picosystem::X) && button(picosystem::B) &&
 		    (pressed(picosystem::X) || pressed(picosystem::B))) {
 			save_storage_request_save();
@@ -3201,9 +3215,20 @@ int main() {
 		// counts as active before any flash op starts (see
 		// save_storage_pending) -- otherwise a manual X+B save waiting on
 		// the slot pre-erase or the quiet gate would sit dark for a second
-		// or two, reading as "the chord did nothing".
+		// or two, reading as "the chord did nothing" -- but only for
+		// SAVING_PENDING_MAX_US, so a queue that is waiting on a slow
+		// pre-erase can't hold the LED up indefinitely. The write itself
+		// (save_storage_saving) re-arms unconditionally: that is the window
+		// a power-off would actually damage, and it is self-limiting.
 		uint64_t saving_now = time_us_64();
-		if (save_storage_saving() || save_storage_pending())
+		if (save_storage_pending()) {
+			if (!pending_since)
+				pending_since = saving_now;
+		} else {
+			pending_since = 0;
+		}
+		if (save_storage_saving() ||
+		    (pending_since && saving_now - pending_since < SAVING_PENDING_MAX_US))
 			saving_hold_until = saving_now + SAVING_HOLD_US;
 		bool saving = saving_now < saving_hold_until;
 
@@ -3212,6 +3237,7 @@ int main() {
 			int level = battery();
 			if (level < 0)   level = 0;
 			if (level > 100) level = 100;
+			batt_level = level;
 #if ENABLE_LCD
 			// Anti-flicker: the ADC reading jitters between adjacent
 			// levels, so once a level is painted it stays pinned for 3s
@@ -3232,10 +3258,12 @@ int main() {
 
 		// The LED signposts the flash-commit window: a fast blue/magenta
 		// blink, in every screen mode -- so a power-off during the write
-		// window is always signposted. When the window closes the forced
-		// battery_count makes the next iteration's tick restore the normal
-		// battery gradient (or RGB hue) immediately instead of leaving the
-		// LED dark for up to 30 frames.
+		// window is always signposted. The closing edge hands the LED
+		// straight back to the battery gradient (or dark, in FS BATTERY)
+		// from the last polled level, rather than forcing the battery
+		// counter and waiting a frame for it: the deferred version left
+		// the LED sitting on whichever blink colour was last written
+		// until that tick came round.
 		if (saving) {
 			const int b = led_brightness();
 			if ((saving_now >> 17) & 1) // ~131ms half-period, ~3.8Hz
@@ -3245,7 +3273,7 @@ int main() {
 			saving_led = true;
 		} else if (saving_led) {
 			saving_led = false;
-			battery_count = BATTERY_UPDATE_FRAMES;
+			led_show_battery(batt_level);
 		}
 
 #if ENABLE_LCD
