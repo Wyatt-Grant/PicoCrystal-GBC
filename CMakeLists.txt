@@ -36,7 +36,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/picosystem/picosystem.cmake)
 # .incbin) plus rom_data.hpp/.cpp (the boot-menu catalog). CONFIGURE_DEPENDS
 # re-runs this automatically on the next build when ROMs are added or
 # removed. assets/roms.json (optional, see README) pins menu order, display
-# names, and save slots.
+# names, and save slots; assets/icons.png (optional too) supplies per-game
+# boot-menu art.
 
 file(GLOB ROM_FILES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/assets/*.gb
@@ -47,7 +48,9 @@ if(NOT ROM_FILES)
         "build again -- every ROM there becomes a boot-menu entry. (This "
         "repo ships no ROMs; use your own dumps or homebrew.)")
 endif()
-file(GLOB ROM_MANIFEST CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/roms.json)
+file(GLOB ROM_MANIFEST CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/assets/roms.json
+    ${CMAKE_CURRENT_SOURCE_DIR}/assets/icons.png)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(ROM_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)

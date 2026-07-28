@@ -1,12 +1,15 @@
 build/
 
 # ROMs are never committed -- drop your own .gb/.gbc files in assets/
-# (see README). roms.json is a per-user manifest for them.
+# (see README). roms.json is a per-user manifest for them, and icons.png the
+# matching per-user boot-menu art (its tiles are keyed to your save slots, and
+# game art isn't ours to ship).
 assets/*.gb
 assets/*.gbc
 assets/*.GB
 assets/*.GBC
 assets/roms.json
+assets/icons.png
 # ...except colorbar.gbc: a free test-pattern ROM committed so CI has
 # something valid to build against (see .github/workflows/cmake.yml).
 !assets/colorbar.gbc

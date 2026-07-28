@@ -1033,6 +1033,19 @@ static void draw_cart_label(int32_t x, int32_t y, color_t col) {
 			fill_rect(x + rx * 2, y + ry * 2, 2, 2, col);
 }
 
+// Per-game boot-menu art: an 8x8 RGBA4444 tile out of assets/icons.png (see
+// gen_rom_data.py), drawn at 2x like the 7x7 glyphs above so it occupies a
+// 16x16 box. The tiles carry their own colors, so unlike draw_icon() this
+// takes no tint -- the artwork is the same on the selected row and in either
+// appearance mode. Transparent source pixels pack to 0 and are skipped, so
+// the row highlight shows through around the art.
+static void draw_rom_icon(int32_t x, int32_t y, const uint16_t *icon) {
+	for (int32_t ry = 0; ry < 8; ry++)
+		for (int32_t rx = 0; rx < 8; rx++)
+			if (icon[ry * 8 + rx])
+				fill_rect(x + rx * 2, y + ry * 2, 2, 2, icon[ry * 8 + rx]);
+}
+
 // RGBA4444 layout per rgb565_to_color: R in bits 0-3, A 4-7, B 8-11, G 12-15.
 // STATUS_WHITE/GREY carry the primary/secondary text roles; along with the six
 // UI_* neutrals below they are swapped between dark and light by apply_mode()
@@ -1966,13 +1979,23 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 			fill_rect(UI_MARGIN - 6, y + 1, UI_RIGHT - UI_MARGIN + 12, 18, UI_ROW_SEL);
 			fill_rect(UI_MARGIN - 5, y, UI_RIGHT - UI_MARGIN + 10, 20, UI_ROW_SEL);
 		}
-		draw_icon(UI_MARGIN, y + 4,
-			  i < ROM_COUNT ? ICON_CART : ICON_SLIDERS,
-			  is_sel ? UI_ACCENT : STATUS_DIM);
-		// Per-ROM cart label tint (roms.json "color"), 0 = leave default.
-		// The selected row stays fully theme-accent, so skip the overlay there.
-		if (i < ROM_COUNT && !is_sel && rom_catalog[i].label_color)
-			draw_cart_label(UI_MARGIN, y + 4, rom_catalog[i].label_color);
+		// Games with art in assets/icons.png show it instead of the cart
+		// glyph; the 16x16 tile sits a pixel higher than the 14x14 glyph so
+		// both stay centered on the name. Slots with no tile (and the
+		// SETTINGS row) keep the drawn icons.
+		const uint16_t *art = i < ROM_COUNT ? rom_catalog[i].icon : nullptr;
+		if (art) {
+			draw_rom_icon(UI_MARGIN, y + 3, art);
+		} else {
+			draw_icon(UI_MARGIN, y + 4,
+				  i < ROM_COUNT ? ICON_CART : ICON_SLIDERS,
+				  is_sel ? UI_ACCENT : STATUS_DIM);
+			// Per-ROM cart label tint (roms.json "color"), 0 = leave default.
+			// The selected row stays fully theme-accent, so skip the overlay
+			// there.
+			if (i < ROM_COUNT && !is_sel && rom_catalog[i].label_color)
+				draw_cart_label(UI_MARGIN, y + 4, rom_catalog[i].label_color);
+		}
 
 		const char *name = i < ROM_COUNT ? rom_catalog[i].name : "SETTINGS";
 		int32_t name_x = UI_MARGIN + 22;

@@ -46,7 +46,8 @@ make
 > `assets/roms.json` to rename games, fix their menu order, and pin save slots.
 > This matters especially if you have saves you want to keep — see
 > [Customizing names, order, and save slots](#customizing-names-order-and-save-slots-assetsromsjson)
-> below.
+> below. An `assets/icons.png` sheet gives each game its own boot-menu icon —
+> see [Per-game menu art](#per-game-menu-art-assetsiconspng).
 
 Every `.gb`/`.gbc` file in `assets/` is validated (header checksum, supported
 mapper, cart-RAM size) and embedded into the firmware; the build fails with a
@@ -161,6 +162,21 @@ save data itself is untouched — saves live outside the firmware and survive
 reflashing). If you change the ROM list on a device with saves you want to
 keep, pin each existing game's slot in `roms.json` first — the build log
 prints every game's current slot.
+
+## Per-game menu art (`assets/icons.png`)
+
+Games show a generic cartridge glyph in the boot menu, tinted by the `color`
+above. Drop an `assets/icons.png` next to your ROMs to replace it with your own
+8×8 pixel art: **8px wide, one 8×8 tile per save slot stacked top to bottom**,
+so a full sheet covering all 14 slots is 8×112. Save it as a non-interlaced,
+8-bit PNG; transparent pixels let the row highlight show through, and the menu
+draws each tile at 2× (16×16 on screen).
+
+Tiles are keyed by **save slot**, not menu position — the same number the build
+log prints — so an icon stays with its game when the menu order changes, just
+like its save does. Slots you leave blank (or past the end of a shorter sheet)
+fall back to the cartridge glyph, and with no `icons.png` at all nothing
+changes. The sheet is gitignored like the ROMs and `roms.json`.
 
 ## Repo layout
 

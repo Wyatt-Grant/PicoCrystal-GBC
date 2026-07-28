@@ -87,6 +87,12 @@ struct rom_entry_t {
 	uint32_t size;
 	uint32_t save_slot;
 	uint16_t label_color; // RGBA4444 cart-label tint, 0 = default accent
+	// 8x8 RGBA4444 tile from assets/icons.png, or nullptr for the drawn cart
+	// glyph. Left null for every entry here: the sheet is a per-user asset
+	// (like the ROMs), so the rendered boot.ppm shows the no-icons.png
+	// fallback that a fresh checkout gets. Paste a generated rom_N_icon[]
+	// array in here to eyeball real art.
+	const uint16_t *icon;
 };
 
 constexpr uint32_t ROM_COUNT = 8;

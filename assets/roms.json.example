@@ -20,6 +20,8 @@
     "        little label sticker on this game's cart icon in the boot menu.",
     "        Defaults to the UI accent color. Channels are shown at the",
     "        screen's 4-bit depth, so nearby shades may look identical.",
+    "        Ignored for games whose slot has art in assets/icons.png, which",
+    "        replaces the cart icon outright (see the README).",
     "The array sets menu order; any assets/ files not listed here are appended",
     "alphabetically. Entries whose file is missing are skipped with a warning",
     "but keep their slot reserved (so removing/re-adding a game keeps its save)."
