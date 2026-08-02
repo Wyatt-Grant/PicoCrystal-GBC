@@ -137,6 +137,16 @@ static inline uint32_t wgb_rom_read32_direct(uint_fast32_t addr) {
 
 static volatile uint32_t _line_wr = 0;
 static volatile uint32_t _line_rd = 0;
+// A third index, one step behind _line_rd: core1 publishes it after the
+// *framebuffer stores* of a job, where _line_rd is published before them (see
+// render_line_job's retire comment -- the early retire is deliberate, it
+// releases the VRAM fence while the stores are still pending). Anything on
+// core0 that touches the framebuffer rows the emulator owns has to wait on
+// this one, not on _line_rd: "_line_rd == _line_wr" only means no render is
+// outstanding, and a line whose stores are still in flight (or parked in the
+// vsync chase, which can hold them for most of a frame) will land on top of
+// whatever core0 drew in the meantime.
+static volatile uint32_t _line_done = 0;
 
 struct gb_s; // walnut_cgb.h's context type, defined inside the include below
 static void wgb_lcd_enqueue(struct gb_s *gb);
@@ -637,37 +647,60 @@ static inline void update_joypad() {
 // @ui-draw fence, which tools/render_menus.cpp extracts and builds on the host
 // where there is no GPIO.
 constexpr uint32_t CHARGE_PIN = 24;
-// STAT has to hold a new level this long before the icon follows it. The
-// charger cycles in and out of charging around termination, and an icon that
-// tracked that raw would sit there flickering the bolt on and off.
-constexpr uint64_t CHARGE_SETTLE_US = 1000000;
+
+// STAT is asserted (low) while the cell takes charge and released otherwise --
+// but the charger does not hold it steady near termination, where it tops the
+// cell off in bursts and releases STAT in the gaps. So the two directions are
+// deliberately asymmetric: charging asserts on a confirmed low and only clears
+// after a full CHARGE_RELEASE_US with no low seen at all. Bursts of any duty
+// cycle read as "charging"; only a genuinely released STAT clears the bolt.
+//
+// This replaced a symmetric "hold a level for a full second before believing
+// it" debounce, which could not represent a bursting STAT: any pattern whose
+// dwell times ran shorter than the settle window restarted the timer on every
+// sample, so the state froze at whatever it happened to be when the bursts
+// began. Plug in a nearly-full device and the bolt would never appear -- and
+// since the boot seed below is a single sample, whether it came up right was
+// down to which phase of the burst that one read landed in.
+constexpr uint64_t CHARGE_RELEASE_US = 3000000;
 
 static bool g_charging = false;        // debounced, what the icon draws
-static bool charge_raw = false;        // last level read off the pin
-static uint64_t charge_since = 0;      // when charge_raw last changed
+static bool charge_prev_low = false;   // previous sample, for the confirm below
+static uint64_t charge_last_low = 0;   // when STAT was last seen asserted
 
 static void charge_sense_init() {
 	gpio_init(CHARGE_PIN);
 	gpio_set_dir(CHARGE_PIN, GPIO_IN);
 	gpio_pull_up(CHARGE_PIN); // open-drain STAT, floats high when not charging
 	// Seed from the pin so booting on the charger shows the bolt straight
-	// away instead of waiting out a settle window it never needed.
-	charge_raw = g_charging = !gpio_get(CHARGE_PIN);
-	charge_since = time_us_64();
+	// away instead of waiting out a confirm it never needed.
+	charge_prev_low = g_charging = !gpio_get(CHARGE_PIN);
+	charge_last_low = time_us_64();
 }
 
-// Returns true when the debounced state changed, so the caller can repaint.
+// Polled every frame -- one SIO read, and the burst gaps this has to measure
+// are far shorter than the battery ADC's cadence. Returns true when the drawn
+// state changed, so the caller can repaint.
 static bool charge_sense_poll() {
 	const uint64_t now = time_us_64();
-	const bool raw = !gpio_get(CHARGE_PIN); // active low
+	const bool low = !gpio_get(CHARGE_PIN); // active low
+	const bool prev = charge_prev_low;
+	charge_prev_low = low;
 
-	if (raw != charge_raw) {
-		charge_raw = raw;
-		charge_since = now;
-		return false;
-	}
-	if (raw != g_charging && now - charge_since >= CHARGE_SETTLE_US) {
-		g_charging = raw;
+	if (low)
+		charge_last_low = now;
+
+	if (!g_charging) {
+		// Two lows in a row before believing it: against a ~50k internal
+		// pull-up on a floating line, one stray low sample is likelier
+		// to be noise than a charger. At frame rate that is ~17-25ms, so
+		// the bolt still appears the moment the cable goes in.
+		if (low && prev) {
+			g_charging = true;
+			return true;
+		}
+	} else if (now - charge_last_low >= CHARGE_RELEASE_US) {
+		g_charging = false;
 		return true;
 	}
 	return false;
@@ -700,9 +733,16 @@ enum color_filter_t : uint8_t {
 	CF_GBC = 1,   // pinned: flash records predate the mode list and stored
 		      // this byte as the old ON/OFF toggle, so 0 and 1 have to
 		      // keep meaning OFF and GBC (device_settings_t::color_filter)
+	// Everything past CF_GBC is ordered by family (saturation boosts, then
+	// the washed-out pair, then the monochromes) rather than by age, so the
+	// settings row walks a list that makes sense. Inserting into the middle
+	// does remap an already-stored byte -- a device holding MONO comes back
+	// on SORBET once -- which is the accepted cost of keeping the order
+	// meaningful; only 0 and 1 carry a compatibility promise.
 	CF_VIVID,
 	CF_CANDY,
 	CF_PASTEL,
+	CF_SORBET,   // a lighter PASTEL curve over a saturation boost: candy pastels
 	CF_MONO,
 	CF_SEPIA,
 	CF_NIGHT,
@@ -835,6 +875,7 @@ static void cf_build_tables(uint8_t mode) {
 		break;
 	}
 	case CF_CANDY:  cf_sat_matrix(448); break; // x1.75
+	case CF_SORBET: cf_sat_matrix(320); break; // x1.25
 	case CF_VIVID:  cf_sat_matrix(352); break; // x1.375
 	case CF_NIGHT:  cf_sat_matrix(192); break; // x0.75
 	case CF_PASTEL: cf_sat_matrix(141); break; // x0.55
@@ -865,8 +906,32 @@ static void cf_build_tables(uint8_t mode) {
 			c[0] = c[1] = c[2] = 132 + ((cf_lift(v, 80) - 132) * 5 >> 2);
 			break;
 		case CF_PASTEL:
-			// Heavily lifted: high-key, milky, low-contrast.
+			// Heavily lifted: high-key, milky, low-contrast. Pairs
+			// with the x0.55 desaturation in the matrix above.
 			c[0] = c[1] = c[2] = cf_lift(v, 190);
+			break;
+		case CF_SORBET:
+			// PASTEL's curve with a second, gentler pass over it,
+			// run over a x1.25 boost instead of a desaturation --
+			// the candy reading of the same picture, and the
+			// lightest mode in the list. Two passes rather than one
+			// bigger amount because a single lift saturates: 190 is
+			// already most of the way to the curve's ceiling, so
+			// 190 -> 256 moves the midtones by about 10/255, while
+			// lifting the lifted ramp again picks up the fresh
+			// headroom the first pass created (mid-grey 175 -> 202,
+			// shadows 53 -> 74). The ordering is the whole trick:
+			// lifting toward white is itself a desaturation, so the
+			// boost has to happen *before* the curve washes it out,
+			// and what comes back down is chalky colour rather than
+			// PASTEL's greyed milk. The matrix is kept well under
+			// CANDY's x1.75 on purpose -- past ~x1.3 the bright end
+			// clips to flat primaries, which is CANDY's look and the
+			// opposite of this one, and the second lift spends some
+			// of that headroom already. Blacks still land on black
+			// (cf_lift fixes both endpoints), so outlines and text
+			// survive.
+			c[0] = c[1] = c[2] = cf_lift(cf_lift(v, 190), 128);
 			break;
 		case CF_SEPIA: {
 			// Warm monochrome: per-channel gains on a lifted ramp.
@@ -1063,12 +1128,13 @@ static uint16_t _pal_src[0x40];
 // old synchronous code.
 //
 // Ring discipline: core0 is the only writer of _line_wr, core1 the only
-// writer of _line_rd (classic SPSC indexes, declared above the walnut_cgb.h
-// include so the fence macro can see them; both monotonically increasing,
-// wrapped only at index time). The Cortex-M0+ executes and retires stores
-// in order and the RP2040 bus fabric preserves per-master ordering, so a
-// volatile index publish after the payload stores is sufficient -- the
-// compiler barrier stops the compiler itself from reordering.
+// writer of _line_rd and _line_done (classic SPSC indexes, declared above the
+// walnut_cgb.h include so the fence macro can see them; all monotonically
+// increasing, wrapped only at index time). The Cortex-M0+ executes and
+// retires stores in order and the RP2040 bus fabric preserves per-master
+// ordering, so a volatile index publish after the payload stores is
+// sufficient -- the compiler barrier stops the compiler itself from
+// reordering.
 struct line_job {
 	wgb_scanline_state st;      // PPU register/palette snapshot; st.oam -> oam[]
 	uint8_t oam[0xA0];          // OAM snapshot; the render must not see live OAM
@@ -1222,6 +1288,13 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 	} else {
 		memcpy(_prev_row, dst, sizeof(_prev_row));
 	}
+
+	// Stores complete -- publish the index core0's framebuffer waits key
+	// off (see _line_done). Ordered after the stores by the same argument
+	// as the retire above: in-order retirement on the M0+ plus a compiler
+	// barrier.
+	__compiler_memory_barrier();
+	_line_done = _line_done + 1;
 }
 
 // ---------------------------------------------------------------------
@@ -2070,6 +2143,12 @@ struct menu_battery_poll {
 	int count = INTERVAL_FRAMES;
 	uint32_t level = 0;
 	uint32_t poll() {
+		// Charge state is polled every frame rather than on the ADC's
+		// interval: STAT bursts, and the slow cadence aliases the bursts
+		// away (see charge_sense_poll). Menus repaint every frame, so
+		// unlike the in-game status bar there is nothing to mark dirty --
+		// the updated g_charging is picked up by the next draw.
+		charge_sense_poll();
 		if (++count >= INTERVAL_FRAMES) {
 			count = 0;
 			int b = battery();
@@ -2077,10 +2156,6 @@ struct menu_battery_poll {
 			if (b > 100) b = 100;
 			level = (uint32_t)b;
 			led_show_battery(b);
-			// Menus repaint every frame, so unlike the in-game
-			// status bar there is nothing to mark dirty -- the
-			// updated g_charging is picked up by the next draw.
-			charge_sense_poll();
 		}
 		return level;
 	}
@@ -2354,7 +2429,7 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// to the classic DMG greens. Costs nothing per frame whichever is
 	// chosen: the whole effect is baked into the 64-entry palette LUT.
 	static const char *const CF_NAMES[CF_COUNT] = {
-		"OFF", "GBC", "VIVID", "CANDY", "PASTEL", "MONO",
+		"OFF", "GBC", "VIVID", "CANDY", "PASTEL", "SORBET", "MONO",
 		"SEPIA", "NIGHT", "GB GREEN", "POCKET", "INVERT",
 	};
 	draw_value_row(SET_ROW_COLOR, sel, ICON_DROPLET, "COLOR FILTER",
@@ -2682,6 +2757,17 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 			fill_rect(UI_MARGIN - 6, y + 1, UI_RIGHT - UI_MARGIN + 12, 18, UI_ROW_SEL);
 			fill_rect(UI_MARGIN - 5, y, UI_RIGHT - UI_MARGIN + 10, 20, UI_ROW_SEL);
 		}
+		// Last-played marker: a 3px accent dot a pixel in from the left
+		// edge of the screen, clear of both the selection pill (which
+		// starts at x = 6) and the icon (UI_MARGIN), so it reads the
+		// same on the bare card and on the pill. g_last_slot is 0xFF
+		// until a game has been booted, which matches no catalog entry,
+		// so a fresh device shows no dot; after that the dot is usually
+		// on the selected row, since rom_select() opens the cursor
+		// there.
+		if (i < ROM_COUNT && rom_catalog[i].save_slot == g_last_slot)
+			fill_rect(1, y + 8, 3, 3, UI_INK);
+
 		// Games with art in assets/icons.png show it instead of the cart
 		// glyph; the 16x16 tile sits a pixel higher than the 14x14 glyph so
 		// both stay centered on the name. Slots with no tile (and the
@@ -4058,17 +4144,18 @@ int main() {
 		}
 #endif
 
+#if ENABLE_LCD
+		// Charge state is polled every frame, not on the ADC's cadence:
+		// STAT bursts around termination, and sampling it twice a second
+		// aliases those bursts away. A change repaints the band -- the
+		// bolt lives inside the battery icon, which is only redrawn on a
+		// status repaint.
+		if (charge_sense_poll())
+			status_dirty = true;
+#endif
+
 		if (++battery_count >= BATTERY_UPDATE_FRAMES) {
 			battery_count = 0;
-#if ENABLE_LCD
-			// Charge state rides the same cadence as the ADC: it
-			// carries a 1s settle of its own, so polling it faster
-			// would only burn reads. A change repaints the band --
-			// the bolt lives inside the battery icon, which is
-			// only redrawn on a status repaint.
-			if (charge_sense_poll())
-				status_dirty = true;
-#endif
 			int level = battery();
 			if (level < 0)   level = 0;
 			if (level > 100) level = 100;
@@ -4156,7 +4243,13 @@ int main() {
 		// Let core1 finish this frame's queued scanlines before flipping,
 		// so the DMA never streams a frame with lines still landing. Core1
 		// runs well ahead of the emulator, so this is normally a no-op wait.
-		while (_line_rd != _line_wr)
+		//
+		// _line_done, not _line_rd: the retire happens before the stores,
+		// so waiting on _line_rd here left the frame's last rows still to
+		// be written -- both under the flip below and, worse, under the
+		// legend draw that follows, which is what made the bottom of the
+		// hotkey strip flicker with game pixels (see _line_done).
+		while (_line_done != _line_wr)
 			tight_loop_contents();
 
 		// The armed layer's legend goes on last, over the game rows core1

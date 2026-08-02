@@ -82,6 +82,7 @@ enum color_filter_t : uint8_t {
 	CF_VIVID,
 	CF_CANDY,
 	CF_PASTEL,
+	CF_SORBET,
 	CF_MONO,
 	CF_SEPIA,
 	CF_NIGHT,
@@ -135,6 +136,13 @@ static const rom_entry_t rom_catalog[ROM_COUNT] = {
 	{ "POKEMON PINBALL", nullptr, 2 * 1024 * 1024, 6, 0 },
 };
 #endif
+
+// Last-played slot (main.cpp persists it in the device settings), which the
+// boot menu marks with an accent dot. Pinned to the catalog entry the boot
+// screenshots select, because that is what the device shows: rom_select()
+// opens the cursor on the last-played row, so in practice the dot sits on the
+// selection pill rather than the bare card.
+static uint8_t g_last_slot = (uint8_t)rom_catalog[1].save_slot;
 
 #include "menu_draw.inc"
 

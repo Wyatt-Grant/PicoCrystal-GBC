@@ -13,7 +13,8 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
 
 - Full-speed CGB emulation on the RP2040's two Cortex-M0+ cores
   (overclocked to 250MHz), with optional tear-free vsync
-- Boot menu for multiple ROMs; per-game flash save regions
+- Boot menu for multiple ROMs; per-game flash save regions. It opens on the
+  last game you played, marked with an accent dot
 - Automatic battery-backed-save persistence: autosaves to flash a few
   seconds after the game writes cart RAM, double-buffered so a mid-save
   power-off can never destroy the last good save. The interval is
@@ -24,8 +25,10 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
   adjustable in the settings menu)
 - COLOR FILTER picture modes: GBC approximates a real GBC screen's channel
   bleed instead of showing raw palette values (softer, less saturated colors,
-  lifted a little to suit this panel), plus VIVID, PASTEL, MONO, SEPIA, NIGHT,
-  GB GREEN and POCKET (the two classic four-shade DMG palettes) and INVERT.
+  lifted a little to suit this panel), plus VIVID, CANDY, PASTEL, SORBET
+  (PASTEL's high-key wash with the saturation pushed up instead of down —
+  candy colors, softened), MONO, SEPIA, NIGHT, GB GREEN and POCKET (the two
+  classic four-shade DMG palettes) and INVERT.
   Every mode is baked into the palette lookup, so none of them costs a frame
 - Settings menu: brightness, volume, vsync, color filter,
   FPS/battery overlays, save interval, clock
