@@ -18,7 +18,8 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
   seconds after the game writes cart RAM, double-buffered so a mid-save
   power-off can never destroy the last good save. The interval is
   configurable (3s–120s, to limit flash wear on games that write cart RAM
-  constantly), or set it to MANUAL and save on demand with **X+B**
+  constantly), or set it to MANUAL and save on demand with the save hotkey
+  (see Controls)
 - MBC3 real-time clock, persisted across power cycles (freeze-while-off,
   adjustable in the settings menu)
 - COLOR FILTER picture modes: GBC approximates a real GBC screen's channel
@@ -26,8 +27,10 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
   lifted a little to suit this panel), plus VIVID, PASTEL, MONO, SEPIA, NIGHT,
   GB GREEN and POCKET (the two classic four-shade DMG palettes) and INVERT.
   Every mode is baked into the palette lookup, so none of them costs a frame
-- Settings menu (Y+X): brightness, volume, vsync, color filter,
+- Settings menu: brightness, volume, vsync, color filter,
   FPS/battery overlays, save interval, clock
+- Charging indicator: a bolt in the battery icon whenever the cell is taking
+  charge, in the status bar and every menu header
 
 **No ROMs are included** and none can be distributed with this repository.
 Use your own cartridge dumps or freely licensed homebrew.
@@ -68,8 +71,28 @@ boot menu.
 ## The boot menu
 
 - **UP/DOWN** to pick a game (long lists scroll), **A** to boot it
-- **Y+X** (or the SETTINGS row) opens settings, both here and in-game
+- **Y+X** (or the SETTINGS row) opens settings
 - To switch games, power-cycle the console
+
+## Controls (in-game)
+
+The eight buttons all belong to the Game Boy — X is START, Y is SELECT — so
+the shortcuts are bought with time rather than with a spare button:
+
+- **Tap Y, then press and hold Y.** After about a third of a second the LED
+  goes white and a legend appears along the bottom of the screen listing what
+  each button now does.
+- While it's armed (keep Y down):
+  - **X** opens the settings menu
+  - **B** commits the save to flash
+  - **LEFT/RIGHT** volume, **UP/DOWN** brightness — both repeat if held
+- Release Y to leave the layer. Nothing happens if you press nothing; a
+  volume or brightness change is written to flash on release.
+
+The layer is modal: while it's armed the game receives no input at all, so
+nudging the volume can't also walk your character across the map. A plain tap
+of Y is still SELECT — it's held back for a moment to see whether a second
+press follows, then handed over if none does.
 
 ## Screenshots
 

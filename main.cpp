@@ -379,7 +379,7 @@ static bool g_nostalgic_boot = true;
 
 // SAVE INTERVAL (settings menu row, persisted): the minimum spacing between
 // flash commits of the save file -- the wear throttle described in
-// save_storage.hpp. Index 0 is MANUAL (commit only on the in-game X+B chord);
+// save_storage.hpp. Index 0 is MANUAL (commit only on the in-game save hotkey);
 // the rest are the seconds a commit is held off for, however continuously the
 // game writes cart RAM. 3s is the historical fixed behaviour and stays the
 // default.
@@ -403,22 +403,274 @@ static inline int led_brightness() {
 	return 45 * g_brightness / 100;
 }
 
+// ---------------------------------------------------------------------
+// In-game hotkey layer: tap-then-hold Y.
+//
+// PicoSystem has eight buttons and the GBC wants all eight, so there is no
+// spare one to hang a menu/save shortcut on -- the shortcut has to be bought
+// with time instead. Y is the one button whose *hold* channel is dead in a
+// pokecrystal-engine game: Select is a tap (registered item, item swap) and
+// nothing reads it held. So the gesture is tap Y, then press Y again and keep
+// it down; the second press arms a layer where X opens the settings menu and
+// B commits the save.
+//
+// This replaces the old X+Y (menu) and X+B (save) chords. Both were ordinary
+// in-game combinations -- X+B is Start+B, routine with B-to-run -- and both
+// fired on the completing edge, so the slightest overlap tripped them, one of
+// them into a flash write. Tap-then-hold can't be produced by accident: it
+// needs a release between the two presses and HK_HOLD_US of hold after the
+// second.
+//
+// Select stays lossless. Y is withheld from the joypad for as long as the
+// gesture is still live, and whatever the gesture turns out NOT to be is
+// handed back to the game afterwards as synthetic Select taps -- one loop
+// iteration per edge, since gb.direct.joypad carries one state per emulated
+// frame and an edge pair the game can actually see needs two of them. The
+// cost is up to HK_TAP_US + HK_GAP_US of latency on a real Select press,
+// which a registered item does not care about.
+enum class hk_state_t : uint8_t {
+	IDLE,     // nothing in progress
+	TAP_DOWN, // first press down, still short enough to be the leading tap
+	TAP_UP,   // leading tap complete, waiting for the second press
+	HOLD,     // second press down, waiting out HK_HOLD_US
+	ARMED,    // hotkey layer live: X = menu, B = save
+	DRAIN,    // armed layer let go, waiting for its partners to come up
+	PASSTHRU, // not the gesture -- feed Y through live until released
+};
+
+// The leading press must come back up inside this, or it is a genuine Select
+// hold rather than a tap.
+constexpr uint64_t HK_TAP_US = 250000;
+// ...and the second press must start inside this of the leading tap's release.
+constexpr uint64_t HK_GAP_US = 300000;
+// How long the second press has to be held before the layer arms.
+constexpr uint64_t HK_HOLD_US = 350000;
+
+static hk_state_t hk_state = hk_state_t::IDLE;
+static uint64_t hk_deadline = 0;    // meaning depends on the state
+static uint8_t hk_replay_taps = 0;  // synthetic Select taps still owed the game
+static bool hk_replay_down = false; // which edge of the current one comes next
+static bool hk_select = false;      // SELECT level handed to update_joypad()
+static bool hk_swallow = false;     // hide X/B from the game (armed layer)
+
+// What the layer fired this iteration, for the run loop to act on. The two
+// axes are directions rather than one-shots because they repeat while held --
+// volume and brightness have ranges you would not want to tap out a step at a
+// time.
+enum class hk_action_t : uint8_t { NONE, MENU, SAVE };
+struct hk_result_t {
+	hk_action_t action;
+	int32_t volume;     // -1 / 0 / +1, from LEFT/RIGHT
+	int32_t brightness; // -1 / 0 / +1, from DOWN/UP
+	bool closed;        // the layer disarmed this iteration
+};
+
+// Hold-to-repeat, shared with the menus (defined further down with the other
+// menu input helpers -- the armed layer wants exactly the same feel as < >
+// adjust on a settings row, so it uses the same timings rather than its own).
+static int32_t menu_repeat_dir(uint32_t neg, uint32_t pos, uint64_t &next_repeat);
+static uint64_t hk_vol_repeat = 0, hk_bright_repeat = 0;
+
+static inline bool hotkey_armed() {
+	return hk_state == hk_state_t::ARMED;
+}
+
+// Every button the armed layer takes over -- which is all of them bar Y, whose
+// level the layer drives directly. The layer is modal: while it is up the game
+// receives no input at all, so there is no "half the pad still plays" state to
+// reason about, and the legend on screen describes the whole controller.
+static bool hotkey_any_partner_down() {
+	return button(picosystem::A) || button(picosystem::B) ||
+	       button(picosystem::X) || button(picosystem::UP) ||
+	       button(picosystem::DOWN) || button(picosystem::LEFT) ||
+	       button(picosystem::RIGHT);
+}
+
+// Back to a clean slate with nothing owed the game. Called after the settings
+// menu returns: it drains every button on its way out, so the gesture that
+// opened it is long gone by then and its state would only be stale.
+static void hotkey_reset() {
+	hk_state = hk_state_t::IDLE;
+	hk_replay_taps = 0;
+	hk_replay_down = false;
+	hk_select = false;
+	hk_swallow = false;
+}
+
+// Advance the gesture one loop iteration (= one emulated frame). Must run
+// before update_joypad(), which consumes hk_select/hk_swallow.
+static hk_result_t hotkey_poll() {
+	const uint64_t now = time_us_64();
+	const bool y = button(picosystem::Y);
+	hk_result_t out = { hk_action_t::NONE, 0, 0, false };
+
+	switch (hk_state) {
+	case hk_state_t::IDLE:
+		if (pressed(picosystem::Y)) {
+			hk_state = hk_state_t::TAP_DOWN;
+			hk_deadline = now + HK_TAP_US;
+		}
+		break;
+
+	case hk_state_t::TAP_DOWN:
+		if (!y) {
+			hk_state = hk_state_t::TAP_UP;
+			hk_deadline = now + HK_GAP_US;
+		} else if (now >= hk_deadline) {
+			// Too long to be the leading tap: an ordinary Select
+			// press. Hand it over live for the rest of its hold --
+			// the game loses the first HK_TAP_US of it, which
+			// nothing in a pokecrystal engine is looking at.
+			hk_state = hk_state_t::PASSTHRU;
+		}
+		break;
+
+	case hk_state_t::TAP_UP:
+		if (pressed(picosystem::Y)) {
+			hk_state = hk_state_t::HOLD;
+			hk_deadline = now + HK_HOLD_US;
+		} else if (now >= hk_deadline) {
+			// No second press -- it was a plain Select tap all
+			// along. Give it back.
+			hk_replay_taps = 1;
+			hk_state = hk_state_t::IDLE;
+		}
+		break;
+
+	case hk_state_t::HOLD:
+		if (!y) {
+			// Let go before arming: a double tap, not the gesture.
+			// Both taps are owed to the game.
+			hk_replay_taps = 2;
+			hk_state = hk_state_t::IDLE;
+		} else if (now >= hk_deadline) {
+			hk_state = hk_state_t::ARMED;
+		}
+		break;
+
+	case hk_state_t::ARMED:
+		if (pressed(picosystem::X))
+			out.action = hk_action_t::MENU;
+		else if (pressed(picosystem::B))
+			out.action = hk_action_t::SAVE;
+		out.volume = menu_repeat_dir(picosystem::LEFT, picosystem::RIGHT,
+					     hk_vol_repeat);
+		out.brightness = menu_repeat_dir(picosystem::DOWN, picosystem::UP,
+						 hk_bright_repeat);
+		if (!y) {
+			hk_state = hk_state_t::DRAIN;
+			out.closed = true;
+		}
+		break;
+
+	case hk_state_t::DRAIN:
+		// Y came up first but a partner may still be down. Keep the pad
+		// hidden until everything is released, or the game would be
+		// handed the tail of a press whose head it never saw.
+		if (!hotkey_any_partner_down())
+			hk_state = hk_state_t::IDLE;
+		break;
+
+	case hk_state_t::PASSTHRU:
+		if (!y)
+			hk_state = hk_state_t::IDLE;
+		break;
+	}
+
+	if (hk_replay_taps) {
+		// One edge per iteration. A replay in flight outranks a fresh
+		// press (which is being withheld anyway), and drains in at most
+		// four iterations.
+		if (!hk_replay_down) {
+			hk_select = true;
+			hk_replay_down = true;
+		} else {
+			hk_select = false;
+			hk_replay_down = false;
+			hk_replay_taps--;
+		}
+	} else {
+		hk_select = (hk_state == hk_state_t::PASSTHRU) && y;
+	}
+	hk_swallow = (hk_state == hk_state_t::ARMED || hk_state == hk_state_t::DRAIN);
+	if (!hk_swallow)
+		hk_vol_repeat = hk_bright_repeat = 0;
+
+	return out;
+}
+
 // Poll PicoSystem's 8 buttons and pack them into the GBC joypad byte (active
 // low, per JOYPAD_* in walnut_cgb.h). PicoSystem has no Start/Select of its
-// own, so X->Start, Y->Select. Holding Y and X together opens
-// the settings menu -- detected in the run loop before this is called, so a
-// completed chord never reaches the game as Start+Select.
+// own, so X->Start, Y->Select. SELECT comes from the hotkey layer above rather
+// than straight off the button, and while that layer is armed the entire pad
+// is hidden from the game -- the d-pad included, or nudging the volume would
+// walk the player across the map at the same time.
 static inline void update_joypad() {
 	uint8_t joypad = 0xFF;
-	if (button(picosystem::UP))    joypad &= ~JOYPAD_UP;
-	if (button(picosystem::DOWN))  joypad &= ~JOYPAD_DOWN;
-	if (button(picosystem::LEFT))  joypad &= ~JOYPAD_LEFT;
-	if (button(picosystem::RIGHT)) joypad &= ~JOYPAD_RIGHT;
-	if (button(picosystem::A))     joypad &= ~JOYPAD_A;
-	if (button(picosystem::B))     joypad &= ~JOYPAD_B;
-	if (button(picosystem::X))     joypad &= ~JOYPAD_START;
-	if (button(picosystem::Y))     joypad &= ~JOYPAD_SELECT;
+	if (!hk_swallow) {
+		if (button(picosystem::UP))    joypad &= ~JOYPAD_UP;
+		if (button(picosystem::DOWN))  joypad &= ~JOYPAD_DOWN;
+		if (button(picosystem::LEFT))  joypad &= ~JOYPAD_LEFT;
+		if (button(picosystem::RIGHT)) joypad &= ~JOYPAD_RIGHT;
+		if (button(picosystem::A))     joypad &= ~JOYPAD_A;
+		if (button(picosystem::B))     joypad &= ~JOYPAD_B;
+		if (button(picosystem::X))     joypad &= ~JOYPAD_START;
+	}
+	if (hk_select)                         joypad &= ~JOYPAD_SELECT;
 	gb.direct.joypad = joypad;
+}
+
+// ---------------------------------------------------------------------
+// Charge sense.
+//
+// The charger's status line (GPIO 24, `CHARGING` in picosystem/hardware.cpp's
+// pin enum) is the one input the SDK names but never initialises or reads, so
+// it is free for us. It is an open-drain STAT output pulled low while the cell
+// is taking charge; it floats high otherwise, which is why the pull-up matters.
+//
+// It reports *charging*, not *cable present*: plugged in with an already-full
+// battery, the charger stops driving STAT and this reads the same as unplugged.
+// That is the honest state to show -- the bolt means "filling", not "docked".
+//
+// The result lands in g_charging for the battery icon to draw from, rather than
+// the icon reading the pin itself: draw_battery_icon() lives inside the
+// @ui-draw fence, which tools/render_menus.cpp extracts and builds on the host
+// where there is no GPIO.
+constexpr uint32_t CHARGE_PIN = 24;
+// STAT has to hold a new level this long before the icon follows it. The
+// charger cycles in and out of charging around termination, and an icon that
+// tracked that raw would sit there flickering the bolt on and off.
+constexpr uint64_t CHARGE_SETTLE_US = 1000000;
+
+static bool g_charging = false;        // debounced, what the icon draws
+static bool charge_raw = false;        // last level read off the pin
+static uint64_t charge_since = 0;      // when charge_raw last changed
+
+static void charge_sense_init() {
+	gpio_init(CHARGE_PIN);
+	gpio_set_dir(CHARGE_PIN, GPIO_IN);
+	gpio_pull_up(CHARGE_PIN); // open-drain STAT, floats high when not charging
+	// Seed from the pin so booting on the charger shows the bolt straight
+	// away instead of waiting out a settle window it never needed.
+	charge_raw = g_charging = !gpio_get(CHARGE_PIN);
+	charge_since = time_us_64();
+}
+
+// Returns true when the debounced state changed, so the caller can repaint.
+static bool charge_sense_poll() {
+	const uint64_t now = time_us_64();
+	const bool raw = !gpio_get(CHARGE_PIN); // active low
+
+	if (raw != charge_raw) {
+		charge_raw = raw;
+		charge_since = now;
+		return false;
+	}
+	if (raw != g_charging && now - charge_since >= CHARGE_SETTLE_US) {
+		g_charging = raw;
+		return true;
+	}
+	return false;
 }
 
 #if ENABLE_LCD
@@ -1343,20 +1595,59 @@ constexpr color_t theme_pill(color_t a) {
 	return status_rgb((a & 0xF) >> 2, ((a >> 12) & 0xF) >> 2,
 			  ((a >> 8) & 0xF) >> 2);
 }
-constexpr uint32_t lift4(uint32_t c) { return 15 - (15 - c) * 3 / 16; } // 13/16 toward white
+// The light lift used to be 13/16 toward white, which 4-bit channels can't
+// actually express: (15-c)*3/16 truncates to 0 for every c >= 11, so the whole
+// pill range collapsed to 13..15 and the highlight ran 1.00-1.25:1 against the
+// card -- for VANILLA, COTTON and FROST it landed on (15,15,15), i.e. the card
+// color exactly, and the selected row simply had no pill.
+//
+// 10/16 leaves a 10..15 range, and the -2 step after it is what makes the pill
+// survive the pale themes: lifting alone still lands VANILLA at 1.01:1 and
+// LEMON at 1.04:1, because a near-white accent tinted toward white is a hue
+// difference with no luminance behind it. The subtraction buys every theme a
+// floor of 1.37:1 -- a band you can actually see -- and costs the ink nothing
+// it can't afford (6.2-9.1:1 becomes 4.5-6.3:1, still comfortably legible).
+constexpr uint32_t lift4(uint32_t c) {
+	uint32_t v = 15 - (15 - c) * 6 / 16; // 10/16 toward white
+	return v > 2 ? v - 2 : 0;            // ...then a guaranteed step off the card
+}
 constexpr color_t light_pill(color_t a) {
 	return status_rgb(lift4(a & 0xF), lift4((a >> 12) & 0xF),
 			  lift4((a >> 8) & 0xF));
 }
 
+// The accent as *ink* -- what it is drawn in when it carries text or a
+// foreground mark (labels, values, icons, clock hands, the header rule) rather
+// than filling an area. Dark mode uses the accent as-is: every theme is pitched
+// bright enough to read on the near-black card by construction. Light mode
+// can't reuse it for the same reason -- those same bright pitches sit at
+// 1.35-3.59:1 on the light card and its pill, which made the selected row the
+// least legible thing on the screen. Scaling the channels to 7/16 keeps the hue
+// plainly recognisable (MINT still reads mint) while landing every theme at
+// 4.5-6.3:1 against its pill (and 7-17:1 against the bare card, which is where
+// the header rule and the meter fills sit). This is what every accent-colored
+// element on the card draws in, meter fills included -- the raw accent survives
+// only as the theme's identity and the source the pill tint is derived from.
+constexpr color_t light_ink(color_t a) {
+	return status_rgb((a & 0xF) * 7 / 16, ((a >> 12) & 0xF) * 7 / 16,
+			  ((a >> 8) & 0xF) * 7 / 16);
+}
+
 static uint8_t g_theme = 0;     // UI_THEMES index, persisted in device settings
 static uint8_t g_dark_mode = 1; // 1 = dark, 0 = light; persisted in device settings
+// UI_ACCENT is the theme's canonical color -- its identity, and the source
+// theme_pill()/light_pill() tint the selection from. UI_INK is that accent
+// conditioned for the current appearance, and is what every accent-colored
+// element on the card actually draws in; in dark mode the two are equal, and
+// in light mode the ink is the darkened form. New draw sites want UI_INK.
 static color_t UI_ACCENT  = UI_THEMES[0].accent;
+static color_t UI_INK     = UI_THEMES[0].accent;
 static color_t UI_ROW_SEL = theme_pill(UI_THEMES[0].accent);
 
 static void apply_theme(uint32_t idx) {
 	g_theme = (uint8_t)(idx < THEME_COUNT ? idx : 0);
 	UI_ACCENT = UI_THEMES[g_theme].accent;
+	UI_INK = g_dark_mode ? UI_ACCENT : light_ink(UI_ACCENT);
 	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
 }
 
@@ -1366,7 +1657,7 @@ static void apply_theme(uint32_t idx) {
 static color_t UI_CARD    = status_rgb(1, 1, 1);  // panel body
 static color_t UI_HEADER  = status_rgb(2, 2, 2);  // header band
 static color_t UI_TRACK   = status_rgb(3, 3, 3);  // meter tracks, header rule
-static color_t UI_VALUE   = status_rgb(6, 6, 6);   // unselected value text (currently unused)
+static color_t UI_VALUE   = status_rgb(12, 12, 12); // unselected value text (brighter than its label)
 static color_t UI_FILL    = status_rgb(6, 6, 6);   // unselected meter fill (kept dark on the light track)
 static color_t UI_BRIGHT  = status_rgb(11, 11, 11); // clock digits (unselected)
 static color_t STATUS_DIM = status_rgb(5, 5, 5);   // faint text: hints, colons
@@ -1381,16 +1672,24 @@ struct ui_mode_t {
 	color_t white, grey, card, header, track, value, fill, bright, dim;
 };
 constexpr ui_mode_t UI_MODES[2] = {
-	// [0] DARK -- the values the UI has always used.
+	// [0] DARK -- the values the UI has always used, except `value`, which
+	// was defined but never wired up (label and value both drew in `grey`,
+	// so a settings row was one undifferentiated line of text).
 	{ 0xFFFF, 0x88F8, status_rgb(1, 1, 1), status_rgb(2, 2, 2),
-	  status_rgb(3, 3, 3), status_rgb(6, 6, 6), status_rgb(6, 6, 6),
+	  status_rgb(3, 3, 3), status_rgb(12, 12, 12), status_rgb(6, 6, 6),
 	  status_rgb(11, 11, 11), status_rgb(5, 5, 5) },
-	// [1] LIGHT -- light card, dark text. Unselected text (grey/value) stays
-	// light so the accent-colored selected row reads as the focus; the meter
-	// fill stays dark so it's legible against the lighter track.
-	{ status_rgb(1, 1, 1), status_rgb(10, 10, 10), status_rgb(15, 15, 15),
-	  status_rgb(13, 13, 13), status_rgb(11, 11, 11), status_rgb(10, 10, 10),
-	  status_rgb(6, 6, 6), status_rgb(3, 3, 3), status_rgb(9, 9, 9) },
+	// [1] LIGHT -- light card, dark text. The unselected ramp used to be
+	// pitched light (grey/value at 10) on the theory that keeping everything
+	// else faint made the accent-colored selected row read as the focus. It
+	// didn't survive contact with the panel: body text sat at 2.32:1 and the
+	// header title at 1.71:1, and the selected row was itself the worst
+	// offender (see light_ink). Selection is carried by the pill and the ink
+	// now, so the neutrals are free to be legible -- grey 6 gives 5.74:1 on
+	// the card, dim 7 gives the hints 4.48:1. The meter fill stays dark so
+	// it's legible against the lighter track.
+	{ status_rgb(1, 1, 1), status_rgb(6, 6, 6), status_rgb(15, 15, 15),
+	  status_rgb(13, 13, 13), status_rgb(11, 11, 11), status_rgb(3, 3, 3),
+	  status_rgb(6, 6, 6), status_rgb(3, 3, 3), status_rgb(7, 7, 7) },
 };
 
 static void apply_mode(uint32_t dark) {
@@ -1405,6 +1704,7 @@ static void apply_mode(uint32_t dark) {
 	UI_FILL   = m.fill;
 	UI_BRIGHT = m.bright;
 	STATUS_DIM = m.dim;
+	UI_INK = g_dark_mode ? UI_ACCENT : light_ink(UI_ACCENT);
 	UI_ROW_SEL = g_dark_mode ? theme_pill(UI_ACCENT) : light_pill(UI_ACCENT);
 }
 
@@ -1462,6 +1762,25 @@ static void led_show_battery(int level) {
 	    ((c >> 8) & 0xF) * brightness / 15);
 }
 
+// Charging bolt, knocked into the battery icon's interior when g_charging.
+// 5x9 -- the full height of the 13x9 interior, centered across it with 4px
+// clear on each side, so it reads as a bolt rather than a smudge at this size.
+// Two down-left strokes joined by a full-width crossbar: the crossbar is what
+// makes the zigzag legible when the strokes are only 2px thick.
+constexpr uint8_t BATT_BOLT[9] = {
+	0b00011, // ...##
+	0b00110, // ..##.
+	0b01100, // .##..
+	0b11000, // ##...
+	0b11111, // #####
+	0b00011, // ...##
+	0b00110, // ..##.
+	0b01100, // .##..
+	0b11000, // ##...
+};
+constexpr int32_t BATT_BOLT_W = 5;
+constexpr int32_t BATT_BOLT_X = 4; // inset from the interior's left edge
+
 // Battery icon: a 17x13 rounded body outline plus a 3x5 terminal nub (20px
 // total), its interior filled proportionally to the charge level in the
 // matching battery_color().
@@ -1489,6 +1808,46 @@ static void draw_battery_icon(int32_t x, int32_t y, uint32_t batt) {
 		color_t *d = SCREEN->p(x + 2, y + ry);
 		for (int32_t rx = 0; rx < fw; rx++)
 			d[rx] = fill;
+	}
+	if (!g_charging)
+		return;
+	// The bolt straddles the fill edge, so it sits on two backgrounds at
+	// once at most charge levels. Drawing it as the inverse of whatever is
+	// under each pixel was the obvious answer and the wrong one -- it comes
+	// out two-tone, split down the fill edge, and stops reading as a shape
+	// at all. Instead: knock a band-colored halo out of the interior around
+	// the bolt, then draw the bolt itself in one flat color on top. One
+	// silhouette, full contrast at 0% and 100% alike, and it survives the
+	// light/light-mode swap since both colors come from the same ramp.
+	for (int32_t ry = -1; ry <= 9; ry++) {
+		int32_t iy = 2 + ry;
+		if (iy < 2 || iy > 10) // clip to the interior, not the body outline
+			continue;
+		color_t *d = SCREEN->p(x + 2, y + iy);
+		for (int32_t rx = -1; rx <= BATT_BOLT_W; rx++) {
+			// Lit if any of the 3x3 around it is a bolt pixel.
+			bool halo = false;
+			for (int32_t sy = ry - 1; sy <= ry + 1 && !halo; sy++) {
+				if (sy < 0 || sy > 8)
+					continue;
+				for (int32_t sx = rx - 1; sx <= rx + 1; sx++) {
+					if (sx < 0 || sx >= BATT_BOLT_W)
+						continue;
+					if (BATT_BOLT[sy] & (1 << (BATT_BOLT_W - 1 - sx))) {
+						halo = true;
+						break;
+					}
+				}
+			}
+			if (halo)
+				d[BATT_BOLT_X + rx] = UI_HEADER;
+		}
+	}
+	for (int32_t ry = 0; ry < 9; ry++) {
+		color_t *d = SCREEN->p(x + 2, y + 2 + ry);
+		for (int32_t rx = 0; rx < BATT_BOLT_W; rx++)
+			if (BATT_BOLT[ry] & (1 << (BATT_BOLT_W - 1 - rx)))
+				d[BATT_BOLT_X + rx] = STATUS_WHITE;
 	}
 }
 
@@ -1552,7 +1911,24 @@ static void draw_header_band(const char *title, uint32_t batt, color_t rule,
 // skips the label/number), the battery percentage, both, or neither -- the
 // icon itself always shows. In FULLSCREEN mode the run loop never calls this
 // (there is no header band); the guard below is just belt-and-braces.
-static void draw_status_bar(uint32_t fps, uint32_t batt) {
+//
+// The band also carries the flash-commit indicator. The LED already blinks
+// through the write window, but it is easy to miss in a case or a pocket and
+// says nothing unless you happen to be looking at the device edge-on, so the
+// screen carries the same "don't power off yet" the SAVE INTERVAL row implies.
+// A word rather than the ICON_DISK glyph -- it can't be misread by someone who
+// hasn't learned the icon. Steady rather than blinking: the LED carries the
+// urgency, and a 4Hz on-screen blink would mean repainting the band ~8 times
+// per save instead of twice (once on each edge of the window).
+//
+// The fullscreen modes deliberately get none of this. Their whole point is an
+// unbroken game canvas, and an indicator there would have to sit in the
+// letterbox, which is the one piece of chrome those modes exist to remove --
+// the LED remains the signal there, as it was before.
+static const char SAVE_TAG[] = "SAVING";
+constexpr int32_t SAVE_TAG_LEN = sizeof(SAVE_TAG) - 1;
+
+static void draw_status_bar(uint32_t fps, uint32_t batt, bool saving) {
 	if (status_fullscreen())
 		return;
 	draw_header_band(status_show_fps() ? "FPS" : "", batt, STATUS_RULE,
@@ -1563,6 +1939,12 @@ static void draw_status_bar(uint32_t fps, uint32_t batt) {
 		buf[n] = '\0';
 		status_text(UI_MARGIN + 3 * 12 + 4, HDR_TOP, buf, STATUS_WHITE);
 	}
+	// Flash-commit indicator, centered in the band -- clear in every header
+	// mode, since the FPS readout ends by x=76 even at three digits and the
+	// battery block starts no earlier than x=173.
+	if (saving)
+		status_text((SCREEN->w - text_w(SAVE_TAG_LEN)) / 2, HDR_TOP,
+			    SAVE_TAG, STATUS_WHITE);
 }
 
 // FS BATTERY's meter: the top 2 rows of the screen become one screen-wide
@@ -1580,6 +1962,64 @@ static void draw_fs_battery_bar(uint32_t batt) {
 	int32_t fw = (int32_t)(batt * SCREEN->w + 50) / 100;
 	fill_rect(0, 0, fw, FS_BATT_BAR_H, battery_color(batt));
 	fill_rect(fw, 0, SCREEN->w - fw, FS_BATT_BAR_H, STATUS_RULE);
+}
+
+// Hotkey legend: the strip that says what each button does while the
+// tap-then-hold Y layer is armed. Redrawn every frame it is up, and simply
+// stopped when the layer closes -- no restore path, because it sits inside
+// the rows core1 repaints from the emulator every frame, so the game paints
+// over it by itself on the very next frame.
+//
+// That self-healing is why the caller passes `game_bottom` (the row after the
+// last one the emulator paints) instead of this picking a fixed y. The frame
+// lands at different rows per STATUS BAR mode (see apply_game_offset): rows
+// 24..239 under a header band, 12..227 in FULLSCREEN, 14..229 in FS BATTERY.
+// Sitting the strip flush against the bottom of the canvas keeps it inside
+// those rows in every mode; pin it to the screen bottom instead and FULLSCREEN
+// leaves a stripe of stale legend in its letterbox, which nothing repaints.
+constexpr int32_t LEGEND_H = 30; // rule + two text lines
+constexpr int32_t LEGEND_L1_Y_OFF = 5;
+constexpr int32_t LEGEND_L2_Y_OFF = 18;
+
+static int32_t legend_len(const char *s) {
+	int32_t n = 0;
+	while (s[n])
+		n++;
+	return n;
+}
+
+// One row of "<key> <label>" pairs, laid out left to right and centered as a
+// group. The key draws in the accent and the label in grey, the same split the
+// settings rows use, so the button letters are what the eye lands on.
+static void draw_legend_line(int32_t y, const char *const *keys,
+			     const char *const *labels, int32_t n) {
+	constexpr int32_t GAP = 3; // blank glyph cells between two pairs
+	int32_t chars = 0;
+	for (int32_t i = 0; i < n; i++)
+		chars += legend_len(keys[i]) + 1 + legend_len(labels[i]);
+	chars += GAP * (n - 1);
+
+	int32_t x = (SCREEN->w - text_w(chars)) / 2;
+	for (int32_t i = 0; i < n; i++) {
+		status_text(x, y, keys[i], UI_INK);
+		x += (legend_len(keys[i]) + 1) * STATUS_GLYPH_ADV;
+		status_text(x, y, labels[i], STATUS_GREY);
+		x += (legend_len(labels[i]) + GAP) * STATUS_GLYPH_ADV;
+	}
+}
+
+static void draw_hotkey_legend(int32_t game_bottom) {
+	static const char *const L1_KEYS[]   = { "X", "B" };
+	static const char *const L1_LABELS[] = { "SETTINGS", "SAVE" };
+	static const char *const L2_KEYS[]   = { "<>", "^v" };
+	static const char *const L2_LABELS[] = { "VOLUME", "BRIGHT" };
+
+	int32_t top = game_bottom - LEGEND_H;
+	// Rule along the top edge, mirroring the header band's along its bottom.
+	fill_rect(0, top, SCREEN->w, 1, UI_INK);
+	fill_rect(0, top + 1, SCREEN->w, LEGEND_H - 1, UI_HEADER);
+	draw_legend_line(top + LEGEND_L1_Y_OFF, L1_KEYS, L1_LABELS, 2);
+	draw_legend_line(top + LEGEND_L2_Y_OFF, L2_KEYS, L2_LABELS, 2);
 }
 
 // ---------------------------------------------------------------------
@@ -1600,10 +2040,17 @@ static void draw_fs_battery_bar(uint32_t batt) {
 // only the in-game header disappears.
 static void draw_menu_frame(const char *title, uint32_t batt) {
 	fill_rect(0, OFFSET_Y, SCREEN->w, SCREEN->h - OFFSET_Y, UI_CARD);
-	draw_header_band(title, batt, UI_ACCENT, menu_show_pct());
+	draw_header_band(title, batt, UI_INK, menu_show_pct());
 }
 
-// Dim, centered control hints along the bottom of the panel.
+// Dim, centered control hints along the bottom of the panel. The line is
+// per-selection, not per-screen: a button that only does something on one row
+// is otherwise invisible (the settings list's A, which opens the clock editor,
+// went unadvertised entirely), and a legend that lists every button on every
+// row teaches nothing about the row you are actually on. Callers pass the
+// string for the current selection; there is only room for one line (the last
+// settings row's pill ends at y=220 and the screen at 240), so the hints are
+// controls rather than descriptions.
 static void draw_menu_hints(const char *s) {
 	int32_t n = 0;
 	while (s[n])
@@ -1630,6 +2077,10 @@ struct menu_battery_poll {
 			if (b > 100) b = 100;
 			level = (uint32_t)b;
 			led_show_battery(b);
+			// Menus repaint every frame, so unlike the in-game
+			// status bar there is nothing to mark dirty -- the
+			// updated g_charging is picked up by the next draw.
+			charge_sense_poll();
 		}
 		return level;
 	}
@@ -1808,6 +2259,13 @@ static void draw_row_highlight(int32_t y) {
 
 // Value row: icon + label, a right-aligned text value where the meter rows
 // have a bar. Shared by the toggles (ON/OFF) and the THEME row (theme name).
+//
+// Unselected rows draw the label in STATUS_GREY but the value in the brighter
+// UI_VALUE: the value column is the state you came to the screen to read, and
+// with both in one color an eleven-row list was eleven undifferentiated lines
+// to scan. The selected row still goes entirely to UI_INK -- there the pill
+// already separates it from the list, so splitting it further would just
+// weaken the one row that should read as a unit.
 static void draw_value_row(uint32_t row, uint32_t sel, icon_t icon,
 			    const char *label, const char *value) {
 	int32_t y = settings_row_y(row);
@@ -1817,10 +2275,10 @@ static void draw_value_row(uint32_t row, uint32_t sel, icon_t icon,
 		n++;
 	if (is_sel)
 		draw_row_highlight(y);
-	draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
-	status_text(UI_MARGIN + 22, y + 2, label, is_sel ? UI_ACCENT : STATUS_GREY);
+	draw_icon(UI_MARGIN, y, icon, is_sel ? UI_INK : STATUS_GREY);
+	status_text(UI_MARGIN + 22, y + 2, label, is_sel ? UI_INK : STATUS_GREY);
 	status_text(UI_RIGHT - text_w(n), y + 2, value,
-		    is_sel ? UI_ACCENT : STATUS_GREY);
+		    is_sel ? UI_INK : UI_VALUE);
 }
 
 static void draw_toggle_row(uint32_t row, uint32_t sel, icon_t icon,
@@ -1859,19 +2317,19 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 #endif
 		if (is_sel)
 			draw_row_highlight(y);
-		draw_icon(UI_MARGIN, y, icon, is_sel ? UI_ACCENT : STATUS_GREY);
+		draw_icon(UI_MARGIN, y, icon, is_sel ? UI_INK : STATUS_GREY);
 		status_text(UI_MARGIN + 22, y + 2, label,
-			    is_sel ? UI_ACCENT : STATUS_GREY);
+			    is_sel ? UI_INK : STATUS_GREY);
 		int32_t n = status_fmt_uint(buf, value);
 		buf[n] = '%';
 		buf[n + 1] = '\0';
 		status_text(UI_RIGHT - text_w(n + 1), y + 2, buf,
-			    is_sel ? UI_ACCENT : STATUS_GREY);
+			    is_sel ? UI_INK : UI_VALUE); // value column, per draw_value_row
 		// Bar vertically centered on the 10px-tall glyphs (y+2..y+12).
 		int32_t by = y + 2;
 		fill_rect(bar_x, by, MINI_BAR_W, MINI_BAR_H, UI_TRACK);
 		fill_rect(bar_x, by, (int32_t)(value * MINI_BAR_W / 100), MINI_BAR_H,
-			  is_sel ? UI_ACCENT : UI_FILL);
+			  is_sel ? UI_INK : UI_FILL);
 	}
 
 	// VSYNC: ON trades a little emulation headroom for tear-free scrolling
@@ -1905,14 +2363,19 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// (the icon always shows), just the icon, FULLSCREEN (no header, game
 	// frame centered) or FS BATTERY (fullscreen plus a 2px screen-wide
 	// battery meter). The percent choice also drives the menu headers.
+	// "PCT" was the old shorthand for the battery percentage, which read as
+	// an abbreviation of nothing in particular next to plain-English
+	// neighbours like FULLSCREEN. The percentage is always the battery's, and
+	// the font has '%', so the modes now say what they put on the bar.
 	static const char *const STATUS_MODE_NAMES[STATUS_MODE_COUNT] = {
-		"FPS+PCT", "FPS", "PERCENT", "ICON", "FULLSCREEN", "FS BATTERY",
+		"FPS + %", "FPS", "BATTERY %", "ICON ONLY", "FULLSCREEN",
+		"FS BATTERY",
 	};
 	draw_value_row(SET_ROW_STATUS, sel, ICON_STATUSBAR, "STATUS BAR",
 		       STATUS_MODE_NAMES[g_status_bar]);
 	// SAVE INTERVAL: how often the save file may be committed to flash --
 	// the wear throttle (see save_storage.hpp). MANUAL commits nothing on
-	// its own; the X+B chord in-game does it instead.
+	// its own; the in-game save hotkey does it instead.
 	{
 		char iv[6]; // "120S" + NUL
 		const char *value = "MANUAL";
@@ -1959,12 +2422,13 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	}
 
 	// Two rows say something the row itself doesn't: CLOCK is the only one
-	// that opens a screen rather than cycling in place, and MANUAL's save
-	// chord is invisible otherwise.
+	// that opens a screen rather than cycling in place, and the manual-save
+	// gesture is invisible otherwise. "YY+B" is the tap-then-hold on Y
+	// (see the hotkey layer in the run loop) with B as its partner.
 	draw_menu_hints(sel == SET_ROW_CLOCK
 			? "A EDIT   B BACK"
-			: (sel == SET_ROW_SAVE && save_interval_manual()
-			   ? "< > ADJUST   X+B SAVES"
+			: (sel == SET_ROW_SAVE
+			   ? "< > ADJUST   YY+B SAVES"
 			   : "< > ADJUST   B BACK"));
 }
 
@@ -2077,19 +2541,19 @@ static void draw_clock_face(int32_t cx, int32_t cy, int32_t r, uint32_t field) {
 	status_text(cx - text_w(2) / 2, cy - 27, g_rtc_hour < 12 ? "AM" : "PM",
 		    STATUS_DIM);
 	status_text(cx - text_w(3) / 2, cy + 17, RTC_DOW_NAMES[g_rtc_dow],
-		    field == CLK_ROW_DOW ? UI_ACCENT : STATUS_GREY);
+		    field == CLK_ROW_DOW ? UI_INK : STATUS_GREY);
 
 	// Hands last, over the windows. The hour hand carries the minutes as a
 	// fifth of an hour, so it sits between the ticks instead of snapping.
 	// The seconds hand is thin and dim under the other two (a sweep hand,
 	// not a reading), reaching nearly to the ticks.
 	draw_hand(cx, cy, g_rtc_sec, r - 8, 1,
-		  field == CLK_ROW_SEC ? UI_ACCENT : STATUS_GREY);
+		  field == CLK_ROW_SEC ? UI_INK : STATUS_GREY);
 	draw_hand(cx, cy, (g_rtc_hour % 12) * 5 + g_rtc_min / 12, r - 26, 3,
-		  field == CLK_ROW_HOUR ? UI_ACCENT : UI_BRIGHT);
+		  field == CLK_ROW_HOUR ? UI_INK : UI_BRIGHT);
 	draw_hand(cx, cy, g_rtc_min, r - 12, 2,
-		  field == CLK_ROW_MIN ? UI_ACCENT : UI_BRIGHT);
-	fill_ring(cx, cy, 3, 0, UI_ACCENT); // pivot cap
+		  field == CLK_ROW_MIN ? UI_INK : UI_BRIGHT);
+	fill_ring(cx, cy, 3, 0, UI_INK); // pivot cap
 	fill_ring(cx, cy, 1, 0, UI_HEADER);
 }
 
@@ -2166,12 +2630,12 @@ static void draw_clock_menu(uint32_t field, uint32_t batt) {
 			draw_group_pill(x - pad, grp[i].y - 5, gw + 2 * pad,
 					gh + 10);
 			int32_t ax = x + gw / 2;
-			draw_scroll_arrow(ax, ARROW_UP, false, UI_ACCENT, 4);
-			draw_scroll_arrow(ax, ARROW_DN, true, UI_ACCENT, 4);
+			draw_scroll_arrow(ax, ARROW_UP, false, UI_INK, 4);
+			draw_scroll_arrow(ax, ARROW_DN, true, UI_INK, 4);
 		}
 		menu_text(x + (gw - text_w(grp[i].label_len)) / 2, gy, grp[i].label,
-			  is_sel ? UI_ACCENT : STATUS_DIM, 2, STATUS_GLYPH_ADV);
-		menu_text(x, grp[i].y, grp[i].text, is_sel ? UI_ACCENT : UI_BRIGHT,
+			  is_sel ? UI_INK : STATUS_DIM, 2, STATUS_GLYPH_ADV);
+		menu_text(x, grp[i].y, grp[i].text, is_sel ? UI_INK : UI_BRIGHT,
 			  grp[i].scale, grp[i].adv);
 		x += grp[i].glyphs * grp[i].adv;
 		if (i < 3) {
@@ -2228,7 +2692,7 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		} else {
 			draw_icon(UI_MARGIN, y + 4,
 				  i < ROM_COUNT ? ICON_CART : ICON_SLIDERS,
-				  is_sel ? UI_ACCENT : STATUS_DIM);
+				  is_sel ? UI_INK : STATUS_DIM);
 			// Per-ROM cart label tint (roms.json "color"), 0 = leave default.
 			// The selected row stays fully theme-accent, so skip the overlay
 			// there.
@@ -2258,7 +2722,7 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 			clipped[max_chars] = '\0';
 			name = clipped;
 		}
-		status_text(name_x, y + 6, name, is_sel ? UI_ACCENT : STATUS_GREY);
+		status_text(name_x, y + 6, name, is_sel ? UI_INK : STATUS_GREY);
 	}
 
 	// Scrollbar down the right edge, drawn only when the catalog is taller
@@ -2289,7 +2753,12 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		fill_rect(BAR_X, ty, BAR_W, th, UI_FILL);
 	}
 
-	draw_menu_hints("A SELECT   Y+X SETTINGS");
+	// Per-row, like the settings list's: A boots a game on the catalog rows
+	// but opens a screen on the trailing SETTINGS row, and "SELECT" reads as
+	// a promise to launch something. The Y+X shortcut stays advertised on
+	// every row -- it works from all of them.
+	draw_menu_hints(sel < ROM_COUNT ? "A SELECT   Y+X SETTINGS"
+					: "A OPEN   Y+X SETTINGS");
 }
 // @menu-draw-end
 
@@ -2463,6 +2932,14 @@ static int32_t menu_adjust_dir(uint64_t &next_repeat) {
 	return menu_repeat_dir(picosystem::LEFT, picosystem::RIGHT, next_repeat);
 }
 
+// Row navigation for the two list screens. Same hold-to-repeat as the adjust
+// axis -- a catalog taller than the boot menu's 9-row window was one tap per
+// row to walk. UP is the negative direction because the returned step is added
+// to a row *index*, which grows downward.
+static int32_t menu_nav_dir(uint64_t &next_repeat) {
+	return menu_repeat_dir(picosystem::UP, picosystem::DOWN, next_repeat);
+}
+
 // The clock editor, opened with A from the settings list's CLOCK row. Edits
 // the same g_rtc_* staging and sets the same dirty flags, so settings_menu's
 // close path persists whatever happens here -- this screen writes nothing to
@@ -2511,8 +2988,11 @@ static void clock_menu(bool in_game) {
 	menu_drain_buttons();
 }
 
-// Modal settings screen, shared by the boot menu (its SETTINGS row, or Y+X)
-// and in-game (Y+X chord, detected in the run loop).
+// Modal settings screen, shared by the boot menu (its SETTINGS row, or Y+X --
+// no game is running there, so an ordinary chord is safe) and in-game (the
+// tap-then-hold Y hotkey layer, detected in the run loop). X+Y still *closes*
+// it in both, mirroring the boot-menu shortcut; the screen is modal, so
+// nothing it swallows was headed for the game anyway.
 static void settings_menu(bool in_game) {
 	uint32_t sel = 0;
 	menu_battery_poll batt;
@@ -2525,7 +3005,10 @@ static void settings_menu(bool in_game) {
 	// until everything is released so opening can't immediately toggle back
 	// out or activate a row.
 	bool wait_release = true;
-	uint64_t next_repeat = 0;
+	// The two axes carry separate repeat timers: sharing one would let a held
+	// DOWN keep re-arming the deadline that < > adjust is waiting on (and the
+	// reverse), so whichever axis the player settled on would stutter.
+	uint64_t next_repeat = 0, nav_repeat = 0;
 
 	while (true) {
 		menu_read_input();
@@ -2538,14 +3021,15 @@ static void settings_menu(bool in_game) {
 			if (pressed(picosystem::B) ||
 			    (button(picosystem::X) && button(picosystem::Y)))
 				break;
-			if (pressed(picosystem::UP))
-				sel = (sel + SET_ROW_COUNT - 1) % SET_ROW_COUNT;
-			if (pressed(picosystem::DOWN))
-				sel = (sel + 1) % SET_ROW_COUNT;
+			int32_t nav = menu_nav_dir(nav_repeat);
+			if (nav)
+				sel = (uint32_t)((int32_t)sel + nav +
+						 (int32_t)SET_ROW_COUNT) %
+				      SET_ROW_COUNT;
 			// A opens the row's own screen -- only CLOCK has one.
 			if (pressed(picosystem::A) && sel == SET_ROW_CLOCK) {
 				clock_menu(in_game);
-				next_repeat = 0;
+				next_repeat = nav_repeat = 0;
 				continue; // its drain already consumed this frame's input
 			}
 
@@ -2598,6 +3082,18 @@ static uint32_t rom_select() {
 	uint32_t sel = 0;
 	constexpr uint32_t MENU_ROWS = ROM_COUNT + 1; // + trailing SETTINGS row
 
+	// Open on the last-played game rather than the top of the catalog. The
+	// slot is already tracked for BOOT LAST GAME (and kept current even
+	// while that toggle is off, see main()), so the common case -- picking
+	// up the game you were playing -- is one press of A. A slot that no
+	// longer matches the catalog just leaves the cursor at row 0, the same
+	// place a first boot starts.
+	for (uint32_t i = 0; i < ROM_COUNT; i++)
+		if (rom_catalog[i].save_slot == g_last_slot) {
+			sel = i;
+			break;
+		}
+
 	// Seed _io from the current GPIO level so the loop's first pressed()
 	// poll below reflects real state instead of the zero-initialized
 	// default (which would read as "every button just released"), and drop
@@ -2605,6 +3101,7 @@ static uint32_t rom_select() {
 	_reset_io();
 
 	menu_battery_poll batt;
+	uint64_t nav_repeat = 0;
 
 	while (true) {
 		menu_read_input();
@@ -2613,14 +3110,17 @@ static uint32_t rom_select() {
 			if (sel < ROM_COUNT)
 				return sel;
 			settings_menu(false); // the SETTINGS row
+			nav_repeat = 0;
 		}
-		if (button(picosystem::X) && button(picosystem::Y))
+		if (button(picosystem::X) && button(picosystem::Y)) {
 			settings_menu(false);
+			nav_repeat = 0;
+		}
 
-		if (pressed(picosystem::DOWN))
-			sel = (sel + 1) % MENU_ROWS;
-		if (pressed(picosystem::UP))
-			sel = (sel + MENU_ROWS - 1) % MENU_ROWS;
+		int32_t nav = menu_nav_dir(nav_repeat);
+		if (nav)
+			sel = (uint32_t)((int32_t)sel + nav +
+					 (int32_t)MENU_ROWS) % MENU_ROWS;
 
 		draw_boot_menu(sel, batt.poll());
 
@@ -3315,6 +3815,10 @@ int main() {
 	// phantom input on the game's first frames.
 	_reset_io();
 
+	// Charger STAT line -- not part of BUTTON_PIN_MASK, so init_inputs()
+	// never touched it and it needs setting up here.
+	charge_sense_init();
+
 	// The LED reports battery charge: a green->red gradient (green ~= full,
 	// red ~= nearly empty), capped by led_brightness(). Updated on a cadence rather than
 	// every frame -- battery() reads the ADC and the charge level changes
@@ -3332,14 +3836,18 @@ int main() {
 	// hold the blink up. The commit itself re-arms the hold for as long as it
 	// actually runs, but a request can sit behind a multi-second slot
 	// pre-erase, and re-arming across all of that -- then again on the next
-	// request -- is what let repeated X+B presses run the blink together into
-	// one that never visibly ended.
+	// request -- is what let repeated manual saves run the blink together
+	// into one that never visibly ended.
 	constexpr uint64_t SAVING_PENDING_MAX_US = 3000000;
 	uint64_t saving_hold_until = 0;  // blink runs while now < this
 	uint64_t pending_since = 0;      // when the queued save was first seen (0 = none)
-	bool saving_led = false;         // save blink owns the LED
-
+	bool led_borrowed = false;       // save blink or hotkey layer owns the LED
 #if ENABLE_LCD
+	// The same window, as the screen currently shows it. The on-screen
+	// indicator is painted on the two edges only (see the repaint block), so
+	// this is what tells them apart from the frames in between.
+	bool saving_shown = false;
+
 	// Status bar state: the values currently painted in the top letterbox,
 	// plus a ~1s wall-clock window for the FPS count. batt_shown = -1 makes
 	// the first battery poll (immediate, see battery_count above) paint the
@@ -3394,17 +3902,49 @@ int main() {
 		// edge-queue block comment in picosystem/hardware.cpp.
 		_poll_io();
 
+		// Advance the tap-then-hold Y gesture. Runs before
+		// update_joypad(), which reads the SELECT level and the
+		// START/B swallow flag it leaves behind.
+		const hk_result_t hk = hotkey_poll();
+
+		// The armed layer's two adjust axes. Both reuse the settings
+		// menu's own setters, so a hotkey nudge and a menu nudge land on
+		// the same clamps and the same step sizes.
+		if (hk.volume || hk.brightness) {
+			if (hk.volume)
+				adjust_volume(hk.volume);
+			if (hk.brightness)
+				adjust_brightness(hk.brightness);
+			g_settings_edited = true;
+		}
+		// Releasing the layer is this loop's equivalent of closing the
+		// settings menu, so it commits on the same terms: one
+		// synchronous flash write, and only if something was actually
+		// edited (store_device_settings no-ops on an unchanged record
+		// anyway). Safe from here despite core1 running -- the write
+		// goes through flash_locked_*, which parks core1 over the XIP-off
+		// window. Without this the value would be live but unsaved, and
+		// a brightness set by hotkey would quietly revert at power-off.
+		if (hk.closed && g_settings_edited) {
+			g_settings_edited = false;
+			store_device_settings();
+			// The write stalled real time by ~50ms. Restart the
+			// pacer and the FPS window at "now" so the game doesn't
+			// fast-forward to repay it, exactly as the menu does.
+			frame_due = time_us_64();
+#if ENABLE_LCD
+			fps_window_start = frame_due;
+			fps_frames = 0;
+#endif
+		}
+
 #if ENABLE_LCD
 		bool status_dirty = false;
-		// Y+X chord (either button completing it) opens the settings menu,
-		// pausing emulation until it closes -- settings_menu() runs its own
-		// loop in place of this one. Checked before update_joypad() so the
-		// completed chord never reaches the game as Start+Select (though the
-		// first button of the chord does, alone, for the frames before its
-		// partner lands -- unavoidable when the chord is built from game
-		// buttons).
-		if (button(picosystem::X) && button(picosystem::Y) &&
-		    (pressed(picosystem::X) || pressed(picosystem::Y))) {
+		// Armed layer + X opens the settings menu, pausing emulation
+		// until it closes -- settings_menu() runs its own loop in place
+		// of this one. Neither the arming hold nor the X reaches the
+		// game (see the hotkey layer above).
+		if (hk.action == hk_action_t::MENU) {
 			// The menu drives _flip() directly -- a pending armed flip
 			// firing mid-menu-draw would stream a half-painted panel.
 			_flip_armed = false;
@@ -3421,30 +3961,35 @@ int main() {
 				tight_loop_contents();
 			memset(SCREEN->data, 0, SCREEN->w * SCREEN->h * sizeof(color_t));
 			status_dirty = true;
+			// The clear took the save indicator with it. Dropping the
+			// shown state to "off" -- which is what the screen now
+			// actually is -- lets this frame's edge check repaint it
+			// if a commit is still in its window (a menu-triggered
+			// autosave can easily still be running here).
+			saving_shown = false;
 			frame_due = time_us_64();
 			fps_window_start = frame_due;
 			fps_frames = 0;
+			// The menu drained every button on its way out, so
+			// the gesture that opened it is finished -- start the
+			// layer clean rather than resuming mid-state.
+			hotkey_reset();
 		}
 #endif
-		// X+B chord (either button completing it): commit the save to
-		// flash now. Only bound in MANUAL mode -- on every other setting
-		// the interval already writes on its own, and X+B is an ordinary
-		// in-game combination (Start + B) that shouldn't touch flash
-		// behind the player's back. Unlike the Y+X menu chord this one
-		// isn't swallowed: both buttons still reach the game below, so a
-		// save can be triggered without disturbing what's on screen. The
-		// LED's save blink is the acknowledgement -- armed here rather
-		// than left to the commit window alone, so a press lands visibly
-		// even when there is nothing dirty to write (the request is then a
-		// no-op, and a silent one would be indistinguishable from a chord
-		// that didn't register). A press while a request is already
-		// queued is dropped rather than re-armed: the save it is asking
-		// for is already on its way, and re-arming from a combination the
-		// game itself uses is how a stray Start+B (or a run of them) used
-		// to chain 2s holds together into a blink that never let up.
-		if (save_interval_manual() && !save_storage_pending() &&
-		    button(picosystem::X) && button(picosystem::B) &&
-		    (pressed(picosystem::X) || pressed(picosystem::B))) {
+		// Armed layer + B: commit the save to flash now. Bound in every
+		// SAVE INTERVAL mode, not just MANUAL -- the old X+B chord was
+		// restricted to MANUAL because Start+B is something the game
+		// itself uses and shouldn't be able to reach flash by accident,
+		// and a deliberate gesture doesn't carry that risk. The LED's
+		// save blink is the acknowledgement -- armed here rather than
+		// left to the commit window alone, so a press lands visibly
+		// even when there is nothing dirty to write (the request is
+		// then a no-op, and a silent one would be indistinguishable
+		// from a gesture that didn't register). A press while a request
+		// is already queued is dropped rather than re-armed: the save
+		// it is asking for is already on its way, and re-arming would
+		// only chain 2s holds into a blink that never let up.
+		if (hk.action == hk_action_t::SAVE && !save_storage_pending()) {
 			save_storage_request_save();
 			saving_hold_until = time_us_64() + SAVING_HOLD_US;
 		}
@@ -3477,9 +4022,9 @@ int main() {
 		// keeps the window open a beat past the last one, so the blink is
 		// easy to notice however short the write was. A *requested* save
 		// counts as active before any flash op starts (see
-		// save_storage_pending) -- otherwise a manual X+B save waiting on
+		// save_storage_pending) -- otherwise a manual save waiting on
 		// the slot pre-erase or the quiet gate would sit dark for a second
-		// or two, reading as "the chord did nothing" -- but only for
+		// or two, reading as "the hotkey did nothing" -- but only for
 		// SAVING_PENDING_MAX_US, so a queue that is waiting on a slow
 		// pre-erase can't hold the LED up indefinitely. The write itself
 		// (save_storage_saving) re-arms unconditionally: that is the window
@@ -3495,9 +4040,35 @@ int main() {
 		    (pending_since && saving_now - pending_since < SAVING_PENDING_MAX_US))
 			saving_hold_until = saving_now + SAVING_HOLD_US;
 		bool saving = saving_now < saving_hold_until;
+		// The armed hotkey layer holds the LED white until Y comes up:
+		// the only feedback that the gesture landed, and the cue that
+		// X and B mean menu/save right now. Outranked by the save blink
+		// (a flash write in progress is the more urgent thing to
+		// signpost -- and the save hotkey hands straight over to it),
+		// outranks the battery gradient.
+		bool hk_armed = hotkey_armed();
+#if ENABLE_LCD
+		// Both edges of the window repaint the band; the frames in
+		// between leave it alone. Only the header modes draw the
+		// indicator, so only they need the repaint -- in a fullscreen
+		// mode this would dirty a band that isn't there.
+		if (!status_fullscreen() && saving != saving_shown) {
+			saving_shown = saving;
+			status_dirty = true;
+		}
+#endif
 
 		if (++battery_count >= BATTERY_UPDATE_FRAMES) {
 			battery_count = 0;
+#if ENABLE_LCD
+			// Charge state rides the same cadence as the ADC: it
+			// carries a 1s settle of its own, so polling it faster
+			// would only burn reads. A change repaints the band --
+			// the bolt lives inside the battery icon, which is
+			// only redrawn on a status repaint.
+			if (charge_sense_poll())
+				status_dirty = true;
+#endif
 			int level = battery();
 			if (level < 0)   level = 0;
 			if (level > 100) level = 100;
@@ -3514,9 +4085,10 @@ int main() {
 				status_dirty = true;
 			}
 #endif
-			// While the save blink owns the LED, skip the write so no
-			// battery color sneaks into the blue/magenta blink.
-			if (!saving)
+			// While the save blink or the armed hotkey layer owns
+			// the LED, skip the write so no battery color sneaks
+			// into either.
+			if (!saving && !hk_armed)
 				led_show_battery(level);
 		}
 
@@ -3534,9 +4106,13 @@ int main() {
 				led(0, 0, b);  // blue
 			else
 				led(b, 0, b);  // magenta
-			saving_led = true;
-		} else if (saving_led) {
-			saving_led = false;
+			led_borrowed = true;
+		} else if (hk_armed) {
+			const int b = led_brightness();
+			led(b, b, b); // steady white while the layer is live
+			led_borrowed = true; // hand back through the same path
+		} else if (led_borrowed) {
+			led_borrowed = false;
 			led_show_battery(batt_level);
 		}
 
@@ -3573,7 +4149,8 @@ int main() {
 			if (status_fs_battery())
 				draw_fs_battery_bar(batt_shown < 0 ? 0 : (uint32_t)batt_shown);
 			else
-				draw_status_bar(fps_shown, batt_shown < 0 ? 0 : (uint32_t)batt_shown);
+				draw_status_bar(fps_shown, batt_shown < 0 ? 0 : (uint32_t)batt_shown,
+						saving_shown);
 		}
 
 		// Let core1 finish this frame's queued scanlines before flipping,
@@ -3581,6 +4158,16 @@ int main() {
 		// runs well ahead of the emulator, so this is normally a no-op wait.
 		while (_line_rd != _line_wr)
 			tight_loop_contents();
+
+		// The armed layer's legend goes on last, over the game rows core1
+		// has just finished writing -- drawing it any earlier would only
+		// have it painted over. Nothing undraws it: it sits inside the
+		// rows the emulator repaints every frame, so the frame after the
+		// layer closes covers it without a restore path (see
+		// draw_hotkey_legend). ~30 rows of fill plus two short strings,
+		// and only while a button is actually being held.
+		if (hk_armed)
+			draw_hotkey_legend(g_game_offset_y + SCALED_H);
 #endif
 
 		frame_due += GB_FRAME_US;

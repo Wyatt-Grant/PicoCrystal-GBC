@@ -34,6 +34,10 @@ constexpr int32_t OFFSET_Y = 24;
 constexpr uint16_t VOLUME_MAX = 800;
 static uint16_t audio_output_get_volume() { return 320; } // reads back as 40%
 static uint8_t g_brightness = 70;
+// Charge sense, on the device a debounced read of the charger's STAT pin.
+// Off by default so the stock screenshots show the plain battery icon; the
+// charging variant flips it (see main() below).
+static bool g_charging = false;
 // Mirrors main.cpp's STATUS BAR mode enum + helpers (they sit outside the
 // fenced ranges, next to the other globals stubbed here).
 enum status_bar_mode_t : uint8_t {
@@ -252,6 +256,18 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/settings.ppm", dir);
 	write_ppm(path);
 
+	// The charging bolt in the header's battery icon, at three levels: the
+	// bolt is drawn as the inverse of what it sits on, so the interesting
+	// cases are the ones where it straddles (or misses) the fill edge.
+	g_charging = true;
+	static const uint32_t CHARGE_LEVELS[] = { 0, 45, 100 };
+	for (uint32_t lvl : CHARGE_LEVELS) {
+		draw_settings_menu(SET_ROW_BRIGHT, lvl);
+		snprintf(path, sizeof path, "%s/charging_%u.ppm", dir, lvl);
+		write_ppm(path);
+	}
+	g_charging = false;
+
 	// The CLOCK row selected in the list, and the editor it opens on A.
 	draw_settings_menu(SET_ROW_CLOCK, 82);
 	snprintf(path, sizeof path, "%s/settings_clock.ppm", dir);
@@ -272,15 +288,22 @@ int main(int argc, char **argv) {
 	g_save_interval = 3;
 
 	memset(_fb, 0, sizeof _fb);
-	draw_status_bar(60, 82);
+	draw_status_bar(60, 82, false);
 	snprintf(path, sizeof path, "%s/statusbar.ppm", dir);
+	write_ppm(path);
+
+	// The flash-commit indicator: the disk glyph the run loop paints into the
+	// band for as long as a save may still be writing.
+	memset(_fb, 0, sizeof _fb);
+	draw_status_bar(60, 82, true);
+	snprintf(path, sizeof path, "%s/statusbar_saving.ppm", dir);
 	write_ppm(path);
 
 	// STATUS BAR mode FPS: "<n>%" text gone from every header (in-game,
 	// boot, settings), FPS readout and icon stay.
 	g_status_bar = STATUS_FPS;
 	memset(_fb, 0, sizeof _fb);
-	draw_status_bar(60, 82);
+	draw_status_bar(60, 82, false);
 	snprintf(path, sizeof path, "%s/statusbar_nopct.ppm", dir);
 	write_ppm(path);
 
@@ -291,7 +314,7 @@ int main(int argc, char **argv) {
 	// ICON mode: header carries only the battery icon.
 	g_status_bar = STATUS_ICON;
 	memset(_fb, 0, sizeof _fb);
-	draw_status_bar(60, 82);
+	draw_status_bar(60, 82, false);
 	snprintf(path, sizeof path, "%s/statusbar_icon.ppm", dir);
 	write_ppm(path);
 
@@ -377,8 +400,24 @@ int main(int argc, char **argv) {
 		g_status_bar = STATUS_FPS_PCT;
 		memset(_fb, 0, sizeof _fb);
 		blit_game(frame, OFFSET_Y);
-		draw_status_bar(60, 82);
+		draw_status_bar(60, 82, false);
 		snprintf(path, sizeof path, "%s/in_game.ppm", dir);
+		write_ppm(path);
+
+		// The armed hotkey layer's legend, over the same in-game frame.
+		// Rendered in both the header and FULLSCREEN layouts because the
+		// strip has to land inside the game canvas in both (see
+		// draw_hotkey_legend) -- this is the shot that shows whether it
+		// does.
+		draw_hotkey_legend(OFFSET_Y + SCALED_H);
+		snprintf(path, sizeof path, "%s/in_game_hotkeys.ppm", dir);
+		write_ppm(path);
+
+		g_status_bar = STATUS_FULLSCREEN;
+		memset(_fb, 0, sizeof _fb);
+		blit_game(frame, (240 - SCALED_H) / 2);
+		draw_hotkey_legend((240 - SCALED_H) / 2 + SCALED_H);
+		snprintf(path, sizeof path, "%s/in_game_hotkeys_fs.ppm", dir);
 		write_ppm(path);
 
 		// FULLSCREEN: no header at all, canvas centered in a 12px
@@ -386,7 +425,7 @@ int main(int argc, char **argv) {
 		g_status_bar = STATUS_FULLSCREEN;
 		memset(_fb, 0, sizeof _fb);
 		blit_game(frame, (240 - SCALED_H) / 2);
-		draw_status_bar(60, 82); // no-ops in FULLSCREEN, kept for parity
+		draw_status_bar(60, 82, false); // no-ops in FULLSCREEN, kept for parity
 		snprintf(path, sizeof path, "%s/in_game_fullscreen.ppm", dir);
 		write_ppm(path);
 
