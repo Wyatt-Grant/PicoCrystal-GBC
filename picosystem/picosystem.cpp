@@ -19,7 +19,6 @@ namespace picosystem {
 
   int32_t _camx = 0, _camy = 0;
   uint32_t _io = 0, _lio = 0;
-  volatile uint32_t _io_press_latch = 0;
   blend_func_t _bf = ALPHA;
 
   #ifndef DYNAMIC_BUFFER

@@ -163,15 +163,14 @@ using namespace picosystem;
 // because it defines int main() and statically allocates SCREEN -- both of
 // which this project needs to own itself. Replicate just the piece of its
 // global state that hardware.cpp actually touches: SCREEN (for _flip()),
-// _io/_lio (for button()/pressed()), and _io_press_latch (set by hardware.cpp's
-// button IRQ handler; see init_button_latch()).
+// _io/_lio (the state behind button()/pressed(), driven here by _poll_io() --
+// see init_button_input() in hardware.cpp for how those are fed).
 // ---------------------------------------------------------------------
 namespace picosystem {
 	static color_t _fb[240 * 240] __attribute__((aligned(4)));
 	static buffer_t _screen_storage = { .w = 240, .h = 240, .data = _fb, .alloc = false };
 	buffer_t *SCREEN = &_screen_storage;
 	uint32_t _io = 0, _lio = 0;
-	volatile uint32_t _io_press_latch = 0;
 }
 
 // ---------------------------------------------------------------------
@@ -1417,7 +1416,7 @@ static void draw_fs_battery_bar(uint32_t batt) {
 // Menus: boot-time ROM picker + settings screen -- full-screen dark panels
 // under the shared header band, with dim control hints along the bottom.
 // Both are modal: each owns a tiny poll/draw loop (mirroring the
-// _io/_lio/_io_press_latch dance the real run loop uses for pressed()) and
+// same _poll_io() sampling the real run loop uses for pressed()) and
 // only returns when the user leaves. Opened in-game, the settings menu
 // therefore pauses emulation by construction: core0 simply isn't calling
 // gb_run_frame_dualfetch() while it's open.
@@ -2235,9 +2234,7 @@ static void rtc_stage_from_gb() {
 
 // One input sample, shared by both modal menu loops.
 static void menu_read_input() {
-	_lio = _io;
-	_io = _gpio_get() & ~_io_press_latch;
-	_io_press_latch = 0;
+	_poll_io();
 }
 
 // Per-frame housekeeping while a menu is open over a paused game. Without it
@@ -2428,15 +2425,14 @@ static uint32_t rom_select() {
 
 	// Seed _io from the current GPIO level so the loop's first pressed()
 	// poll below reflects real state instead of the zero-initialized
-	// default (which would read as "every button just released").
-	_io = _gpio_get();
+	// default (which would read as "every button just released"), and drop
+	// any transitions queued by whatever ran before this picker.
+	_reset_io();
 
 	menu_battery_poll batt;
 
 	while (true) {
-		_lio = _io;
-		_io = _gpio_get() & ~_io_press_latch;
-		_io_press_latch = 0;
+		menu_read_input();
 
 		if (pressed(picosystem::A)) {
 			if (sel < ROM_COUNT)
@@ -3035,7 +3031,7 @@ int main() {
 	if (g_boot_last) {
 		// Read live GPIO -- the same seeding rom_select() does -- so the
 		// held-B check reflects real state, not the zero-initialized _io.
-		_io = _gpio_get();
+		_reset_io();
 		if (!button(picosystem::B))
 			for (uint32_t i = 0; i < ROM_COUNT; i++)
 				if (rom_catalog[i].save_slot == g_last_slot) {
@@ -3138,7 +3134,10 @@ int main() {
 	// picosystem.cpp's excluded stock loop is what normally refreshes
 	// _io/_lio each frame -- without this, button()/pressed() silently read
 	// stale (always-zero) state and button() would report "pressed" forever.
-	_io = _gpio_get();
+	// Resetting (rather than just sampling) also drops the transitions queued
+	// while the boot menu and ROM load ran, which would otherwise replay as
+	// phantom input on the game's first frames.
+	_reset_io();
 
 	// The LED reports battery charge: a green->red gradient (green ~= full,
 	// red ~= nearly empty), capped by led_brightness(). Updated on a cadence rather than
@@ -3209,15 +3208,15 @@ int main() {
 #endif
 
 	while (true) {
-		_lio = _io;
-		// _io_press_latch (set from a GPIO falling-edge IRQ, see
-		// picosystem/hardware.cpp) catches any button that went down and back
-		// up entirely between two polls -- this loop's cadence isn't constant
-		// (it stalls on core1 and on save-flash erases), so a plain level
-		// sample of _gpio_get() can miss a tap that fits inside one of those
-		// gaps. Fold it in here, then clear it for the next window.
-		_io = _gpio_get() & ~_io_press_latch;
-		_io_press_latch = 0;
+		// One joypad state per emulated frame is all gb.direct.joypad can
+		// carry, and this loop's cadence isn't constant (it stalls on core1
+		// and on save-flash erases), so anything that happened to a button
+		// since the last poll has to be delivered as a sequence rather than a
+		// level. _poll_io() advances each button by one queued transition per
+		// call, which is what guarantees a fast tap is seen as press *and*
+		// release instead of being merged into its neighbours -- see the
+		// edge-queue block comment in picosystem/hardware.cpp.
+		_poll_io();
 
 #if ENABLE_LCD
 		bool status_dirty = false;

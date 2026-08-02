@@ -7,6 +7,7 @@
 #include "hardware/pwm.h"
 #include "hardware/pio.h"
 #include "hardware/irq.h"
+#include "hardware/sync.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
 
@@ -55,17 +56,69 @@ namespace picosystem {
   volatile bool _in_flip = false;
   volatile bool _flip_armed = false;
 
+  // A|B|X|... below are raw pin numbers (see enum button), not pre-shifted
+  // bits, so OR-ing them directly is not a valid bitmask -- it collapses to
+  // a handful of low bits instead of covering pins 16-23. Shift each one
+  // into place before combining.
+  constexpr uint32_t BUTTON_PIN_MASK =
+    (1U << A) | (1U << B) | (1U << X) | (1U << Y) |
+    (1U << UP) | (1U << DOWN) | (1U << LEFT) | (1U << RIGHT);
+
+  // ---------------------------------------------------------------------
+  // Button input: debounced edge queue
+  //
+  // The consumer (main.cpp's run loop) can only present ONE joypad state per
+  // emulated GB frame -- gb.direct.joypad is set once and the whole frame runs
+  // against it. So everything that happens to a button between two polls has
+  // to survive as a *sequence*, not a level.
+  //
+  // The old scheme latched falling edges into a single bit per button, which
+  // collapsed any number of edges into "pressed for one frame". That loses
+  // real input three ways: two taps in one window become one; a tap followed
+  // by a press-and-hold is absorbed into the hold; and a release+re-press
+  // while the pin is low at both polls is invisible entirely (the game sees
+  // one unbroken hold and never re-triggers). The last one is the mash-through
+  // -dialogue case.
+  //
+  // Instead: the IRQ (both edges now) debounces and counts *net level
+  // transitions* per pin, and _poll_io() hands the consumer at most one
+  // transition per frame. Every tap therefore gets at least one frame pressed
+  // AND one frame released, however tightly it was squeezed between polls.
+  //
+  // Self-correcting by design: transitions strictly alternate (the IRQ drops
+  // any edge that doesn't change the debounced level), so applying them by
+  // XOR reproduces the sequence exactly -- and whenever a button's queue is
+  // empty _poll_io() resyncs that bit to the raw pin instead, so a dropped
+  // transition (saturation, or an edge lost while flash ops had IRQs off)
+  // heals on the next frame rather than leaving the button stuck.
+  // ---------------------------------------------------------------------
+
+  // Pending net transitions per pin, oldest-first by parity from _io's bit.
+  // Saturating: >4 transitions inside one 16.7ms frame is not physically
+  // reachable on a mechanical switch, and dropping one only costs a resync.
+  static constexpr uint8_t IO_EDGE_MAX = 4;
+  static volatile uint8_t  _io_edges[32];
+  // Last accepted (post-debounce) pin levels, 1 = released. Only the IRQ
+  // writes this; it is the reference the next edge is compared against.
+  static volatile uint32_t _io_debounced = 0xffffffff;
+  // time_us_32() of each pin's last accepted edge, for the bounce lockout.
+  static volatile uint32_t _io_edge_us[32];
+  // Tactile switches on the PicoSystem settle in ~1-5ms. Anything shorter
+  // than this after an accepted edge is contact bounce, not a new press --
+  // release bounce in particular used to fire a phantom extra press (and,
+  // via the Y+X / X+B chords, phantom menu opens and flash saves).
+  static constexpr uint32_t IO_DEBOUNCE_US = 4000;
+
   // Shared GPIO IRQ, two jobs:
   //
-  // Buttons: the main loop only samples gpio_get_all() once per emulated GB
-  // frame, and that loop's real-time cadence isn't constant -- it stalls
-  // waiting on core1 (screen scale/convert) and during save-flash erases (see
-  // main.cpp's pacer). A tap that presses and releases entirely inside one of
-  // those stalls is invisible to a single before/after level sample. This IRQ
-  // latches every falling edge (button pulled to ground) into
-  // _io_press_latch so the main loop can OR it into that frame's reading
-  // before clearing it, independent of how long the loop took to get back
-  // around to polling.
+  // Buttons: debounce the edge and, if it is a genuine level change, queue one
+  // transition for the run loop to consume (see the block comment above).
+  //
+  // Marked __not_in_flash_func: XIP is disabled while save_storage's flash
+  // erase/program run. Those wrap themselves in save_and_disable_interrupts()
+  // so this cannot currently be entered from flash, but a RAM-resident handler
+  // is the correct guarantee rather than a lucky one -- and it also keeps XIP
+  // cache misses out of the VSYNC flip path below.
   //
   // VSYNC (the ST7789 TE pin, rising edge = beam entering the off-glass dead
   // zone at scanline 240 -- see the STE command in init): starts an armed
@@ -77,7 +130,7 @@ namespace picosystem {
   // never claws back within one frame -- no panel-level tear anywhere.
   // Armed-but-still-flipping should be impossible (flips are ~12.2ms, TE
   // period ~16.7ms); if it ever happens the arm survives for the next TE.
-  static void _gpio_irq_handler(uint gpio, uint32_t event_mask) {
+  static void __not_in_flash_func(_gpio_irq_handler)(uint gpio, uint32_t event_mask) {
     if(gpio == VSYNC) {
       #ifndef PIXEL_DOUBLE
         if(_flip_armed && !_in_flip) {
@@ -96,23 +149,81 @@ namespace picosystem {
       #endif
       return;
     }
-    _io_press_latch |= (1U << gpio);
+    // Bounce lockout. Note this can also swallow the *release* of an
+    // implausibly short (<4ms) tap; that costs nothing, because the queued
+    // press is consumed next frame and the bit then resyncs to the raw
+    // (released) pin on the frame after.
+    uint32_t now = time_us_32();
+    if(now - _io_edge_us[gpio] < IO_DEBOUNCE_US)
+      return;
+
+    // Only net level changes count -- this is what keeps the queued
+    // transitions strictly alternating, so the consumer can apply them by XOR.
+    uint32_t level = gpio_get(gpio) ? (1U << gpio) : 0;
+    if(level == (_io_debounced & (1U << gpio)))
+      return;
+
+    _io_edge_us[gpio] = now;
+    _io_debounced ^= (1U << gpio);
+    if(_io_edges[gpio] < IO_EDGE_MAX)
+      _io_edges[gpio]++;
   }
 
-  void init_button_latch(uint32_t pin_mask) {
+  // Seed _io/_lio and the debounce reference from the live pins, discarding
+  // any queued transitions. Use at every point that (re)enters an input loop
+  // cold: without it, presses made in whatever ran *before* the loop are still
+  // queued and get replayed as phantom input on its first frames -- picking a
+  // ROM with A used to hand the game an A press on frame 1.
+  void _reset_io() {
+    uint32_t ints = save_and_disable_interrupts();
+    uint32_t raw = gpio_get_all();
+    // Backdated a full lockout: seeding with "now" would instead open every
+    // reset with a 4ms window in which a real press is discarded as bounce.
+    uint32_t seed_us = time_us_32() - IO_DEBOUNCE_US;
+    _io_debounced = raw;
+    for(uint8_t i = 0; i < 32; i++) {
+      if((1U << i) & BUTTON_PIN_MASK) {
+        _io_edges[i] = 0;
+        _io_edge_us[i] = seed_us;
+      }
+    }
+    _io = _lio = raw;
+    restore_interrupts(ints);
+  }
+
+  // One input sample: advance each button by at most one queued transition,
+  // and resync to the live pin where there is nothing queued. IRQs are held
+  // off across the whole sample so a concurrent edge can't be lost to the
+  // read-modify-write on _io_edges (the old latch had exactly that race
+  // between reading the latch word and zeroing it).
+  void _poll_io() {
+    uint32_t ints = save_and_disable_interrupts();
+    uint32_t raw = gpio_get_all();
+    uint32_t next = _io;
+    for(uint8_t i = 0; i < 32; i++) {
+      uint32_t bit = 1U << i;
+      if(!(bit & BUTTON_PIN_MASK))
+        continue;
+      if(_io_edges[i]) {
+        _io_edges[i]--;
+        next ^= bit;
+      } else {
+        next = (next & ~bit) | (raw & bit);
+      }
+    }
+    _lio = _io;
+    _io = next;
+    restore_interrupts(ints);
+  }
+
+  void init_button_input(uint32_t pin_mask) {
     for(uint8_t i = 0; i < 32; i++) {
       if((1U << i) & pin_mask)
-        gpio_set_irq_enabled_with_callback(i, GPIO_IRQ_EDGE_FALL, true, _gpio_irq_handler);
+        gpio_set_irq_enabled_with_callback(
+          i, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, _gpio_irq_handler);
     }
+    _reset_io();
   }
-
-  // A|B|X|... below are raw pin numbers (see enum button), not pre-shifted
-  // bits, so OR-ing them directly is not a valid bitmask -- it collapses to
-  // a handful of low bits instead of covering pins 16-23. Shift each one
-  // into place before combining.
-  constexpr uint32_t BUTTON_PIN_MASK =
-    (1U << A) | (1U << B) | (1U << X) | (1U << Y) |
-    (1U << UP) | (1U << DOWN) | (1U << LEFT) | (1U << RIGHT);
 
   void init_outputs(uint32_t pin_mask) {
     for(uint8_t i = 0; i < 32; i++) {
@@ -394,7 +505,7 @@ namespace picosystem {
 
     // configure control io pins
     init_inputs(BUTTON_PIN_MASK);
-    init_button_latch(BUTTON_PIN_MASK);
+    init_button_input(BUTTON_PIN_MASK);
     init_outputs(CHARGE_LED);
 
     // configure adc channel used to monitor battery charge
@@ -530,7 +641,7 @@ namespace picosystem {
 
     // route the TE rising edge (vblank start) into the shared GPIO IRQ so an
     // armed flip starts exactly at vblank (see _gpio_irq_handler). The
-    // callback itself was registered by init_button_latch() above; always
+    // callback itself was registered by init_button_input() above; always
     // enabled -- when nothing is armed the handler is a compare and return,
     // ~60 times a second.
     gpio_set_irq_enabled(VSYNC, GPIO_IRQ_EDGE_RISE, true);

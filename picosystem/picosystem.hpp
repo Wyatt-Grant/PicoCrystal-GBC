@@ -70,7 +70,8 @@ namespace picosystem {
   extern int32_t        _tlh, _tls;          // text letter height and spacing
   extern int32_t        _tlw;                // text letter width (-1: variable)
   extern uint32_t       _io, _lio;           // io state and last io state
-  extern volatile uint32_t _io_press_latch;  // buttons seen low since last poll (irq-set)
+  void        _poll_io();                    // sample buttons (debounced edge queue)
+  void        _reset_io();                   // seed _io from live pins, drop queue
   extern volatile bool  _in_flip;            // display flip DMA in flight
   extern volatile bool  _flip_armed;         // TE irq starts a flip at next panel vblank
   uint32_t    _measure_te_period_us();       // boot-time panel TE period measurement
