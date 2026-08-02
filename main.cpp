@@ -633,20 +633,35 @@ static inline void update_joypad() {
 // ---------------------------------------------------------------------
 // Charge sense.
 //
-// The charger's status line (GPIO 24, `CHARGING` in picosystem/hardware.cpp's
-// pin enum) is the one input the SDK names but never initialises or reads, so
-// it is free for us. It is an open-drain STAT output pulled low while the cell
-// is taking charge; it floats high otherwise, which is why the pull-up matters.
+// Two pins, because STAT alone cannot tell "charging" from "unplugged".
 //
-// It reports *charging*, not *cable present*: plugged in with an already-full
-// battery, the charger stops driving STAT and this reads the same as unplugged.
-// That is the honest state to show -- the bolt means "filling", not "docked".
+// GPIO 24 is the charger's STAT line (`CHARGING` in picosystem/hardware.cpp's
+// pin enum, PICOSYSTEM_CHARGE_STAT_PIN in the pico-sdk board header). It is an
+// open-drain output pulled low while the cell takes charge and released when it
+// does not -- but only while the charger is powered. Unplug the cable and the
+// charger loses VBUS, and the pull-up current we feed into its now-dead STAT
+// pin gets clamped to a fraction of a volt by the IC's internal ESD diode. The
+// pin reads *low*. So the unpowered charger and the charging one look
+// identical, which is why STAT on its own left the bolt lit forever after
+// unplugging.
+//
+// GPIO 2 is the disambiguator: VBUS detect (PICOSYSTEM_VBUS_DETECT_PIN, high
+// when USB power is present). picosystem/hardware.cpp misnames it `CHARGE_LED`
+// and passes it to init_outputs(), which takes a *mask* -- so the constant 2
+// selects GPIO 1, and GPIO 2 is left alone. We reconfigure it as an input here
+// anyway, after _init_hardware() has run, so it stays an input even if that
+// mismatch is ever corrected upstream.
+//
+// Charging is the AND of the two: cable present *and* STAT asserted. That keeps
+// the earlier semantics -- the bolt means "filling", not "docked", so a full
+// battery on the cable drops the bolt once the charger stops driving STAT.
 //
 // The result lands in g_charging for the battery icon to draw from, rather than
-// the icon reading the pin itself: draw_battery_icon() lives inside the
+// the icon reading the pins itself: draw_battery_icon() lives inside the
 // @ui-draw fence, which tools/render_menus.cpp extracts and builds on the host
 // where there is no GPIO.
-constexpr uint32_t CHARGE_PIN = 24;
+constexpr uint32_t CHARGE_PIN = 24; // STAT, open-drain, active low
+constexpr uint32_t VBUS_PIN = 2;    // VBUS detect, active high
 
 // STAT is asserted (low) while the cell takes charge and released otherwise --
 // but the charger does not hold it steady near termination, where it tops the
@@ -662,28 +677,44 @@ constexpr uint32_t CHARGE_PIN = 24;
 // began. Plug in a nearly-full device and the bolt would never appear -- and
 // since the boot seed below is a single sample, whether it came up right was
 // down to which phase of the burst that one read landed in.
+//
+// None of that hold applies to losing VBUS: the cable is either in or it is
+// not, so that direction clears the bolt on the spot.
 constexpr uint64_t CHARGE_RELEASE_US = 3000000;
 
 static bool g_charging = false;        // debounced, what the icon draws
 static bool charge_prev_low = false;   // previous sample, for the confirm below
 static uint64_t charge_last_low = 0;   // when STAT was last seen asserted
 
+// STAT only means anything while the charger has power (see above), so every
+// read of it is gated on VBUS.
+static bool charge_stat_low() {
+	return gpio_get(VBUS_PIN) && !gpio_get(CHARGE_PIN);
+}
+
 static void charge_sense_init() {
 	gpio_init(CHARGE_PIN);
 	gpio_set_dir(CHARGE_PIN, GPIO_IN);
 	gpio_pull_up(CHARGE_PIN); // open-drain STAT, floats high when not charging
-	// Seed from the pin so booting on the charger shows the bolt straight
+
+	gpio_init(VBUS_PIN);
+	gpio_set_dir(VBUS_PIN, GPIO_IN);
+	// Pull down, so the safe reading is the quiet one: if this pin is ever
+	// left floating the bolt stays off rather than latching on.
+	gpio_pull_down(VBUS_PIN);
+
+	// Seed from the pins so booting on the charger shows the bolt straight
 	// away instead of waiting out a confirm it never needed.
-	charge_prev_low = g_charging = !gpio_get(CHARGE_PIN);
+	charge_prev_low = g_charging = charge_stat_low();
 	charge_last_low = time_us_64();
 }
 
-// Polled every frame -- one SIO read, and the burst gaps this has to measure
+// Polled every frame -- two SIO reads, and the burst gaps this has to measure
 // are far shorter than the battery ADC's cadence. Returns true when the drawn
 // state changed, so the caller can repaint.
 static bool charge_sense_poll() {
 	const uint64_t now = time_us_64();
-	const bool low = !gpio_get(CHARGE_PIN); // active low
+	const bool low = charge_stat_low();
 	const bool prev = charge_prev_low;
 	charge_prev_low = low;
 
@@ -699,7 +730,9 @@ static bool charge_sense_poll() {
 			g_charging = true;
 			return true;
 		}
-	} else if (now - charge_last_low >= CHARGE_RELEASE_US) {
+	} else if (!gpio_get(VBUS_PIN) || now - charge_last_low >= CHARGE_RELEASE_US) {
+		// Cable out clears immediately; a released STAT with the cable
+		// still in waits out the burst window.
 		g_charging = false;
 		return true;
 	}
