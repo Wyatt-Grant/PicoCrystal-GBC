@@ -70,7 +70,23 @@ static uint8_t g_rtc_hour = 14;
 static uint8_t g_rtc_min = 32;
 static uint8_t g_rtc_sec = 7;
 static bool g_vsync = true; // render the settings screen with the toggle ON
-static bool g_color_filter = true; // COLOR FILTER row rendered ON
+// Mirrors main.cpp's picture-mode enum (the filter itself only touches game
+// palettes, so nothing here converts anything -- the row just names the mode).
+enum color_filter_t : uint8_t {
+	CF_OFF = 0,
+	CF_GBC = 1,
+	CF_VIVID,
+	CF_CANDY,
+	CF_PASTEL,
+	CF_MONO,
+	CF_SEPIA,
+	CF_NIGHT,
+	CF_GREEN,
+	CF_POCKET,
+	CF_INVERT,
+	CF_COUNT,
+};
+static uint8_t g_color_filter = CF_GBC; // COLOR FILTER row rendered on GBC
 static bool g_boot_last = true; // BOOT LAST GAME row rendered ON
 static bool g_nostalgic_boot = true; // NOSTALGIC BOOT row rendered ON
 // SAVE INTERVAL row: rendered at the 10S option (a plain seconds value; index

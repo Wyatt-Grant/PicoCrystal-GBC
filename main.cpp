@@ -433,62 +433,226 @@ static inline constexpr color_t rgb565_to_color(uint16_t c) {
 	return r4 | (0xF << 4) | (b4 << 8) | (g4 << 12);
 }
 
-// COLOR FILTER (settings row): approximate a real GBC panel's response instead
-// of showing raw palette values. A game's palette writes were authored for a
-// reflective STN screen whose primaries bleed heavily into each other; feeding
-// those same values straight to this device's LCD gives colors that are far
-// more saturated (and greens far purer) than the artists ever saw. Read by
-// core1's LUT rebuild; only changed from the settings menu while emulation is
-// paused, so no synchronisation beyond the volatile is needed.
-static volatile bool g_color_filter = false;
+// COLOR FILTER (settings row): picture modes, each recoloring the game's
+// palette on its way to the framebuffer. GBC, the original, approximates a real
+// GBC panel's response instead of showing raw palette values -- a game's
+// palette writes were authored for a reflective STN screen whose primaries
+// bleed heavily into each other, and feeding those same values straight to this
+// device's LCD gives colors far more saturated (and greens far purer) than the
+// artists ever saw. The rest are frank effects: monochrome ramps, the classic
+// DMG greens, a saturation boost. Read by core1's LUT rebuild; only changed
+// from the settings menu while emulation is paused, so no synchronisation
+// beyond the volatile is needed.
+enum color_filter_t : uint8_t {
+	CF_OFF = 0,   // raw palette values, converted straight through
+	CF_GBC = 1,   // pinned: flash records predate the mode list and stored
+		      // this byte as the old ON/OFF toggle, so 0 and 1 have to
+		      // keep meaning OFF and GBC (device_settings_t::color_filter)
+	CF_VIVID,
+	CF_CANDY,
+	CF_PASTEL,
+	CF_MONO,
+	CF_SEPIA,
+	CF_NIGHT,
+	CF_GREEN,
+	CF_POCKET,
+	CF_INVERT,
+	CF_COUNT,
+};
+static volatile uint8_t g_color_filter = CF_OFF;
 
-// The cross-channel bleed, in 1/256ths. Each output channel is mostly its own
-// input plus a slice of the other two -- which is what desaturates the picture
-// the way the panel did. Every row sums to exactly 256, so greys stay
-// perfectly neutral (a matrix whose rows sum differently tints the greyscale,
-// which is the usual failure mode of the hand-rolled GBC matrices floating
-// around). Blue keeps the least of itself and picks up the most green: the
-// GBC's blue was the weakest, most cyan-shifted primary.
-constexpr int32_t CF_RR = 200, CF_RG =  40, CF_RB =  16;
-constexpr int32_t CF_GR =  32, CF_GG = 184, CF_GB =  40;
-constexpr int32_t CF_BR =  32, CF_BG =  48, CF_BB = 176;
+// Every mode runs the same two stages, so there is one conversion path and no
+// per-mode branching anywhere that matters:
+//
+//   5-bit channel -> _cf_x5 -> 0..255 -> 3x3 matrix -> clamp -> curve -> 4 bits
+//
+// The matrix does everything cross-channel (the GBC bleed, desaturation toward
+// luma, saturation boosts); the per-channel curves do everything else
+// (wash-out, tints, inversion, posterizing). That split is what lets ten fairly
+// different looks share one function.
+//
+// Invariant: every matrix row sums to exactly 256, so greys stay perfectly
+// neutral. A matrix whose rows sum differently tints the greyscale, which is
+// the usual failure mode of the hand-rolled GBC matrices floating around -- and
+// here it would also break the two DMG modes, whose four shades are picked by
+// the (necessarily neutral) luma the matrix produces. Tints belong in the
+// curves.
 
-// Wash-out, applied after the bleed. An accurate GBC emulation is also
-// noticeably *darker* than raw output, and this device's panel is already dim
-// -- stacking the two would bury the shadows. So instead of the usual darkening
-// gamma we lift: blend each channel CF_LIFT/256 of the way toward its
-// mirrored-square curve (v -> 255 - (255-v)^2/255), which leaves black at black
-// and white at white but pulls the midtones up, for the slightly faded,
-// sun-bleached look of a real screen rather than a dim one. Bumped past what a
-// straight "authentic" filter would do, per how dark this panel reads.
-constexpr int32_t CF_LIFT = 128;
+// Luma weights in 1/256ths, summing to 256: the neutral row every monochrome
+// mode uses, and the desaturation target of the saturation family below.
+constexpr int32_t CF_LR = 77, CF_LG = 150, CF_LB = 29;
 
-// The two tables the conversion below runs on, built once by cf_build_tables():
-//   _cf_x5    5-bit channel -> 0..255, i.e. what "v * 255 / 31" used to compute
-//             inline. The M0+ has no divide instruction and GCC can't magic-
-//             number its way around one without a long multiply, so each of
-//             those three divides compiled to an __aeabi_idiv call -- together
-//             they cost more than everything else in the function.
-//   _cf_lift4 post-bleed channel (0..255) -> the final 4-bit output nibble,
-//             with the wash-out curve already folded in.
+// The active pipeline, rebuilt by cf_build_tables() on a mode change:
+//   _cf_x5   5-bit channel -> 0..255, i.e. what "v * 255 / 31" used to compute
+//            inline. The M0+ has no divide instruction and GCC can't magic-
+//            number its way around one without a long multiply, so each of
+//            those three divides compiled to an __aeabi_idiv call -- together
+//            they cost more than everything else in the function.
+//   _cf_mat  the matrix, row-major, in 1/256ths. Signed, because a saturation
+//            boost is exactly a matrix with negative off-diagonals. int32
+//            rather than the int16 the values would fit in: Thumb-1 has no
+//            immediate-offset form of LDRSH, so a halfword table costs an extra
+//            MOVS per coefficient -- 9 wasted instructions to save 18 bytes.
+//   _cf_out  post-matrix channel (0..255) -> the final 4-bit output nibble,
+//            one curve per channel so a mode can tint.
 // Plain .bss, so they sit in SRAM where core1 reads them without touching the
-// QSPI bus. Values are computed with the same integer expressions the inline
-// arithmetic used, so the filtered output is bit-identical to before.
+// QSPI bus. 836 bytes all told, which is the point: folding the matrix into the
+// input lookups would drop the multiplies, but it costs ~1.2KB against the
+// ~2.8KB of slack the RAM region has left, and the multiplies are worth tens of
+// cycles per *changed palette entry* -- this runs once per entry on a palette
+// rebuild, never per pixel.
 static uint8_t _cf_x5[32];
-static uint8_t _cf_lift4[256];
+static int32_t _cf_mat[9];
+static uint8_t _cf_out[3][256];
 
-static void cf_build_tables() {
+// Branchless saturate to 0..255: three data-processing pairs, versus the
+// compare-and-branch GCC emits for the ternary form (which costs a taken branch
+// on the common in-range path, on a core with no branch prediction).
+// `v & ~(v >> 31)` floors at 0; the same trick on 255 - v then ceilings at 255.
+static inline int32_t cf_clamp8(int32_t v) {
+	v &= ~(v >> 31);
+	const int32_t t = 255 - v;
+	return 255 - (t & ~(t >> 31));
+}
+
+// Wash-out. An accurate GBC emulation is noticeably *darker* than raw output,
+// and this device's panel is already dim -- stacking the two would bury the
+// shadows. So instead of the usual darkening gamma we lift: blend v amount/256
+// of the way toward its mirrored-square curve (v -> 255 - (255-v)^2/255), which
+// leaves black at black and white at white but pulls the midtones up, for the
+// slightly faded, sun-bleached look of a real screen rather than a dim one.
+// (255-v)^2/255 is approximated as (255-v)^2 >> 8; the 1/255-vs-1/256 error is
+// under one part in 256, well inside the 4-bit output. GBC's 128 is bumped past
+// what a straight "authentic" filter would do, per how dark this panel reads.
+static int32_t cf_lift(int32_t v, int32_t amount) {
+	const int32_t iv = 255 - v;
+	return v + ((((255 - (iv * iv >> 8)) - v) * amount) >> 8);
+}
+
+// Saturation blend: s/256 of the identity plus the remainder of luma. s == 256
+// is the identity (hue and saturation untouched), s == 0 collapses every row to
+// luma (monochrome), and s > 256 pushes past the identity -- which is where the
+// negative off-diagonals of a saturation boost come from. The off-diagonals are
+// computed first and the diagonal takes the remainder, so a row lands on
+// exactly 256 however the rounding falls.
+static void cf_sat_matrix(int32_t s) {
+	static const int32_t L[3] = { CF_LR, CF_LG, CF_LB };
+	for (int32_t i = 0; i < 3; i++) {
+		int32_t row = 0;
+		for (int32_t j = 0; j < 3; j++) {
+			if (i == j)
+				continue;
+			const int32_t v = ((256 - s) * L[j] + 128) >> 8;
+			_cf_mat[i * 3 + j] = v;
+			row += v;
+		}
+		_cf_mat[i * 3 + i] = 256 - row;
+	}
+}
+
+// The four shades of a DMG-class panel, darkest first, as 8-bit RGB. Both
+// posterizing modes quantize luma into four equal bands and emit these -- the
+// real thing, detail loss included, rather than a smooth ramp between them.
+static const uint8_t CF_RAMP_GREEN[4][3] = {
+	{ 0x0F, 0x38, 0x0F }, { 0x30, 0x62, 0x30 },
+	{ 0x8B, 0xAC, 0x0F }, { 0x9B, 0xBC, 0x0F },
+};
+static const uint8_t CF_RAMP_POCKET[4][3] = {
+	{ 0x1F, 0x1F, 0x1F }, { 0x4D, 0x53, 0x3C },
+	{ 0x8B, 0x95, 0x6D }, { 0xC4, 0xCF, 0xA1 },
+};
+
+static void cf_build_tables(uint8_t mode) {
 	for (int32_t v = 0; v < 32; v++)
 		_cf_x5[v] = (uint8_t)(v * 255 / 31);
+
+	// Matrix. Everything but GBC is a saturation blend.
+	switch (mode) {
+	case CF_GBC: {
+		// The cross-channel bleed, in 1/256ths. Each output channel is
+		// mostly its own input plus a slice of the other two -- which is
+		// what desaturates the picture the way the panel did. Blue keeps
+		// the least of itself and picks up the most green: the GBC's blue
+		// was the weakest, most cyan-shifted primary.
+		static const int32_t GBC_BLEED[9] = {
+			200,  40,  16,
+			 32, 184,  40,
+			 32,  48, 176,
+		};
+		memcpy(_cf_mat, GBC_BLEED, sizeof(_cf_mat));
+		break;
+	}
+	case CF_CANDY:  cf_sat_matrix(448); break; // x1.75
+	case CF_VIVID:  cf_sat_matrix(352); break; // x1.375
+	case CF_NIGHT:  cf_sat_matrix(192); break; // x0.75
+	case CF_PASTEL: cf_sat_matrix(141); break; // x0.55
+	case CF_INVERT: cf_sat_matrix(256); break; // identity: colours untouched
+	default:        cf_sat_matrix(0);   break; // monochrome: luma rows
+	}
+
+	// Curves. Cold path (a mode change, with emulation paused), so this is
+	// written for legibility -- the switch is per table entry, not per pixel.
 	for (int32_t v = 0; v < 256; v++) {
-		// v + (lift(v) - v) * CF_LIFT/256, with lift(v) = 255 - (255-v)^2/255
-		// approximated as 255 - ((255-v)^2 >> 8) (the 1/255-vs-1/256 error is
-		// under one part in 256, well inside the 4-bit output). Then >>4 to
-		// output precision: the curve is monotonic into 0..255, so the nibble
-		// needs no clamp.
-		const int32_t iv = 255 - v;
-		const int32_t lifted = v + ((((255 - (iv * iv >> 8)) - v) * CF_LIFT) >> 8);
-		_cf_lift4[v] = (uint8_t)(lifted >> 4);
+		int32_t c[3];
+		switch (mode) {
+		case CF_GBC:
+			c[0] = c[1] = c[2] = cf_lift(v, 128);
+			break;
+		case CF_VIVID:
+			// Gentle S-contrast about mid-grey (x9/8) -- the punch
+			// half of "vivid"; the matrix does the colour half.
+			c[0] = c[1] = c[2] = 128 + ((v - 128) * 9 >> 3);
+			break;
+		case CF_CANDY:
+			// VIVID turned up: a much harder saturation boost in the
+			// matrix, and here a lift (so it reads bright and sugary
+			// rather than merely contrasty) followed by a x5/4 pivot
+			// about 132. Both ends run past 0..255 on purpose -- the
+			// clamp is what clips highlights to pure primaries, and
+			// that clipping is most of the "pop".
+			c[0] = c[1] = c[2] = 132 + ((cf_lift(v, 80) - 132) * 5 >> 2);
+			break;
+		case CF_PASTEL:
+			// Heavily lifted: high-key, milky, low-contrast.
+			c[0] = c[1] = c[2] = cf_lift(v, 190);
+			break;
+		case CF_SEPIA: {
+			// Warm monochrome: per-channel gains on a lifted ramp.
+			const int32_t l = cf_lift(v, 64);
+			c[0] = l * 275 >> 8;
+			c[1] = l * 238 >> 8;
+			c[2] = l * 184 >> 8;
+			break;
+		}
+		case CF_NIGHT: {
+			// Blue cut hard, red and green nudged up: an amber wash
+			// for playing in the dark. Keeps a trace of the original
+			// colour (the matrix only desaturates to 75%).
+			const int32_t l = cf_lift(v, 96);
+			c[0] = l * 272 >> 8;
+			c[1] = l * 230 >> 8;
+			c[2] = l * 140 >> 8;
+			break;
+		}
+		case CF_GREEN:
+		case CF_POCKET: {
+			const uint8_t (*ramp)[3] = mode == CF_GREEN ? CF_RAMP_GREEN
+								   : CF_RAMP_POCKET;
+			const int32_t shade = v >> 6; // four equal luma bands
+			c[0] = ramp[shade][0];
+			c[1] = ramp[shade][1];
+			c[2] = ramp[shade][2];
+			break;
+		}
+		case CF_INVERT:
+			c[0] = c[1] = c[2] = 255 - v;
+			break;
+		default: // CF_MONO -- and CF_OFF, which never reads these tables
+			c[0] = c[1] = c[2] = v;
+			break;
+		}
+		for (int32_t i = 0; i < 3; i++)
+			_cf_out[i][v] = (uint8_t)(cf_clamp8(c[i]) >> 4);
 	}
 }
 
@@ -503,18 +667,24 @@ static color_t __not_in_flash_func(rgb565_to_color_filtered)(uint16_t c) {
 	const int32_t g = _cf_x5[(c >> 6)  & 0x1F];
 	const int32_t b = _cf_x5[c         & 0x1F];
 
-	// Bleed, then wash-out and the drop to 4 bits in a single lookup. The
-	// matrix rows sum to 256 and the inputs are 0..255, so every index is in
-	// range for _cf_lift4 with no clamp.
-	const uint32_t nr = _cf_lift4[(r * CF_RR + g * CF_RG + b * CF_RB) >> 8];
-	const uint32_t ng = _cf_lift4[(r * CF_GR + g * CF_GG + b * CF_GB) >> 8];
-	const uint32_t nb = _cf_lift4[(r * CF_BR + g * CF_BG + b * CF_BB) >> 8];
+	// Matrix, then the curve and the drop to 4 bits in a single lookup. The
+	// clamp only ever bites for a saturation boost (VIVID, CANDY), whose
+	// negative off-diagonals can push a channel outside 0..255; every other
+	// matrix has non-negative coefficients and rows summing to 256, so there
+	// it is dead weight the compiler still has to carry.
+	const uint32_t nr = _cf_out[0][cf_clamp8(
+		(r * _cf_mat[0] + g * _cf_mat[1] + b * _cf_mat[2]) >> 8)];
+	const uint32_t ng = _cf_out[1][cf_clamp8(
+		(r * _cf_mat[3] + g * _cf_mat[4] + b * _cf_mat[5]) >> 8)];
+	const uint32_t nb = _cf_out[2][cf_clamp8(
+		(r * _cf_mat[6] + g * _cf_mat[7] + b * _cf_mat[8]) >> 8)];
 
 	return (color_t)(nr | (0xF << 4) | (nb << 8) | (ng << 12));
 }
 
 static inline color_t rgb565_to_color_maybe_filtered(uint16_t c) {
-	return g_color_filter ? rgb565_to_color_filtered(c) : rgb565_to_color(c);
+	return g_color_filter != CF_OFF ? rgb565_to_color_filtered(c)
+					: rgb565_to_color(c);
 }
 
 // Non-CGB (DMG) titles get a fixed four-shade grey ramp rather than palette
@@ -535,17 +705,17 @@ static color_t _grey_lut[4] = {
 // core1 inside the rebuild.
 static volatile bool _pal_lut_stale = true;
 
-// Switch the filter on/off. The DMG ramp is rebuilt here; the CGB palette LUT
-// is rebuilt by core1 the usual way, by marking the emulator's palette dirty so
+// Select a filter mode. The DMG ramp is rebuilt here; the CGB palette LUT is
+// rebuilt by core1 the usual way, by marking the emulator's palette dirty so
 // the next line job carries a snapshot. Call only with emulation paused (the
 // settings menu, or before the run loop starts) -- core1 must not be mid-job.
-static void apply_color_filter(bool on) {
+static void apply_color_filter(uint8_t mode) {
 	// The only route to a filtered conversion runs through here, so this is
-	// the one place the tables have to be ready by. Rebuilding them on an
-	// off-toggle too is a few hundred cycles once, and saves having a second
+	// the one place the tables have to be ready by. Rebuilding them for
+	// CF_OFF too is a few thousand cycles once, and saves having a second
 	// state to reason about.
-	cf_build_tables();
-	g_color_filter = on;
+	cf_build_tables(mode);
+	g_color_filter = mode;
 	for (int32_t i = 0; i < 4; i++)
 		_grey_lut[i] = rgb565_to_color_maybe_filtered(DMG_GREY565[i]);
 	_pal_lut_stale = true;
@@ -705,13 +875,13 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 		// order of magnitude more, and it is rare for a palette write to
 		// touch more than one or two of the 64. `all` covers the cases
 		// where the shadow can't be trusted: the first rebuild after
-		// boot, and a filter toggle, which changes every output colour
+		// boot, and a filter change, which changes every output colour
 		// without changing a single input value.
 		const bool all = _pal_lut_stale;
 		_pal_lut_stale = false;
 		// Branch hoisted out of the loop: the filter can't change
 		// mid-rebuild (it only moves with emulation paused).
-		if (g_color_filter) {
+		if (g_color_filter != CF_OFF) {
 			for (int32_t i = 0; i < 0x40; i++) {
 				const uint16_t c = job->palette[i];
 				if (!all && c == _pal_src[i])
@@ -1721,12 +1891,16 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	} else {
 		draw_toggle_row(SET_ROW_VSYNC, sel, ICON_SCREEN, "VSYNC", g_vsync);
 	}
-	// COLOR FILTER: ON runs the CGB palette through the panel-response
-	// approximation (see g_color_filter) instead of showing raw palette
-	// values -- softer, less saturated, and lifted a little to suit this
-	// screen. Costs nothing per frame: it's baked into the palette LUT.
-	draw_toggle_row(SET_ROW_COLOR, sel, ICON_DROPLET, "COLOR FILTER",
-			g_color_filter);
+	// COLOR FILTER: picture modes (see color_filter_t) -- GBC is the
+	// panel-response approximation, the rest range from a saturation boost
+	// to the classic DMG greens. Costs nothing per frame whichever is
+	// chosen: the whole effect is baked into the 64-entry palette LUT.
+	static const char *const CF_NAMES[CF_COUNT] = {
+		"OFF", "GBC", "VIVID", "CANDY", "PASTEL", "MONO",
+		"SEPIA", "NIGHT", "GB GREEN", "POCKET", "INVERT",
+	};
+	draw_value_row(SET_ROW_COLOR, sel, ICON_DROPLET, "COLOR FILTER",
+		       CF_NAMES[g_color_filter]);
 	// STATUS BAR: what the in-game header shows -- FPS and/or battery % text
 	// (the icon always shows), just the icon, FULLSCREEN (no header, game
 	// frame centered) or FS BATTERY (fullscreen plus a 2px screen-wide
@@ -2148,7 +2322,7 @@ static void store_device_settings() {
 		g_last_slot,
 		(uint8_t)(g_nostalgic_boot ? 1 : 0),
 		g_save_interval,
-		(uint8_t)(g_color_filter ? 1 : 0),
+		g_color_filter,
 	};
 	save_storage_settings_store(ds);
 }
@@ -2169,10 +2343,11 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		g_vsync = !g_vsync;
 		apply_audio_pacing(); // TE-paced vsync shifts the production rate
 		return;
-	case SET_ROW_COLOR: // either direction toggles
+	case SET_ROW_COLOR: // < > cycle OFF/GBC/VIVID/../INVERT, wrapping
 		// Safe to rebuild the palette LUTs from here: the settings menu
 		// only runs with emulation (and so core1's renderer) paused.
-		apply_color_filter(!g_color_filter);
+		apply_color_filter((uint8_t)((g_color_filter + CF_COUNT +
+					      (uint32_t)dir) % CF_COUNT));
 		return;
 	case SET_ROW_STATUS: // < > cycle the five modes, wrapping
 		g_status_bar = (uint8_t)((g_status_bar + STATUS_MODE_COUNT +
@@ -2998,7 +3173,8 @@ int main() {
 					? ds.save_interval : SAVE_INTERVAL_DEFAULT;
 			// Rebuilds the DMG ramp and marks the CGB palette dirty;
 			// both LUTs are rebuilt before the first frame renders.
-			apply_color_filter(ds.color_filter != 0);
+			apply_color_filter(ds.color_filter < CF_COUNT
+					   ? ds.color_filter : (uint8_t)CF_OFF);
 #if ENABLE_SOUND
 			audio_output_set_volume(ds.volume); // clamps internally
 #endif

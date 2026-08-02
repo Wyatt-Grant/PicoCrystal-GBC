@@ -155,9 +155,12 @@ struct device_settings_t {
 			      // 60/120 seconds. Stored as the index, not the
 			      // seconds, so the option list can be retuned
 			      // without reinterpreting stored records.
-	uint8_t color_filter; // 0/1: GBC panel color emulation -- softened,
-			      // desaturated, slightly lifted palettes
-			      // (main.cpp g_color_filter)
+	uint8_t color_filter; // picture mode: an index into main.cpp's
+			      // color_filter_t (g_color_filter) -- 0 = OFF,
+			      // 1 = GBC panel emulation, then VIVID/PASTEL/
+			      // MONO/... Was a 0/1 toggle before the mode list
+			      // existed, and 0/1 still mean the same two
+			      // things, so old records decode unchanged.
 };
 // Growing this struct invalidates the previously stored record (the CRC is
 // computed over the whole payload), so settings reset to defaults once on
