@@ -14,7 +14,8 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
 - Full-speed CGB emulation on the RP2040's two Cortex-M0+ cores
   (overclocked to 250MHz), with optional tear-free vsync
 - Boot menu for multiple ROMs; per-game flash save regions. It opens on the
-  last game you played, marked with an accent dot
+  last game you played, marked with an accent dot — or BOOT LAST GAME skips
+  the picker entirely and goes straight back into it
 - Automatic battery-backed-save persistence: autosaves to flash a few
   seconds after the game writes cart RAM, double-buffered so a mid-save
   power-off can never destroy the last good save. The interval is
@@ -31,8 +32,9 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
   classic four-shade DMG palettes), GB RED / GB BLUE / GB YELLOW (the same
   four-shade posterizing on a differently tinted panel) and INVERT.
   Every mode is baked into the palette lookup, so none of them costs a frame
-- Settings menu: brightness, volume, vsync, color filter,
-  FPS/battery overlays, save interval, clock
+- Settings menu: brightness, volume, vsync, color filter, status bar,
+  save interval, boot last game, nostalgic boot (a Game Boy–style startup
+  splash and chime), theme, appearance, clock
 - Charging indicator: a bolt in the battery icon whenever the cell is taking
   charge, in the status bar and every menu header
 
@@ -77,6 +79,8 @@ boot menu.
 - **UP/DOWN** to pick a game (long lists scroll), **A** to boot it
 - **Y+X** (or the SETTINGS row) opens settings
 - To switch games, power-cycle the console
+- With BOOT LAST GAME on the picker is skipped entirely — hold **B** while
+  switching on to get it back
 
 ## Controls (in-game)
 
@@ -170,13 +174,16 @@ create `assets/roms.json` (it is gitignored, like the ROMs):
 {
   "roms": [
     { "file": "polishedcrystal.gbc",  "name": "POKEMON CRYSTAL", "slot": 0 },
-    { "file": "chromatic_tetris.gbc", "name": "CHROMATIC TETRIS" },
+    { "file": "chromatic_tetris.gbc", "name": "CHROMATIC TETRIS", "color": "#39f" },
     { "file": "some_other_game.gb" }
   ]
 }
 ```
 
-`name` and `slot` are optional (omit or set to `null`). The array sets the
+(`assets/roms.json.example` is the same thing with every field documented.)
+
+`name`, `slot` and `color` — a hex RGB tint for the game's cart icon, e.g.
+`"#3fa9f5"` — are optional (omit or set to `null`). The array sets the
 menu order; unlisted files are appended alphabetically. Names may use `A-Z`,
 `0-9`, and spaces (the menu font has nothing else). Entries for files no
 longer in `assets/` are skipped with a warning, and their pinned slots stay
