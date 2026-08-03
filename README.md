@@ -28,7 +28,8 @@ run `make`, copy one `.uf2` to the device, and pick a game from the boot menu.
   lifted a little to suit this panel), plus VIVID, CANDY, PASTEL, SORBET
   (PASTEL's high-key wash with the saturation pushed up instead of down —
   candy colors, softened), MONO, SEPIA, NIGHT, GB GREEN and POCKET (the two
-  classic four-shade DMG palettes) and INVERT.
+  classic four-shade DMG palettes), GB RED / GB BLUE / GB YELLOW (the same
+  four-shade posterizing on a differently tinted panel) and INVERT.
   Every mode is baked into the palette lookup, so none of them costs a frame
 - Settings menu: brightness, volume, vsync, color filter,
   FPS/battery overlays, save interval, clock

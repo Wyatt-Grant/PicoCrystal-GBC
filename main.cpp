@@ -780,6 +780,12 @@ enum color_filter_t : uint8_t {
 	CF_SEPIA,
 	CF_NIGHT,
 	CF_GREEN,
+	// The same four-shade posterizing as CF_GREEN with the panel tinted
+	// another colour -- hardware that never existed, but the DMG look does
+	// not depend on the green in particular, only on the four flat steps.
+	CF_RED,
+	CF_BLUE,
+	CF_YELLOW,
 	CF_POCKET,
 	CF_INVERT,
 	CF_COUNT,
@@ -886,6 +892,25 @@ static const uint8_t CF_RAMP_POCKET[4][3] = {
 	{ 0x1F, 0x1F, 0x1F }, { 0x4D, 0x53, 0x3C },
 	{ 0x8B, 0x95, 0x6D }, { 0xC4, 0xCF, 0xA1 },
 };
+// The invented tints, built to the same shape as CF_RAMP_GREEN rather than by
+// rotating its channels -- a straight channel swap works for red but sends
+// blue's light end to a muddy purple, because the eye gets most of its
+// brightness from green and a blue ramp has none to spend. So each keeps the
+// green ramp's spacing (a near-black shade, a dark midtone, then two bright
+// steps close together, which is the compression the real panel had) and drifts
+// warmer as it brightens the way the original does toward its pea-soup top.
+static const uint8_t CF_RAMP_RED[4][3] = {
+	{ 0x40, 0x12, 0x12 }, { 0x78, 0x38, 0x28 },
+	{ 0xC8, 0x78, 0x18 }, { 0xE0, 0x98, 0x20 },
+};
+static const uint8_t CF_RAMP_BLUE[4][3] = {
+	{ 0x0F, 0x1E, 0x38 }, { 0x28, 0x50, 0x78 },
+	{ 0x58, 0xA0, 0xC8 }, { 0x78, 0xBC, 0xD8 },
+};
+static const uint8_t CF_RAMP_YELLOW[4][3] = {
+	{ 0x2C, 0x24, 0x0C }, { 0x60, 0x54, 0x18 },
+	{ 0xB4, 0xA4, 0x24 }, { 0xD8, 0xC8, 0x38 },
+};
 
 static void cf_build_tables(uint8_t mode) {
 	for (int32_t v = 0; v < 32; v++)
@@ -964,7 +989,26 @@ static void cf_build_tables(uint8_t mode) {
 			// of that headroom already. Blacks still land on black
 			// (cf_lift fixes both endpoints), so outlines and text
 			// survive.
-			c[0] = c[1] = c[2] = cf_lift(cf_lift(v, 190), 128);
+			//
+			// Green runs the same curve over a scaled-down index,
+			// which is what keeps grass, trees and yellows off the
+			// ceiling. Green carries 150/256 of luma, so green- and
+			// yellow-dominant colours are the ones the double lift
+			// pins at full brightness first; everything else has
+			// room to spare. Scaling *into* the curve rather than
+			// gaining its output is the point -- the lift's own
+			// compression pulls the top back up (255 -> 215 comes
+			// out at 250), so white and near-white stay neutral,
+			// while the midtones the scale actually bites into come
+			// down a step. The cost is that greys carry the cut
+			// too: mid-grey loses one of sixteen levels of green,
+			// a warmth this mode's candy palette absorbs, with
+			// black and white exactly neutral either way. This is
+			// the only lever that reaches both hues -- a matrix
+			// row rotates the compensation onto some other hue
+			// (reds go orange, blues teal) for a weaker result.
+			c[0] = c[2] = cf_lift(cf_lift(v, 190), 128);
+			c[1] = cf_lift(cf_lift(v * 216 >> 8, 190), 128);
 			break;
 		case CF_SEPIA: {
 			// Warm monochrome: per-channel gains on a lifted ramp.
@@ -985,9 +1029,18 @@ static void cf_build_tables(uint8_t mode) {
 			break;
 		}
 		case CF_GREEN:
+		case CF_RED:
+		case CF_BLUE:
+		case CF_YELLOW:
 		case CF_POCKET: {
-			const uint8_t (*ramp)[3] = mode == CF_GREEN ? CF_RAMP_GREEN
-								   : CF_RAMP_POCKET;
+			const uint8_t (*ramp)[3];
+			switch (mode) {
+			case CF_RED:    ramp = CF_RAMP_RED;    break;
+			case CF_BLUE:   ramp = CF_RAMP_BLUE;   break;
+			case CF_YELLOW: ramp = CF_RAMP_YELLOW; break;
+			case CF_POCKET: ramp = CF_RAMP_POCKET; break;
+			default:        ramp = CF_RAMP_GREEN;  break;
+			}
 			const int32_t shade = v >> 6; // four equal luma bands
 			c[0] = ramp[shade][0];
 			c[1] = ramp[shade][1];
@@ -2463,7 +2516,8 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// chosen: the whole effect is baked into the 64-entry palette LUT.
 	static const char *const CF_NAMES[CF_COUNT] = {
 		"OFF", "GBC", "VIVID", "CANDY", "PASTEL", "SORBET", "MONO",
-		"SEPIA", "NIGHT", "GB GREEN", "POCKET", "INVERT",
+		"SEPIA", "NIGHT", "GB GREEN", "GB RED", "GB BLUE",
+		"GB YELLOW", "POCKET", "INVERT",
 	};
 	draw_value_row(SET_ROW_COLOR, sel, ICON_DROPLET, "COLOR FILTER",
 		       CF_NAMES[g_color_filter]);
