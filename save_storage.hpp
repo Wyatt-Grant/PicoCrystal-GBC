@@ -54,10 +54,11 @@ void save_storage_mark_dirty();
 //
 // `ms` == SAVE_INTERVAL_MANUAL disables autosaving entirely: dirty data waits
 // (the target slot is still pre-erased, so the commit itself is quick) until
-// save_storage_request_save() is called -- main.cpp binds that to the in-game
-// X+B chord. Manual mode means an unsaved session is lost on power-off, and it
-// widens the window in which only one of the two slots holds a valid save; both
-// are the deliberate trade for touching flash only when asked.
+// save_storage_request_save() is called -- main.cpp binds that to B on the
+// in-game hotkey layer (tap Y, then hold Y). Manual mode means an unsaved
+// session is lost on power-off, and it widens the window in which only one of
+// the two slots holds a valid save; both are the deliberate trade for touching
+// flash only when asked.
 constexpr uint32_t SAVE_INTERVAL_MANUAL = 0;
 
 // Sets the minimum spacing between flash commits. Safe to call any time
@@ -73,7 +74,7 @@ void save_storage_set_interval_ms(uint32_t ms);
 bool save_storage_pending();
 
 // Requests a commit at the next opportunity, bypassing the interval. Used by
-// the manual-save chord and by edits that must reach flash immediately (an
+// the manual-save hotkey and by edits that must reach flash immediately (an
 // in-game RTC change). No-ops when there is nothing dirty to write.
 void save_storage_request_save();
 
@@ -102,14 +103,16 @@ bool save_storage_load_rtc(save_rtc_t &out);
 
 // Call once per frame from the main loop. Autosaves cart_ram to flash if
 // it's dirty and the autosave interval has elapsed; otherwise returns
-// immediately or advances an in-progress save. The save is incremental --
-// at most ONE small flash op per call (a single 4KB sector erase, ~45ms, or a
-// page-program burst, ~1.4ms), each briefly pausing core1 (audio) and
-// interrupts -- doing the whole slot in one gulp instead freezes both cores
-// for ~half a second, felt as a stutter a few seconds after starting a game
-// or saving in-game. The header (magic+CRC+seq) is written
-// last as the commit record, so a power-off mid-save still falls back to the
-// previous good slot on load.
+// immediately or advances an in-progress save. The save is incremental -- at
+// most ONE small flash op per call, each briefly pausing core1 (audio) and
+// interrupts. On erase-suspend-capable flash that op is a ~1.5ms erase slice or
+// a ~1.4ms page-program burst, neither of which drops a frame; without suspend
+// support the erase falls back to a blocking ~45ms sector erase. Doing the whole
+// slot in one gulp instead freezes both cores for ~half a second, felt as a
+// stutter a few seconds after starting a game or saving in-game. See
+// save_storage.cpp's state-machine comment for the full pacing story. The
+// header (magic+CRC+seq) is written last as the commit record, so a power-off
+// mid-save still falls back to the previous good slot on load.
 void save_storage_poll(const uint8_t *cart_ram, size_t size);
 
 // True while save_storage_poll() is mid-commit (programming the new snapshot
@@ -132,9 +135,12 @@ struct device_settings_t {
 	uint8_t rtc_min;    // 0..59
 	uint16_t volume;    // audio_output native range, 0..800
 	uint8_t vsync;        // 0/1: tear-free TE-synchronised flips (main.cpp g_vsync)
-	uint8_t status_bar;   // status_bar_mode_t (main.cpp g_status_bar): 0 FPS+PCT,
-			      // 1 FPS, 2 PERCENT, 3 ICON, 4 FULLSCREEN (no in-game
-			      // header, game frame centered)
+	uint8_t status_bar;   // status_bar_mode_t (main.cpp g_status_bar): 0 FPS + %,
+			      // 1 FPS, 2 BATTERY %, 3 ICON ONLY, 4 FULLSCREEN (no
+			      // in-game header, game frame centered), 5 FS BATTERY
+			      // (fullscreen plus a screen-wide battery meter).
+			      // Keep in sync with main.cpp's enum -- see the note
+			      // there.
 	uint8_t theme;        // UI accent theme: a UI_THEMES index (main.cpp
 			      // g_theme); apply_theme() falls back to 0 == MINT
 			      // if it's out of range. Was reserved0, always stored
@@ -157,10 +163,12 @@ struct device_settings_t {
 			      // without reinterpreting stored records.
 	uint8_t color_filter; // picture mode: an index into main.cpp's
 			      // color_filter_t (g_color_filter) -- 0 = OFF,
-			      // 1 = GBC panel emulation, then VIVID/PASTEL/
-			      // MONO/... Was a 0/1 toggle before the mode list
-			      // existed, and 0/1 still mean the same two
-			      // things, so old records decode unchanged.
+			      // 1 = GBC panel emulation, then the saturation,
+			      // washed-out and monochrome families. Was a 0/1
+			      // toggle before the mode list existed, and 0/1 still
+			      // mean the same two things, so old records decode
+			      // unchanged. Keep in sync with main.cpp's enum --
+			      // see the note there.
 };
 // Growing this struct invalidates the previously stored record (the CRC is
 // computed over the whole payload), so settings reset to defaults once on

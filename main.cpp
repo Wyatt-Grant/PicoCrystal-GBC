@@ -2,6 +2,32 @@
 // model. This project runs a Game Boy Color emulator (Walnut-CGB) rather
 // than a native game, so it needs a custom main() driving its own loop and
 // direct low-level access to the display flip/vsync primitives.
+//
+// Map of the file, in order. Sections are marked by `// -----` rules; grep the
+// quoted phrase to jump to one. Ordering is forced in places -- anything the
+// walnut_cgb.h macros expand into has to be declared above that include.
+//
+//   "ROM / cart-RAM storage"      ROM/SRAM buffers + the WGB_* devirt macros
+//   "Core1 scanline-render"       the offload's hooks and ring indices
+//   #include "core/walnut_cgb.h"  <-- the macros above are baked in here
+//   "picosystem.cpp is excluded"  the SDK globals we own instead
+//   "Walnut-CGB glue"             callbacks, error path, volume/brightness
+//   "Tear-free display toggle"    vsync, TE pacing, audio pacing
+//   "STATUS BAR mode"             the persisted settings globals, one per row
+//   "In-game hotkey layer"        the tap-then-hold Y gesture + joypad packing
+//   "Charge sense"                STAT/VBUS debounce behind g_charging
+//   "COLOR FILTER"                the picture-mode matrix/curve engine
+//   "GBC's 160x144 frame scaled"  1.5x scaler, palette LUT
+//   "the line ring"               producer (core0) + render_line_job (core1)
+//   "UI drawing"                  font, icons, theme, status bar   @ui-draw
+//   "Menus"                       boot picker, settings, clock     @menu-draw
+//   "NOSTALGIC BOOT splash"       logo animation + chimes
+//   "Core1 worker loop"           core1_main
+//   int main()                    init, boot flow, then the run loop
+//
+// The @ui-draw / @menu-draw fences matter: tools/render_menus.cpp sed-extracts
+// those ranges and compiles them on the host, so nothing inside them may touch
+// GPIO or pico-sdk calls.
 
 #include <array>
 #include <cstdint>
@@ -191,8 +217,8 @@ static struct gb_s gb;
 // These are only reached from cold init-time paths now (gb_init's header
 // parse/checksum still calls through the function pointers); every hot
 // runtime access was devirtualized via the WGB_* macros above. They keep
-// their __not_in_flash_func markings anyway -- they're tiny, and gb_error's
-// LED blink must work even if flash is mid-erase when a fault hits.
+// their __not_in_flash_func markings anyway -- they're a few instructions
+// each, so the RAM they cost is not worth the churn of unmarking them.
 static uint8_t __not_in_flash_func(gb_rom_read)(struct gb_s *, const uint_fast32_t addr) {
 	return g_rom_data[addr];
 }
@@ -342,6 +368,11 @@ static void apply_audio_pacing() {
 // scaled GBC frame vertically (see g_game_offset_y); menus keep their band.
 // FS BATTERY is FULLSCREEN plus a 2px-tall battery meter spanning the whole
 // width of the top letterbox band (see draw_fs_battery_bar).
+//
+// Keep in sync when adding a mode: STATUS_MODE_NAMES (draw_settings_menu),
+// device_settings_t::status_bar's comment in save_storage.hpp, and the mirror
+// of this enum in tools/render_menus.cpp. Appending is free; reordering remaps
+// an already-stored byte.
 enum status_bar_mode_t : uint8_t {
 	STATUS_FPS_PCT,
 	STATUS_FPS,
@@ -741,9 +772,10 @@ static bool charge_sense_poll() {
 
 #if ENABLE_LCD
 // RGB565 (Walnut-CGB's resolved gb->cgb.fixPalette format) -> PicoSystem's
-// packed RGBA4444 color_t. Plain per-pixel bit math, no LUT needed: Walnut
-// already maintains fixPalette incrementally as the game writes palette RAM,
-// so there's nothing left to precompute per frame.
+// packed RGBA4444 color_t. Plain bit math, no table. This is the per-*entry*
+// converter: the scanline writer never calls it per pixel, it indexes
+// _pal_lut (see below), which this fills 64 entries at a time on a palette
+// rebuild.
 static inline constexpr color_t rgb565_to_color(uint16_t c) {
 	uint8_t r4 = (c >> 12) & 0xF; // top 4 of 5 red bits
 	uint8_t g4 = (c >> 7) & 0xF;  // top 4 of 6 green bits
@@ -761,6 +793,10 @@ static inline constexpr color_t rgb565_to_color(uint16_t c) {
 // DMG greens, a saturation boost. Read by core1's LUT rebuild; only changed
 // from the settings menu while emulation is paused, so no synchronisation
 // beyond the volatile is needed.
+//
+// Keep in sync when adding a mode: CF_NAMES (draw_settings_menu), the curve
+// switch in cf_build_tables, device_settings_t::color_filter's comment in
+// save_storage.hpp, and the mirror of this enum in tools/render_menus.cpp.
 enum color_filter_t : uint8_t {
 	CF_OFF = 0,   // raw palette values, converted straight through
 	CF_GBC = 1,   // pinned: flash records predate the mode list and stored
@@ -799,8 +835,8 @@ static volatile uint8_t g_color_filter = CF_OFF;
 //
 // The matrix does everything cross-channel (the GBC bleed, desaturation toward
 // luma, saturation boosts); the per-channel curves do everything else
-// (wash-out, tints, inversion, posterizing). That split is what lets ten fairly
-// different looks share one function.
+// (wash-out, tints, inversion, posterizing). That split is what lets the whole
+// mode list share one function however far it grows.
 //
 // Invariant: every matrix row sums to exactly 256, so greys stay perfectly
 // neutral. A matrix whose rows sum differently tints the greyscale, which is
@@ -828,10 +864,12 @@ constexpr int32_t CF_LR = 77, CF_LG = 150, CF_LB = 29;
 //            one curve per channel so a mode can tint.
 // Plain .bss, so they sit in SRAM where core1 reads them without touching the
 // QSPI bus. 836 bytes all told, which is the point: folding the matrix into the
-// input lookups would drop the multiplies, but it costs ~1.2KB against the
-// ~2.8KB of slack the RAM region has left, and the multiplies are worth tens of
-// cycles per *changed palette entry* -- this runs once per entry on a palette
-// rebuild, never per pixel.
+// input lookups would drop the multiplies, but it costs ~1.2KB, and the RAM
+// region has only about 2KB of slack left (measure it as RAM top 0x20040000
+// minus the end of .heap, via arm-none-eabi-objdump -h on the elf). The
+// multiplies buy tens of cycles per *changed palette entry* -- this runs once
+// per entry on a palette rebuild, never per pixel -- so they are not worth
+// better than half the remaining budget.
 static uint8_t _cf_x5[32];
 static int32_t _cf_mat[9];
 static uint8_t _cf_out[3][256];
@@ -1330,10 +1368,10 @@ static void __not_in_flash_func(render_line_job)(const line_job *job) {
 	// (see hardware.cpp's TE handler), so this can never pass on a stale
 	// address. In steady state it never spins: the DMA streams ~19.65
 	// rows/ms while the emulator writes ~14 rows/ms at authentic pace, and
-	// the top letterbox (24 rows; 12 in FULLSCREEN) gives the reader a
-	// head start -- the spin only
-	// engages when emulation bursts ahead within a frame, and the main
-	// loop's arming policy keeps flips away from catch-up sprints.
+	// the top letterbox (24 rows; 12 in FULLSCREEN) gives the reader a head
+	// start -- the spin only engages when emulation bursts ahead within a
+	// frame, and the main loop's arming policy keeps flips away from
+	// catch-up sprints.
 	if (g_vsync) {
 		const uint32_t last_row = (uint32_t)(g_game_offset_y + 3 * k) + (odd ? 2u : 0u);
 		const uintptr_t chase_end = (uintptr_t)SCREEN->data +
@@ -1627,11 +1665,11 @@ static const uint8_t _icons7[][7] = {
 	  0b1111000,
 	  0b1110000 },
 	{ 0b1111111,  // ICON_STATUSBAR -- screen with a solid band across the top
-	  0b1111111,  // (STATUS BAR row). Was a vertical battery, which named only
-	  0b1111111,  // one of the five modes; the band is the row's actual subject.
-	  0b0000000,  // The band is 3 rows (6px at 2x) against the hollow body
-	  0b1000001,  // below, so it reads as a filled header rather than as the
-	  0b1000001,  // thick top edge of a plain rectangle.
+	  0b1111111,  // (STATUS BAR row). Was a vertical battery, which named just
+	  0b1111111,  // one mode out of the row's list; the band is the row's
+	  0b0000000,  // actual subject. The band is 3 rows (6px at 2x) against the
+	  0b1000001,  // hollow body below, so it reads as a filled header rather
+	  0b1000001,  // than as the thick top edge of a plain rectangle.
 	  0b1111111 },
 	{ 0b1110111,  // ICON_SWATCHES -- 2x2 grid of color swatches (THEME row)
 	  0b1110111,
@@ -1831,9 +1869,9 @@ struct ui_mode_t {
 	color_t white, grey, card, header, track, value, fill, bright, dim;
 };
 constexpr ui_mode_t UI_MODES[2] = {
-	// [0] DARK -- the values the UI has always used, except `value`, which
-	// was defined but never wired up (label and value both drew in `grey`,
-	// so a settings row was one undifferentiated line of text).
+	// [0] DARK -- the classic look. `value` is deliberately brighter than
+	// `grey`: label and value drawing in one color makes a settings row read
+	// as a single undifferentiated line of text.
 	{ 0xFFFF, 0x88F8, status_rgb(1, 1, 1), status_rgb(2, 2, 2),
 	  status_rgb(3, 3, 3), status_rgb(12, 12, 12), status_rgb(6, 6, 6),
 	  status_rgb(11, 11, 11), status_rgb(5, 5, 5) },
@@ -2229,10 +2267,9 @@ struct menu_battery_poll {
 	int count = INTERVAL_FRAMES;
 	uint32_t level = 0;
 	uint32_t poll() {
-		// Charge state is polled every frame rather than on the ADC's
-		// interval: STAT bursts, and the slow cadence aliases the bursts
-		// away (see charge_sense_poll). Menus repaint every frame, so
-		// unlike the in-game status bar there is nothing to mark dirty --
+		// Every frame, not on the ADC's interval -- see CHARGE_RELEASE_US
+		// for why the burst pattern demands it. Menus repaint every frame,
+		// so unlike the in-game status bar there is nothing to mark dirty:
 		// the updated g_charging is picked up by the next draw.
 		charge_sense_poll();
 		if (++count >= INTERVAL_FRAMES) {
@@ -2524,11 +2561,9 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	// STATUS BAR: what the in-game header shows -- FPS and/or battery % text
 	// (the icon always shows), just the icon, FULLSCREEN (no header, game
 	// frame centered) or FS BATTERY (fullscreen plus a 2px screen-wide
-	// battery meter). The percent choice also drives the menu headers.
-	// "PCT" was the old shorthand for the battery percentage, which read as
-	// an abbreviation of nothing in particular next to plain-English
-	// neighbours like FULLSCREEN. The percentage is always the battery's, and
-	// the font has '%', so the modes now say what they put on the bar.
+	// battery meter). The percent choice also drives the menu headers. Each
+	// name says what the mode puts on the bar, in plain words rather than
+	// abbreviations -- the font has '%', so there is no reason to spell it.
 	static const char *const STATUS_MODE_NAMES[STATUS_MODE_COUNT] = {
 		"FPS + %", "FPS", "BATTERY %", "ICON ONLY", "FULLSCREEN",
 		"FS BATTERY",
@@ -2565,8 +2600,9 @@ static void draw_settings_menu(uint32_t sel, uint32_t batt) {
 	draw_value_row(SET_ROW_MODE, sel, ICON_CONTRAST, "APPEARANCE",
 		       g_dark_mode ? "DARK" : "LIGHT");
 	// CLOCK: a summary row ("MON 13:45") that opens the segmented editor on
-	// A -- the big display was a fifth of the panel for a setting touched
-	// about once, and the space it freed is what put ROW_H back to 18.
+	// A -- the big inline display was a fifth of the panel for a setting
+	// touched about once, and moving it out is what made room for the rows
+	// added since.
 	// In-game the caller refreshes g_rtc_* from the live MBC3 clock each
 	// frame, so this value ticks rather than showing the boot-time staging.
 	{
@@ -2880,8 +2916,7 @@ static void draw_boot_menu(uint32_t sel, uint32_t batt) {
 		// Clip long titles to the full row width: the name's ink (text_w, no
 		// trailing glyph gap) must fit in name_max. At the current metrics
 		// that's 24 glyphs -- the same cap gen_rom_data.py applies to catalog
-		// names -- so in practice nothing gets ".."-clipped anymore (the old
-		// right-aligned size column used to cost ~4 name characters).
+		// names -- so in practice nothing reaches the ".." path.
 		int32_t max_chars = (name_max + STATUS_GLYPH_ADV - 6) / STATUS_GLYPH_ADV;
 		int32_t len = 0;
 		while (name[len])
@@ -2976,12 +3011,14 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 	if (row == SET_ROW_CLOCK)
 		return;
 	g_settings_edited = true;
+	// `dir` is the < > direction. Rows with a list cycle through it and wrap;
+	// the plain ON/OFF rows ignore it, since either direction just toggles.
 	switch (row) {
 	case SET_ROW_BRIGHT: adjust_brightness(dir); return;
 #if ENABLE_SOUND
 	case SET_ROW_VOLUME: adjust_volume(dir); return;
 #endif
-	case SET_ROW_VSYNC: // either direction toggles
+	case SET_ROW_VSYNC:
 		g_vsync = !g_vsync;
 		apply_audio_pacing(); // TE-paced vsync shifts the production rate
 		return;
@@ -2991,7 +3028,7 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 		apply_color_filter((uint8_t)((g_color_filter + CF_COUNT +
 					      (uint32_t)dir) % CF_COUNT));
 		return;
-	case SET_ROW_STATUS: // < > cycle the five modes, wrapping
+	case SET_ROW_STATUS: // < > cycle status_bar_mode_t, wrapping
 		g_status_bar = (uint8_t)((g_status_bar + STATUS_MODE_COUNT +
 					  (uint32_t)dir) % STATUS_MODE_COUNT);
 		apply_game_offset();
@@ -3006,12 +3043,12 @@ static void settings_step(uint32_t row, int32_t dir, bool in_game) {
 					     (uint32_t)dir) % SAVE_INTERVAL_COUNT);
 		apply_save_interval();
 		return;
-	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return; // either direction toggles
-	case SET_ROW_NOSTALGIC: g_nostalgic_boot = !g_nostalgic_boot; return; // either direction toggles
+	case SET_ROW_BOOT_LAST: g_boot_last = !g_boot_last; return;
+	case SET_ROW_NOSTALGIC: g_nostalgic_boot = !g_nostalgic_boot; return;
 	case SET_ROW_THEME:
 		apply_theme((g_theme + THEME_COUNT + (uint32_t)dir) % THEME_COUNT);
 		return;
-	case SET_ROW_MODE: apply_mode(!g_dark_mode); return; // either direction toggles
+	case SET_ROW_MODE: apply_mode(!g_dark_mode); return;
 	}
 }
 
@@ -3303,19 +3340,20 @@ static uint32_t rom_select() {
 }
 
 // ---------------------------------------------------------------------
-// NOSTALGIC BOOT splash (settings toggle g_nostalgic_boot): a Game Boy
-// Advance-style boot screen played after a ROM is picked and before
-// core1/emulation starts. The PicoCrystal logo -- bold italic sans in the
-// GBC "GAME BOY" lettering style -- flies in on a wave that runs from the
-// bottom left to the right: each column of the logo swoops up from below,
-// staggered so the arrival reads as a wavefront, and rides a travelling
-// ripple that stretches and squashes it vertically, so the flat bitmap reads
-// as a ribbon turning in 3D. Once it has landed a band of every UI accent
-// (settings THEME row) sweeps left to right through the letters, each column
-// running the whole wheel before settling on its own color -- the whole
-// sequence tuned to ~2.5s, the same length as the descent-and-sweep it
-// replaced. Two chimes ring out through the PWM DAC across it, both
-// synthesized rather than played back as sampled PCM: our own arpeggio
+// NOSTALGIC BOOT splash (settings toggle g_nostalgic_boot): a Game Boy-style
+// boot screen played after a ROM is picked and before core1/emulation starts.
+// The PicoCrystal logo -- bold italic sans in the GBC "GAME BOY" lettering
+// style -- flies in on a wave that runs from the bottom left to the right:
+// each column of the logo swoops up from below, staggered so the arrival reads
+// as a wavefront, and rides a travelling ripple that stretches and squashes it
+// vertically, so the flat bitmap reads as a ribbon turning in 3D. Once it has
+// landed a band of every UI accent (settings THEME row) sweeps left to right
+// through the letters, each column running the whole wheel before settling on
+// its own color. The animation is FLY_MS + BAND_MS (~1.3s); with the jingle
+// and the beat of silence after it, the whole splash is ~2.2s.
+//
+// Two chimes ring out through the PWM DAC across it, both synthesized rather
+// than played back as sampled PCM: our own arpeggio
 // (audio_output_start_startup_chime) rings under the fly-in from the first
 // frame, then the "ba-ding" based on GBC boot
 // (audio_output_play_boot_jingle) once the colors settle.
@@ -3325,9 +3363,10 @@ static uint32_t rom_select() {
 // light mode, white-on-black in dark (the letter colors read on either
 // field).
 //
-// Bitmaps are 1-bpp MSB-first. The logo is stored as one layer per color, so
-// each layer is a plain single-color pass and the per-column wave geometry is
-// recomputed (cheaply, from an integer sine table) rather than buffered.
+// Bitmaps are 1-bpp MSB-first, the logo split across several layers so each
+// pass is a plain single-color blit (the color itself comes from the band and
+// gradient, not the layer). Per-column wave geometry is recomputed (cheaply,
+// from an integer sine table) rather than buffered.
 // ---------------------------------------------------------------------
 
 constexpr int32_t BOOT_LOGO_W = 81, BOOT_LOGO_H = 15;
@@ -3412,7 +3451,10 @@ static const uint8_t boot_logo_y_bits[165] = { // "l" -- yellow, the Y-tail nod
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-// The five color layers, left to right, and their settled GBC-style colors.
+// The five layers of the logo bitmap, left to right. They are drawn one flat
+// color at a time, but the color is never the layer's own -- it comes from the
+// accent band / gradient in nostalgic_boot_splash(). The split into layers is
+// only so each pass is a plain single-color blit.
 constexpr int32_t BOOT_LOGO_LAYERS = 5;
 static const uint8_t *const boot_logo_layer_bits[BOOT_LOGO_LAYERS] = {
 	boot_logo_b_bits, boot_logo_g_bits, boot_logo_m_bits,
@@ -3728,9 +3770,10 @@ static void nostalgic_boot_splash() {
 	// Colors settled -- hand the DAC over to the second chime: the "ba-ding"
 	// based on GBC boot (audio_output_play_boot_jingle), whose ring-down
 	// doubles as the hold before the cut. Release our chime's alarm first; it
-	// finished ~1.7s ago, but the jingle drives the same PWM register from
-	// a blocking loop, so ownership is ended explicitly rather than left to
-	// timing. Muted (or soundless build): hold the same beat silently so
+	// rang down ~0.5s ago (~800ms against the animation's FLY_MS + BAND_MS),
+	// but the jingle drives the same PWM register from a blocking loop, so
+	// ownership is ended explicitly rather than left to timing. Muted (or
+	// soundless build): hold the same beat silently so
 	// the splash still reads.
 #if ENABLE_SOUND
 	audio_output_stop_startup_chime();
@@ -3992,12 +4035,11 @@ int main() {
 	// never touched it and it needs setting up here.
 	charge_sense_init();
 
-	// The LED reports battery charge: a green->red gradient (green ~= full,
-	// red ~= nearly empty), capped by led_brightness(). Updated on a cadence rather than
-	// every frame -- battery() reads the ADC and the charge level changes
-	// slowly, so per-frame polling would only waste cycles and jitter the LED.
-	// Starting the counter at the threshold makes the first loop iteration do
-	// an immediate update instead of sitting on the boot-success green for ~0.5s.
+	// Battery poll cadence (the LED it drives is led_show_battery's business).
+	// battery() reads the ADC and the level changes slowly, so per-frame
+	// polling would only waste cycles and jitter the LED. Starting the counter
+	// at the threshold makes the first loop iteration do an immediate update
+	// instead of sitting on the boot-success green for ~0.5s.
 	constexpr int BATTERY_UPDATE_FRAMES = 30;
 	int battery_count = BATTERY_UPDATE_FRAMES;
 	int batt_level = 0; // last polled level, so the save blink can hand the
@@ -4232,11 +4274,9 @@ int main() {
 #endif
 
 #if ENABLE_LCD
-		// Charge state is polled every frame, not on the ADC's cadence:
-		// STAT bursts around termination, and sampling it twice a second
-		// aliases those bursts away. A change repaints the band -- the
-		// bolt lives inside the battery icon, which is only redrawn on a
-		// status repaint.
+		// Every frame, not on the ADC's cadence -- see CHARGE_RELEASE_US.
+		// A change repaints the band: the bolt lives inside the battery
+		// icon, which is only redrawn on a status repaint.
 		if (charge_sense_poll())
 			status_dirty = true;
 #endif

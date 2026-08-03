@@ -1,8 +1,8 @@
 /*
  * Headless desktop validation harness for Walnut-CGB running Polished
- * Crystal, per PicoCrystal's plan Milestone 2 ("core validation on the
- * host"). No SDL2/display required: dumps PPM snapshots to disk and
- * exercises save-RAM round-trip + RTC state directly.
+ * Crystal: proves the emulator core is correct on the host before any of it
+ * is blamed on the device. No SDL2/display required -- dumps PPM snapshots to
+ * disk and exercises save-RAM round-trip + RTC state directly.
  *
  * Usage: headless_test <rom.gbc> [out_dir]
  */

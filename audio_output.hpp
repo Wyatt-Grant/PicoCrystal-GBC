@@ -66,11 +66,13 @@ uint16_t audio_output_get_volume();
 // (NR11=$80), envelope NR12=$F3 -- start at volume 15, step down one level
 // every 3/64s (exactly 1536 samples at 32768Hz) -- note 1 at freq $783
 // (131072/125 = ~1048.6Hz), then ~67ms later note 2 at $7C1 (131072/63 =
-// ~2080.5Hz) retriggers the envelope and rings down to silence. Full-swing square at unity volume -- the loudest waveform the
-// piezo can produce, unlike the sine-bell attempt this replaces, which
-// barely moved it. Only valid between audio_output_init() (the carrier must
-// be configured) and audio_output_core1_init() (afterwards the DMA engine
-// owns the CC register). Software-paced: at boot nothing else runs, so a
+// ~2080.5Hz) retriggers the envelope and rings down to silence. Full-swing
+// square at unity volume -- the loudest waveform the piezo can produce, unlike
+// the sine-bell attempt this replaces, which barely moved it. A summed
+// multi-voice mix (the startup chime below) is quieter for the same reason.
+// Only valid between audio_output_init() (the carrier must be configured) and
+// audio_output_core1_init() (afterwards the DMA engine owns the CC register).
+// Software-paced: at boot nothing else runs, so a
 // time_us_64() spin per sample is jitter-free enough. Applies the master
 // volume (unity-clamped -- the 0-800 loudness-compression range only makes
 // sense against the APU's deliberately quiet mix, not a full-scale square)

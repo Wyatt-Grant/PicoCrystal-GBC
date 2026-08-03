@@ -105,8 +105,8 @@ namespace picosystem {
   static volatile uint32_t _io_edge_us[32];
   // Tactile switches on the PicoSystem settle in ~1-5ms. Anything shorter
   // than this after an accepted edge is contact bounce, not a new press --
-  // release bounce in particular used to fire a phantom extra press (and,
-  // via the Y+X / X+B chords, phantom menu opens and flash saves).
+  // release bounce in particular used to fire a phantom extra press, which
+  // the shortcut gestures then read as phantom menu opens and flash saves.
   static constexpr uint32_t IO_DEBOUNCE_US = 4000;
 
   // Shared GPIO IRQ, two jobs:

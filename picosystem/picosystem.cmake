@@ -1,7 +1,9 @@
 # PicoCrystal fork: narrowed on purpose. We do NOT use the stock
 # init()/update()/draw() model or the high-level drawing API (pen/blit/text/
-# blend) -- main.cpp drives its own loop and writes SCREEN->data directly, per
-# the project plan (see /home/wyatt/.claude/plans/i-want-to-port-fluttering-meadow.md).
+# blend) -- main.cpp drives its own loop and writes SCREEN->data directly. A
+# CPU/PPU/APU emulator needs lower-level control of frame timing and the
+# display flip than the stock 40fps callback model can give it; see the header
+# comment in main.cpp and the README.
 # picosystem.cpp is deliberately excluded: it defines int main(), which
 # conflicts with our own, and it statically allocates SCREEN, which main.cpp
 # provides instead. blend.cpp/audio.cpp/state.cpp/primitives.cpp/text.cpp/

@@ -267,9 +267,11 @@ int main(int argc, char **argv) {
 	snprintf(path, sizeof path, "%s/settings.ppm", dir);
 	write_ppm(path);
 
-	// The charging bolt in the header's battery icon, at three levels: the
-	// bolt is drawn as the inverse of what it sits on, so the interesting
-	// cases are the ones where it straddles (or misses) the fill edge.
+	// The charging bolt in the header's battery icon, at three levels. The
+	// bolt is one flat color over a knocked-out halo (see draw_battery_icon),
+	// precisely so it survives sitting on two backgrounds at once -- so the
+	// interesting cases are the ones where it straddles, fills, or misses the
+	// fill edge entirely.
 	g_charging = true;
 	static const uint32_t CHARGE_LEVELS[] = { 0, 45, 100 };
 	for (uint32_t lvl : CHARGE_LEVELS) {
